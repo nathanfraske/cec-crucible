@@ -19,10 +19,18 @@ instantiated the AI Denoiser — whose own log reports `buffers: fp16, xmma/xmma
 convolution`, i.e. **tensor-core** execution confirmed. The ABI-118 function table
 is exactly 60 entries; the brute-force size probe + the full offset map (module 12,
 program-group 24, pipeline 27, accel 33, sbt 48, launch 49, denoiser 52-54) are
-recorded for the build. **Remaining Phase-2 blocker: `nvcc` (CUDA toolkit) is not
-installed — needed at build time to compile the path-tracer device `.cu` → the
-committed PTX blob** (the target still needs nothing but the driver). Phase 3
-(SER, §4) remains scoped-not-built.
+recorded for the build. **Phase 2 device kernel BUILT** —
+CUDA 13.3 installed; `crates/crucible-gpu/src/optix/path_tracer.cu` (the CUDA/OptiX
+megakernel counterpart of `pathtrace.wgsl`) compiles to `path_tracer.ptx` (37 KB,
+all three OptiX entry points + `_optix_*` intrinsics, sm_86 → JITs to Blackwell)
+via nvcc + the public OptiX headers; `build_ptx.ps1` reproduces it. So **both hard
+Phase-2 unknowns are resolved**: the hand-rolled host FFI reaches a live OptiX
+context + tensor denoiser (spike `d7a87f6`), and the device `.cu` → correct PTX
+(`25a778c`). **Remaining Phase-2 work: the host integration** —
+`optixModuleCreate` (from the committed PTX) → program groups → pipeline → SBT →
+accel build (BLAS/TLAS over the knot) → `optixLaunch` → readback/verify → a
+`LoadKernel` + CLI. The full 60-entry function-table offset map is recorded (§3
++ memory). Phase 3 (SER, §4) remains scoped-not-built.
 
 ## 0. TL;DR
 
