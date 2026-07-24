@@ -47,6 +47,7 @@ const COMMON_BOOLS: &[&str] = &[
     "all-drives",
     "gpu-alu-only",
     "link-cuda",
+    "per-core",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -94,7 +95,15 @@ PROFILES:
     anti-phase           CPU and GPU alternate    -> VRM/PSU chase load.  [gpu]
     beat                 Slightly different periods -> sweeps all phases. [gpu]
     worst-case           Everything at once: CPU transients anti-phase to the
-                         GPU, under RAM + storage + VRAM-integrity load.
+                         GPU, under RAM + storage + VRAM-integrity + PCIe load.
+    chaos                Randomized never-settle: CPU+GPU on independent seeded
+                         jitter over steady RAM/storage/VRAM/PCIe.        [gpu]
+    game-load            Frame-paced CPU->GPU handoff at moderate power — the
+                         game electrical/thermal signature (not graphics). [gpu]
+    core-cycle           Single-core steady boost, rotated over all cores — the
+                         weak-core-at-max-boost hunt (CoreCycler-style).
+    c-states             Single-core pulse + deep idle, rotated — the idle /
+                         C-state / low-load-voltage class (needs BIOS C-states).
 
 COMMON OPTIONS:
     --seconds <N>        Run duration in seconds.
@@ -105,8 +114,26 @@ COMMON OPTIONS:
 
 CPU OPTIONS:
     --core <all|N>       All cores (default) or a single logical core index.
-    --shape <steady|burst>
+    --shape <steady|burst|pulse|jitter>
     --burst-on <MS> --burst-off <MS>   Burst duty cycle (default 20/20 ms).
+
+TRANSIENT / LIGHT-LOAD OPTIONS (jitter & pulse shapes; chaos/game-load/rotation):
+    --shape jitter       Randomized never-settle burst (spike/floor).
+      --jit-on-min/-max <MS>    Spike (ON) bounds (default 5/50).
+      --jit-off-min/-max <MS>   Floor (OFF) bounds (default 3/40).
+      --floor <PCT>             Trickle % during the floor (default 12; 0 = idle).
+      --per-core                CPU only: decorrelate each core -> CPU-VRM chaos
+                                instead of one synchronized system-level step.
+    --shape pulse        Short work pulse + deep idle (lets a core reach C6).
+      --pulse-ms <MS>           Work pulse (default 5).
+      --idle-ms <MS>            Deep idle (default 300).
+    --seed <N|0xHEX>     Seed the jitter/chaos PRNG (default: a logged random seed;
+                         the report prints it so any run can be replayed).
+    --dwell <SEC>        Per-core seconds for core-cycle / c-states (default 30 / 120).
+    --passes <N>         Rotation passes for core-cycle / c-states (default 2 / 1).
+    --fps <N>            game-load frame rate (default 120).
+    --bound <gpu|cpu|balanced>   game-load duty split (default gpu-bound).
+    --handoff-ms <MS>    game-load GPU-start delay after CPU submit (default: cpu-on).
 
 MEM OPTIONS:
     --mb <N>             Buffer size in MiB (default: 50% of free RAM).
@@ -316,7 +343,7 @@ fn cmd_drives(rest: &[String]) -> Result<u8, String> {
 
 fn cmd_cpu(rest: &[String]) -> Result<u8, String> {
     let p = Parsed::parse(rest, COMMON_BOOLS)?;
-    p.reject_unknown(&[
+    let mut allowed = vec![
         "seconds",
         "core",
         "shape",
@@ -327,12 +354,20 @@ fn cmd_cpu(rest: &[String]) -> Result<u8, String> {
         "no-report",
         "json",
         "help",
-    ])?;
+    ];
+    allowed.extend_from_slice(SHAPE_OPTS);
+    p.reject_unknown(&allowed)?;
     let seconds = seconds_arg(&p, 60)?;
     let shape = shape_from(&p)?;
     let cores = core_from(&p)?;
-    let kernel = CpuKernel::new(cores);
-    let mode = format!("{} {}", shape.mode_str(), cores_label(cores));
+    let mut kernel = CpuKernel::new(cores);
+    kernel.per_core_jitter = p.has("per-core");
+    let per_core = if kernel.per_core_jitter && matches!(shape, Shape::Jitter { .. }) {
+        " per-core"
+    } else {
+        ""
+    };
+    let mode = format!("{} {}{}", shape_label(&shape), cores_label(cores), per_core);
     let budget = Budget {
         duration: Duration::from_secs(seconds),
         shape,
@@ -645,8 +680,15 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         "no-report",
         "json",
         "help",
+        // core-cycle / c-states rotation, game-load cadence.
+        "dwell",
+        "passes",
+        "fps",
+        "bound",
+        "handoff-ms",
     ];
     allowed.extend_from_slice(GPU_OPTS);
+    allowed.extend_from_slice(SHAPE_OPTS);
     p.reject_unknown(&allowed)?;
     let profile = p
         .positional
@@ -746,9 +788,17 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         "in-phase" | "anti-phase" | "beat" => run_transient_scenario(&mut runner, &p, &profile),
         // Everything at once: CPU transients under RAM + storage + GPU + VRAM.
         "worst-case" => run_worst_case(&mut runner, &p),
+        // Randomized never-settle transient cross-load.
+        "chaos" => run_chaos(&mut runner, &p),
+        // Frame-paced CPU->GPU handoff at a moderate power point (game signature).
+        "game-load" => run_game_load(&mut runner, &p),
+        // Single-core rotations: max-boost weak-core hunt / C-state idle test.
+        "core-cycle" => run_core_cycle(&mut runner, &p),
+        "c-states" => run_c_states(&mut runner, &p),
         other => Err(format!(
             "unknown profile '{other}' (expected: quick | soak | cross | power | \
-             storage-cross | in-phase | anti-phase | beat | worst-case)"
+             storage-cross | in-phase | anti-phase | beat | worst-case | chaos | \
+             game-load | core-cycle | c-states)"
         )),
     }
 }
@@ -925,6 +975,256 @@ fn run_worst_case(runner: &mut Runner, p: &Parsed) -> Result<u8, String> {
     runner.note("built without GPU support - running CPU + RAM + storage only");
 
     runner.concurrent_phased(stages, "worst-case")
+}
+
+/// Randomized never-settle cross-load. CPU and GPU each run an independent
+/// seeded jitter (spike/floor), so at any instant one may be slamming while the
+/// other floors, and the alignment swaps continuously — a stochastic superset of
+/// beat that also traverses the coincident-spike (OCP) and hand-off (VRM-chase)
+/// worst cases. RAM/storage/VRAM/PCIe run steady underneath and verify their own
+/// data while the power environment thrashes. `--per-core` decorrelates each CPU
+/// core for CPU-VRM chaos instead of one synchronized system step.
+fn run_chaos(runner: &mut Runner, p: &Parsed) -> Result<u8, String> {
+    let dur = Duration::from_secs(seconds_arg(p, 120)?);
+    let base = seed_from(p)?;
+    let per_core = p.has("per-core");
+
+    let cpu_jit = jitter_shape_from(p, crucible_core::rng::hash2(base, 1))?;
+    let mut cpu_k = CpuKernel::new(core_from(p)?);
+    cpu_k.per_core_jitter = per_core;
+
+    #[allow(unused_mut)]
+    let mut stages: Vec<PhasedStage> = vec![
+        PhasedStage {
+            kernel: Box::new(cpu_k),
+            mode: format!(
+                "{}{}",
+                shape_label(&cpu_jit),
+                if per_core { " per-core" } else { "" }
+            ),
+            budget: budget_with(dur, cpu_jit),
+            phase_offset: Duration::ZERO,
+        },
+        PhasedStage {
+            kernel: Box::new(MemKernel::new(mem_size_from(p, Some(2048))?)),
+            mode: "steady".into(),
+            budget: Budget::steady(dur),
+            phase_offset: Duration::ZERO,
+        },
+        PhasedStage {
+            kernel: Box::new(StorageKernel::new(storage_cfg_from(p, 512)?)),
+            mode: "steady".into(),
+            budget: Budget::steady(dur),
+            phase_offset: Duration::ZERO,
+        },
+    ];
+
+    #[cfg(feature = "gpu")]
+    {
+        let gpu_jit = jitter_shape_from(p, crucible_core::rng::hash2(base, 2))?;
+        let gpu = gpu_kernel_from(p, gpu_jit)?;
+        let gpu_label = format!("{} {}", shape_label(&gpu_jit), gpu.device.label());
+        stages.push(PhasedStage {
+            kernel: Box::new(gpu),
+            mode: gpu_label,
+            budget: budget_with(dur, gpu_jit),
+            phase_offset: Duration::ZERO,
+        });
+
+        let vram = vram_kernel_from(p)?;
+        let vram_label = format!("integrity {}", vram.device.label());
+        stages.push(PhasedStage {
+            kernel: Box::new(vram),
+            mode: vram_label,
+            budget: Budget::steady(dur),
+            phase_offset: Duration::ZERO,
+        });
+
+        let link = link_kernel_from(p)?;
+        let link_via = if link.cuda { "cuda" } else { "wgpu" };
+        let link_label = link.device.label();
+        stages.push(PhasedStage {
+            kernel: Box::new(link),
+            mode: format!("transfer {link_label} {link_via}"),
+            budget: Budget::steady(dur),
+            phase_offset: Duration::ZERO,
+        });
+    }
+
+    runner.note(&format!(
+        "chaos: CPU + GPU on independent seeded jitter (base seed=0x{base:x}{}), never-settle, \
+         under steady RAM/storage/VRAM-integrity/PCIe; every domain verifies its own data. \
+         Re-run with --seed 0x{base:x} to re-command the same pattern.",
+        if per_core { ", CPU per-core" } else { "" }
+    ));
+    #[cfg(not(feature = "gpu"))]
+    runner.note("built without GPU support - chaos running CPU + RAM + storage only");
+
+    runner.concurrent_phased(stages, "chaos")
+}
+
+/// Frame-paced CPU->GPU handoff at a moderate power point — the game *signature*
+/// (frame cadence, CPU-leads-GPU, moderate power, VRAM streaming). It reproduces
+/// the electrical/thermal/transient load a game puts on the PSU/VRM/boost, NOT
+/// the graphics stack (no draw calls/shaders/present) — a graphics-path in-game
+/// crash can still PASS here. Uniquely catches moderate-load boost instability
+/// that a max-load test throttles away.
+fn run_game_load(runner: &mut Runner, p: &Parsed) -> Result<u8, String> {
+    let dur = Duration::from_secs(seconds_arg(p, 120)?);
+    let fps = p.get_u64("fps")?.unwrap_or(120).clamp(10, 1000);
+    let frame_us = 1_000_000 / fps;
+    // Duty split: what fraction of the frame the CPU is busy (early — sim +
+    // render-thread submission). The GPU's fraction is computed with its stage
+    // (gpu-feature-only) so a non-GPU build carries no unused values.
+    let bound = p.get("bound").unwrap_or("gpu").to_string();
+    let cpu_frac = match bound.as_str() {
+        "cpu" => 0.70,
+        "balanced" => 0.55,
+        _ => 0.40, // gpu-bound (typical AAA)
+    };
+    let frame = Duration::from_micros(frame_us);
+    let cpu_on = Duration::from_micros((frame_us as f64 * cpu_frac) as u64);
+    let cpu_off = frame.saturating_sub(cpu_on);
+
+    #[allow(unused_mut)]
+    let mut stages: Vec<PhasedStage> = vec![PhasedStage {
+        kernel: Box::new(CpuKernel::new(core_from(p)?)),
+        mode: format!("frame {fps}fps cpu-on {}us", cpu_on.as_micros()),
+        budget: budget_with(
+            dur,
+            Shape::Burst {
+                on: cpu_on,
+                off: cpu_off,
+            },
+        ),
+        phase_offset: Duration::ZERO,
+    }];
+
+    #[cfg(feature = "gpu")]
+    {
+        let gpu_frac = match bound.as_str() {
+            "cpu" => 0.45,
+            "balanced" => 0.60,
+            _ => 0.70, // gpu-bound
+        };
+        let gpu_on = Duration::from_micros((frame_us as f64 * gpu_frac) as u64);
+        let gpu_off = frame.saturating_sub(gpu_on);
+        // GPU render starts after the CPU has "submitted" the frame.
+        let handoff = match p.get_u64("handoff-ms")? {
+            Some(v) => ms(v),
+            None => cpu_on,
+        };
+        let gpu_shape = Shape::Burst {
+            on: gpu_on,
+            off: gpu_off,
+        };
+        let mut gpu = gpu_kernel_from(p, gpu_shape)?;
+        // Size one dispatch to fit inside the render window (a 6 ms burst
+        // default would overrun a 120 fps frame). Explicit --gpu-iters wins.
+        if p.get_u64("gpu-iters")?.is_none() {
+            gpu.iters = ((gpu_on.as_micros() / 50).clamp(32, 512)) as u32;
+        }
+        let gpu_label = format!(
+            "frame {fps}fps gpu-on {}us handoff {}us {}",
+            gpu_on.as_micros(),
+            handoff.as_micros(),
+            gpu.device.label()
+        );
+        stages.push(PhasedStage {
+            kernel: Box::new(gpu),
+            mode: gpu_label,
+            budget: budget_with(dur, gpu_shape),
+            phase_offset: handoff,
+        });
+    }
+
+    runner.note(&format!(
+        "game-load: {fps}fps CPU->GPU per-frame handoff ({bound}-bound), moderate power. \
+         Reproduces the game's electrical/thermal/transient signature, NOT the graphics stack \
+         (draw calls/shaders/present) — a graphics-path in-game crash can still PASS here."
+    ));
+    #[cfg(not(feature = "gpu"))]
+    runner.note("built without GPU support - game-load runs the CPU frame cadence only");
+
+    runner.concurrent_phased(stages, "game-load")
+}
+
+/// CoreCycler-style single-core boost rotation: load one logical core at a time
+/// at steady (= its top single-core boost bin, unreachable in an all-core run
+/// where the package clocks down), rotate through every core, N passes. The
+/// weak-core-at-max-boost catcher; a miscompare is attributed to the pinned core.
+fn run_core_cycle(runner: &mut Runner, p: &Parsed) -> Result<u8, String> {
+    let dwell = p.get_u64("dwell")?.unwrap_or(30).clamp(1, 86_400);
+    let passes = p.get_u64("passes")?.unwrap_or(2).clamp(1, 100);
+    let total = crucible_core::sysinfo::logical_cpus().max(1);
+    let mut stages: Vec<(Box<dyn LoadKernel>, String)> = Vec::new();
+    for pass in 0..passes {
+        for core in 0..total {
+            stages.push((
+                Box::new(CpuKernel::new(CoreSel::One(core))),
+                format!("steady core={core} (pass {}/{passes})", pass + 1),
+            ));
+        }
+    }
+    runner.note(&format!(
+        "core-cycle: single-core steady boost, {total} core(s) x {passes} pass(es), {dwell}s each \
+         — places each core at its top boost bin to catch a weak core the all-core run masks. \
+         Needs boost (CPB/Turbo) enabled in BIOS."
+    ));
+    let d = Duration::from_secs(dwell);
+    runner.sequential(stages, move |_| Budget::steady(d))
+}
+
+/// Light-load / C-state test: a short work pulse + deep idle, one core at a
+/// time, rotated — forcing C0<->C6 cycling, the idle->boost step, and low idle
+/// voltage (the "crashes at idle, passes Prime95" class). Requires BIOS C-states
+/// and boost enabled plus a power plan that permits deep idle, or it silently
+/// tests nothing (the tool has no telemetry to confirm the state was reached).
+/// An idle-only fault shows only via WHEA / reboot — the in-kernel check is dark
+/// while the core idles.
+fn run_c_states(runner: &mut Runner, p: &Parsed) -> Result<u8, String> {
+    let dwell = p.get_u64("dwell")?.unwrap_or(120).clamp(1, 86_400);
+    let passes = p.get_u64("passes")?.unwrap_or(1).clamp(1, 100);
+    let shape = pulse_shape_from(p)?;
+    let total = crucible_core::sysinfo::logical_cpus().max(1);
+    let mut stages: Vec<(Box<dyn LoadKernel>, String)> = Vec::new();
+    for pass in 0..passes {
+        for core in 0..total {
+            stages.push((
+                Box::new(CpuKernel::new(CoreSel::One(core))),
+                format!(
+                    "{} core={core} (pass {}/{passes})",
+                    shape_label(&shape),
+                    pass + 1
+                ),
+            ));
+        }
+    }
+    runner.note(
+        "c-states: single-core pulse + deep-idle rotation. REQUIRES BIOS C-states + boost enabled \
+         and a deep-idle power plan (Balanced, not High-Performance), else it silently no-ops. \
+         Idle-only faults surface via WHEA/reboot only — the in-kernel check is dark at idle.",
+    );
+    let d = Duration::from_secs(dwell);
+    runner.sequential(stages, move |_| Budget {
+        duration: d,
+        shape,
+        target_watts: None,
+        phase_epoch: None,
+        phase_offset: Duration::ZERO,
+    })
+}
+
+/// A duration+shape budget with no phase pinning (the orchestrator supplies the
+/// epoch). Keeps the phased-stage builders terse.
+fn budget_with(duration: Duration, shape: Shape) -> Budget {
+    Budget {
+        duration,
+        shape,
+        target_watts: None,
+        phase_epoch: None,
+        phase_offset: Duration::ZERO,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,15 +1739,111 @@ fn resolve_device(p: &Parsed) -> DeviceId {
 fn shape_from(p: &Parsed) -> Result<Shape, String> {
     match p.get("shape") {
         None | Some("steady") => Ok(Shape::Steady),
-        Some("burst") => {
-            let on = p.get_u64("burst-on")?.unwrap_or(20).clamp(1, MAX_BURST_MS);
-            let off = p.get_u64("burst-off")?.unwrap_or(20).clamp(0, MAX_BURST_MS);
-            Ok(Shape::Burst {
-                on: Duration::from_millis(on),
-                off: Duration::from_millis(off),
-            })
+        Some("burst") => shape_from_burst(p),
+        Some("pulse") => pulse_shape_from(p),
+        Some("jitter") => jitter_shape_from(p, seed_from(p)?),
+        Some(other) => Err(format!(
+            "--shape expects steady|burst|pulse|jitter, got '{other}'"
+        )),
+    }
+}
+
+/// Options that only apply to the jitter/pulse shapes — listed so single-kernel
+/// commands can accept them without a "unknown option" error.
+const SHAPE_OPTS: &[&str] = &[
+    "jit-on-min",
+    "jit-on-max",
+    "jit-off-min",
+    "jit-off-max",
+    "floor",
+    "seed",
+    "pulse-ms",
+    "idle-ms",
+    "per-core",
+];
+
+/// Parse `--seed` (decimal or `0x`-hex). Absent → a logged, entropy-derived
+/// seed so an unseeded run is still reproducible from its report.
+fn seed_from(p: &Parsed) -> Result<u64, String> {
+    match p.get("seed") {
+        Some(s) => {
+            let s = s.trim();
+            let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                Some(hex) => u64::from_str_radix(hex, 16),
+                None => s.parse::<u64>(),
+            };
+            parsed.map_err(|_| format!("--seed expects a decimal or 0x-hex integer, got '{s}'"))
         }
-        Some(other) => Err(format!("--shape expects steady|burst, got '{other}'")),
+        None => {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            Ok(nanos ^ ((std::process::id() as u64) << 17) ^ 0x9E37_79B9_7F4A_7C15)
+        }
+    }
+}
+
+/// A randomized (jitter) shape from `--jit-*` / `--floor` (all clamped).
+fn jitter_shape_from(p: &Parsed, seed: u64) -> Result<Shape, String> {
+    let on_min = p.get_u64("jit-on-min")?.unwrap_or(5).clamp(1, MAX_BURST_MS);
+    let on_max = p
+        .get_u64("jit-on-max")?
+        .unwrap_or(50)
+        .clamp(on_min, MAX_BURST_MS);
+    let off_min = p
+        .get_u64("jit-off-min")?
+        .unwrap_or(3)
+        .clamp(1, MAX_BURST_MS);
+    let off_max = p
+        .get_u64("jit-off-max")?
+        .unwrap_or(40)
+        .clamp(off_min, MAX_BURST_MS);
+    let floor = p.get_u64("floor")?.unwrap_or(12).min(100) as u8;
+    Ok(Shape::Jitter {
+        on_min: ms(on_min),
+        on_max: ms(on_max),
+        off_min: ms(off_min),
+        off_max: ms(off_max),
+        floor_pct: floor,
+        seed,
+    })
+}
+
+/// A deep-idle pulse shape from `--pulse-ms` (work) / `--idle-ms` (idle).
+fn pulse_shape_from(p: &Parsed) -> Result<Shape, String> {
+    let work = p.get_u64("pulse-ms")?.unwrap_or(5).clamp(1, 1000);
+    let idle = p.get_u64("idle-ms")?.unwrap_or(300).clamp(1, MAX_BURST_MS);
+    Ok(Shape::Pulse {
+        work: ms(work),
+        idle: ms(idle),
+    })
+}
+
+/// A human/report label for a shape — includes the jitter seed so a failing run
+/// can be replayed with `--seed`.
+fn shape_label(shape: &Shape) -> String {
+    match shape {
+        Shape::Jitter {
+            on_min,
+            on_max,
+            off_min,
+            off_max,
+            floor_pct,
+            seed,
+        } => format!(
+            "jitter on[{},{}] off[{},{}]ms floor{}% seed=0x{:x}",
+            on_min.as_millis(),
+            on_max.as_millis(),
+            off_min.as_millis(),
+            off_max.as_millis(),
+            floor_pct,
+            seed
+        ),
+        Shape::Pulse { work, idle } => {
+            format!("pulse {}/{}ms", work.as_millis(), idle.as_millis())
+        }
+        other => other.mode_str().to_string(),
     }
 }
 
