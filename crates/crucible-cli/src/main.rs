@@ -64,6 +64,9 @@ const GPU_OPTS: &[&str] = &[
     "link-mb",
     "link-dir",
     "link-cuda",
+    "render-w",
+    "render-h",
+    "render-inst",
 ];
 
 const USAGE: &str = "\
@@ -82,6 +85,7 @@ COMMANDS:
     gpu                  Run the GPU thrasher kernel (watts).    [--features gpu]
     vram                 Run the VRAM integrity test.            [--features gpu]
     link                 PCIe host<->device transfer + verify.   [--features gpu]
+    render               Graphics pipeline: raster/TMU/ROP + verify. [--features gpu]
     run <profile>        See PROFILES below.
     version              Print version.
     help                 Print this help.
@@ -170,6 +174,10 @@ GPU OPTIONS (builds with --features gpu):
                          for true full-duplex (both copy engines at once), which
                          wgpu's single queue can't do. NVIDIA + `--features cuda`
                          build; probed at runtime, falls back to wgpu if absent.
+    --render-w <N> --render-h <N>   Framebuffer size (default 1280x720).
+    --render-inst <N>    Mesh instances drawn per frame — the geometry/overdraw
+                         knob (default 48). `render` exercises the rasterizer,
+                         texture units and ROP the compute thrasher never touches.
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -222,6 +230,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "gpu" => cmd_gpu(rest),
         "vram" => cmd_vram(rest),
         "link" => cmd_link(rest),
+        "render" => cmd_render(rest),
         "run" => cmd_run(rest),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -601,6 +610,81 @@ fn cmd_link(rest: &[String]) -> Result<u8, String> {
         let kernel = link_kernel_from(&p)?;
         let mode = format!("{} {}", kernel.dir.as_str(), kernel.device.label());
         let budget = Budget::steady(Duration::from_secs(seconds));
+        let mut runner = Runner::new(&p)?;
+        runner.single_stage(&kernel, &budget, &mode)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn render_kernel_from(p: &Parsed) -> Result<crucible_gpu::render::RenderKernel, String> {
+    let device = match p.get("gpu-device").unwrap_or("discrete") {
+        "discrete" => GpuDevice::Discrete(0),
+        "integrated" | "igpu" => GpuDevice::Integrated(0),
+        "default" => GpuDevice::Default,
+        other => {
+            return Err(format!(
+                "--gpu-device expects discrete|integrated|default, got '{other}'"
+            ))
+        }
+    };
+    let mut k = crucible_gpu::render::RenderKernel::new(device);
+    if let Some(v) = p.get_u64("render-w")? {
+        k.width = v.clamp(64, 7680) as u32;
+    }
+    if let Some(v) = p.get_u64("render-h")? {
+        k.height = v.clamp(64, 4320) as u32;
+    }
+    if let Some(v) = p.get_u64("render-inst")? {
+        k.instances = v.clamp(1, 4096) as u32;
+    }
+    Ok(k)
+}
+
+/// Graphics-pipeline load — drives a real headless render (rasterizer / TMU /
+/// ROP, the fixed-function units the compute thrasher cannot reach) and verifies
+/// the framebuffer bit-for-bit against the first frame (same-device
+/// self-consistency; a miscompare is a raster/TMU/ROP/VRAM soft error).
+fn cmd_render(rest: &[String]) -> Result<u8, String> {
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = rest;
+        Err(NO_GPU.to_string())
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let p = Parsed::parse(rest, COMMON_BOOLS)?;
+        let mut allowed: Vec<&str> = vec![
+            "seconds",
+            "shape",
+            "burst-on",
+            "burst-off",
+            "device-id",
+            "out",
+            "no-report",
+            "json",
+            "help",
+        ];
+        allowed.extend_from_slice(GPU_OPTS);
+        allowed.extend_from_slice(SHAPE_OPTS);
+        p.reject_unknown(&allowed)?;
+
+        let seconds = seconds_arg(&p, 60)?;
+        let shape = shape_from(&p)?;
+        let kernel = render_kernel_from(&p)?;
+        let mode = format!(
+            "{} render {}x{} x{}",
+            shape.mode_str(),
+            kernel.width,
+            kernel.height,
+            kernel.instances
+        );
+        let budget = Budget {
+            duration: Duration::from_secs(seconds),
+            shape,
+            target_watts: None,
+            phase_epoch: None,
+            phase_offset: Duration::ZERO,
+        };
         let mut runner = Runner::new(&p)?;
         runner.single_stage(&kernel, &budget, &mode)
     }

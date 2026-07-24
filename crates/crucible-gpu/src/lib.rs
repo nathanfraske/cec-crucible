@@ -33,6 +33,7 @@
 //! Either failure sets `error_count > 0`, which the report rolls up to FAIL.
 
 pub mod link;
+pub mod render;
 pub mod vram;
 
 use std::time::Instant;
