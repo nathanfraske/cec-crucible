@@ -13,12 +13,13 @@
 // verification is unaffected by anything below.
 //
 // When `params.shade == 1` (a frame the preview will present) each pixel is ALSO
-// shaded into `colorbuf` from an ORBITING camera (driven by `params.time`), so
-// the object appears to rotate in realtime. Shading reconstructs the smooth
-// surface normal from the bound index + normal buffers, does Lambertian lighting
-// and a traced hard shadow ray (the object self-shadows — visibly the RT cores
-// doing primary + secondary rays). None of this touches `outbuf`, so the animated
-// display never affects what is verified.
+// shaded into `colorbuf` from an ORBITING camera (driven by `params.time`), with
+// 2x2 supersampled anti-aliasing, so the object appears to rotate smoothly with
+// clean edges. Shading reconstructs the smooth surface normal from the bound
+// index + normal buffers, does Lambertian lighting and a traced hard shadow ray
+// (the object self-shadows — visibly the RT cores doing primary + secondary
+// rays). None of this touches `outbuf`, so the animated display never affects
+// what is verified.
 //
 // Compiled to SPIR-V at runtime by naga (no external shader compiler), then run
 // on raw Vulkan (ash) with VK_KHR_ray_query enabled.
@@ -52,6 +53,56 @@ fn fetch_normal(i: u32) -> vec3<f32> {
     return vec3<f32>(vnormals[3u * i], vnormals[3u * i + 1u], vnormals[3u * i + 2u]);
 }
 
+// Trace one display ray and return its (linear) colour. Reconstructs the smooth
+// surface normal at the hit from the mesh, lights it, and traces a hard shadow
+// ray so the object self-shadows.
+fn shade_ray(ro: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
+    var crq: ray_query;
+    rayQueryInitialize(&crq, tlas, RayDesc(0u, 0xFFu, 0.01, 100.0, ro, rd));
+    while (rayQueryProceed(&crq)) {}
+    let ch = rayQueryGetCommittedIntersection(&crq);
+
+    if (ch.kind == RAY_QUERY_INTERSECTION_NONE) {
+        return sky(rd);
+    }
+
+    let p = ro + rd * ch.t;
+    let prim = ch.primitive_index;
+    let i0 = indices[3u * prim + 0u];
+    let i1 = indices[3u * prim + 1u];
+    let i2 = indices[3u * prim + 2u];
+    let bc = ch.barycentrics;
+    let w0 = 1.0 - bc.x - bc.y;
+    var n = normalize(w0 * fetch_normal(i0) + bc.x * fetch_normal(i1) + bc.y * fetch_normal(i2));
+    let viewdir = normalize(ro - p);
+    if (dot(n, viewdir) < 0.0) {
+        n = -n;
+    }
+
+    let lightdir = normalize(vec3<f32>(0.35, 0.85, 0.35));
+    // Traced hard shadow ray, lifted along the normal to avoid self-hit.
+    var srq: ray_query;
+    rayQueryInitialize(&srq, tlas, RayDesc(0u, 0xFFu, 0.02, 50.0, p + n * 0.01, lightdir));
+    while (rayQueryProceed(&srq)) {}
+    let shadowed = rayQueryGetCommittedIntersection(&srq).kind != RAY_QUERY_INTERSECTION_NONE;
+
+    let ndl = max(dot(n, lightdir), 0.0);
+    let ambient = 0.2;
+    var diffuse = ndl;
+    var spec = 0.0;
+    if (shadowed) {
+        diffuse = 0.0;
+    } else {
+        let halfv = normalize(lightdir + viewdir);
+        spec = pow(max(dot(n, halfv), 0.0), 40.0);
+    }
+    let lit = ambient + (1.0 - ambient) * diffuse;
+
+    let orient = 0.5 + 0.5 * n.y;
+    let tint = mix(vec3<f32>(0.90, 0.48, 0.28), vec3<f32>(0.30, 0.62, 0.95), orient);
+    return tint * lit + vec3<f32>(spec) * 0.6;
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -62,10 +113,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let gx = idx % params.width;
     let gy = idx / params.width;
-    let u = (f32(gx) + 0.5) / f32(params.width) * 2.0 - 1.0;
-    let v = (f32(gy) + 0.5) / f32(params.height) * 2.0 - 1.0;
 
     // ---- Checksum: FIXED camera, deterministic (this is what's verified) ----
+    let u = (f32(gx) + 0.5) / f32(params.width) * 2.0 - 1.0;
+    let v = (f32(gy) + 0.5) / f32(params.height) * 2.0 - 1.0;
     let cs_origin = vec3<f32>(0.0, 0.0, -4.0);
     let cs_dir = normalize(vec3<f32>(u * 2.2, v * 2.2, 4.0));
     var acc: u32 = idx * 2654435761u;
@@ -85,12 +136,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     outbuf[idx] = acc;
 
-    // ---- Display shading: ORBITING camera (animated, NOT verified) ----
+    // ---- Display shading: ORBITING camera, 2x2 AA (animated, NOT verified) ----
     if (params.shade != 1u) {
         return;
     }
 
-    // Camera orbits the object at the origin; look-at basis, per-pixel ray.
+    // Camera orbits the object at the origin; look-at basis.
     let ang = params.time * 0.5;
     let radius = 4.2;
     let cam_pos = vec3<f32>(sin(ang) * radius, 1.6, -cos(ang) * radius);
@@ -98,55 +149,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let right = normalize(cross(fwd, vec3<f32>(0.0, 1.0, 0.0)));
     let up = cross(right, fwd);
     let fov = 0.55;
-    let disp_dir = normalize(fwd + right * (u * fov) + up * (-v * fov));
+    let inv_w = 1.0 / f32(params.width);
+    let inv_h = 1.0 / f32(params.height);
 
-    var col: vec3<f32>;
-    var crq: ray_query;
-    rayQueryInitialize(&crq, tlas, RayDesc(0u, 0xFFu, 0.01, 100.0, cam_pos, disp_dir));
-    while (rayQueryProceed(&crq)) {}
-    let ch = rayQueryGetCommittedIntersection(&crq);
-
-    if (ch.kind == RAY_QUERY_INTERSECTION_NONE) {
-        col = sky(disp_dir);
-    } else {
-        let p = cam_pos + disp_dir * ch.t;
-        // Smooth normal: interpolate the 3 vertex normals by barycentrics.
-        let prim = ch.primitive_index;
-        let i0 = indices[3u * prim + 0u];
-        let i1 = indices[3u * prim + 1u];
-        let i2 = indices[3u * prim + 2u];
-        let bc = ch.barycentrics;
-        let w0 = 1.0 - bc.x - bc.y;
-        var n = normalize(w0 * fetch_normal(i0) + bc.x * fetch_normal(i1) + bc.y * fetch_normal(i2));
-        let viewdir = normalize(cam_pos - p);
-        if (dot(n, viewdir) < 0.0) {
-            n = -n;
+    // Four sub-samples per pixel (jittered on a 2x2 grid), averaged.
+    var col = vec3<f32>(0.0);
+    for (var sy = 0u; sy < 2u; sy = sy + 1u) {
+        for (var sx = 0u; sx < 2u; sx = sx + 1u) {
+            let ox = (f32(sx) - 0.5) * 0.5; // -0.25 / +0.25
+            let oy = (f32(sy) - 0.5) * 0.5;
+            let su = (f32(gx) + 0.5 + ox) * inv_w * 2.0 - 1.0;
+            let sv = (f32(gy) + 0.5 + oy) * inv_h * 2.0 - 1.0;
+            let rd = normalize(fwd + right * (su * fov) + up * (-sv * fov));
+            col = col + shade_ray(cam_pos, rd);
         }
-
-        let lightdir = normalize(vec3<f32>(0.35, 0.85, 0.35));
-        // Traced hard shadow ray, lifted along the normal to avoid self-hit.
-        var srq: ray_query;
-        rayQueryInitialize(&srq, tlas, RayDesc(0u, 0xFFu, 0.02, 50.0, p + n * 0.01, lightdir));
-        while (rayQueryProceed(&srq)) {}
-        let shadowed = rayQueryGetCommittedIntersection(&srq).kind != RAY_QUERY_INTERSECTION_NONE;
-
-        let ndl = max(dot(n, lightdir), 0.0);
-        let ambient = 0.2;
-        var diffuse = ndl;
-        var spec = 0.0;
-        if (shadowed) {
-            diffuse = 0.0;
-        } else {
-            let halfv = normalize(lightdir + viewdir);
-            spec = pow(max(dot(n, halfv), 0.0), 40.0);
-        }
-        let lit = ambient + (1.0 - ambient) * diffuse;
-
-        // Base colour shifts with surface orientation for a bit of life.
-        let orient = 0.5 + 0.5 * n.y;
-        let tint = mix(vec3<f32>(0.90, 0.48, 0.28), vec3<f32>(0.30, 0.62, 0.95), orient);
-        col = tint * lit + vec3<f32>(spec) * 0.6;
     }
+    col = col * 0.25;
 
     col = pow(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
     colorbuf[idx] = pack4x8unorm(vec4<f32>(col, 1.0));

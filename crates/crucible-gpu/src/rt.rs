@@ -48,10 +48,15 @@ use gpu_allocator::MemoryLocation;
 
 use crate::GpuDevice;
 
-/// Camera-fan resolution — 256x256 = 65_536 primary rays per dispatch.
+/// Camera-fan resolution for a plain (headless) run — 256x256 = 65_536 primary
+/// rays per dispatch, the validated QC load.
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 256;
-const N_RAYS: u32 = WIDTH * HEIGHT;
+/// When a preview window is open, render at this resolution instead (native to
+/// the window, so no upscaling), with anti-aliasing — a much crisper image. Only
+/// the preview pays this; a plain `rt` run stays at 256x256.
+#[cfg(all(windows, feature = "preview"))]
+const PREVIEW_RES: u32 = 768;
 /// Compute workgroup size (must match the WGSL `@workgroup_size`).
 const WG: u32 = 64;
 
@@ -279,6 +284,8 @@ struct RtContext {
     // Mapped uniform pointer, so the preview can update shade/time each frame.
     #[cfg(all(windows, feature = "preview"))]
     params_ptr: *mut Params,
+    width: u32,
+    height: u32,
     groups: u32,
 }
 
@@ -540,6 +547,18 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
         }
     };
 
+    // Render resolution: a plain run stays at the validated 256x256 QC load; a
+    // preview renders at the (higher) window resolution for a crisp image.
+    #[cfg(all(windows, feature = "preview"))]
+    let (rt_w, rt_h) = if kernel.preview {
+        (PREVIEW_RES, PREVIEW_RES)
+    } else {
+        (WIDTH, HEIGHT)
+    };
+    #[cfg(not(all(windows, feature = "preview")))]
+    let (rt_w, rt_h) = (WIDTH, HEIGHT);
+    let n_rays = rt_w * rt_h;
+
     // Context skeleton — from here, `?` + Drop handle all cleanup.
     let mut ctx = RtContext {
         _entry: entry,
@@ -568,7 +587,9 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
         color_bytes: 0,
         #[cfg(all(windows, feature = "preview"))]
         params_ptr: std::ptr::null_mut(),
-        groups: N_RAYS.div_ceil(WG),
+        width: rt_w,
+        height: rt_h,
+        groups: n_rays.div_ceil(WG),
     };
 
     // Command pool + buffer + fence.
@@ -625,7 +646,7 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
     ctx.build_tlas(blas_addr)?;
 
     // ---- Output + colour + uniform buffers ----
-    let out_bytes = (N_RAYS as u64) * 4;
+    let out_bytes = (n_rays as u64) * 4;
     let obuf = ctx.make_buffer(
         out_bytes,
         vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -638,7 +659,7 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
     // Colour image (RGBA8), host-visible so the preview can read it back. Always
     // allocated + bound (keeps one descriptor layout); the shader only writes it
     // when shading is on, and its pointer is only kept for a preview build.
-    let color_bytes = (N_RAYS as u64) * 4;
+    let color_bytes = (n_rays as u64) * 4;
     let cbuf = ctx.make_buffer(
         color_bytes,
         vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -655,8 +676,8 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
     // ~60 Hz frames it actually presents, so most dispatches stay pure traversal.
     let params = Params {
         iters: kernel.iters.clamp(1, 1 << 20),
-        width: WIDTH,
-        height: HEIGHT,
+        width: rt_w,
+        height: rt_h,
         shade: 0,
         time: 0.0,
         _pad0: 0,
@@ -1185,15 +1206,14 @@ struct RtPreview {
 
 #[cfg(all(windows, feature = "preview"))]
 impl RtPreview {
-    /// Preview window edge (the traced image is upscaled to fill it).
-    const WIN: u32 = 768;
-
-    fn open(kernel: &RtKernel) -> Option<RtPreview> {
+    /// `res_w`/`res_h` are the render (and window) resolution — the traced image
+    /// is shown 1:1, so it is crisp.
+    fn open(kernel: &RtKernel, res_w: u32, res_h: u32) -> Option<RtPreview> {
         if !kernel.preview {
             return None;
         }
         let title = format!("cec-crucible rt — {}", kernel.device.label());
-        let window = match crate::preview::PreviewWindow::open(&title, Self::WIN, Self::WIN) {
+        let window = match crate::preview::PreviewWindow::open(&title, res_w, res_h) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("note: --preview window unavailable ({e}); running headless");
@@ -1230,13 +1250,7 @@ impl RtPreview {
         ))
         .ok()?;
         let presenter = crate::preview::PixelPresenter::new(
-            &device,
-            &adapter,
-            surface,
-            Self::WIN,
-            Self::WIN,
-            WIDTH,
-            HEIGHT,
+            &device, &adapter, surface, res_w, res_h, res_w, res_h,
         )
         .ok()?;
         Some(RtPreview {
@@ -1307,7 +1321,7 @@ impl LoadKernel for RtKernel {
         // Optional live window (windows+preview build). A failure here just runs
         // headless; the shader already wrote the colour image regardless.
         #[cfg(all(windows, feature = "preview"))]
-        let preview = RtPreview::open(self);
+        let preview = RtPreview::open(self, ctx.width, ctx.height);
 
         let backend = "vulkan-rt".to_string();
         let mut driver = ShapeDriver::start(budget, stop, markers, "rt", backend.clone());
@@ -1395,17 +1409,17 @@ impl LoadKernel for RtKernel {
 
         let secs = start.elapsed().as_secs_f64();
         // Every ray traces `iters` times per dispatch.
-        let traversals =
-            dispatches as f64 * N_RAYS as f64 * self.iters.max(1) as f64;
+        let n_rays = ctx.width * ctx.height;
+        let traversals = dispatches as f64 * n_rays as f64 * self.iters.max(1) as f64;
         let mrays = if secs > 0.0 {
             traversals / secs / 1.0e6
         } else {
             0.0
         };
         let detail = format!(
-            "{label} {backend} {WIDTH}x{HEIGHT} rays x{} traces, {dispatches} dispatch(es), \
+            "{label} {backend} {}x{} rays x{} traces, {dispatches} dispatch(es), \
              {verifications} verified, ~{mrays:.0} Mray/s",
-            self.iters
+            ctx.width, ctx.height, self.iters
         );
         LoadResult::new(true, dispatches, reference.unwrap_or(0), errors, detail)
     }
