@@ -193,9 +193,11 @@ GPU OPTIONS (builds with --features gpu):
                          texture units and ROP the compute thrasher never touches.
     --scene <FILE>       Render a glTF/.glb scene (real game geometry + texture)
                          instead of the procedural mesh. Needs `--features gpu-gltf`.
-    --preview            (render) Pop a live window mirroring the render as it runs.
-                         Needs a `--features preview` (Windows) build; the mirror
-                         never changes what is verified. Close the window to stop.
+    --preview            (render/rt) Pop a live window showing the work as it runs:
+                         render mirrors its framebuffer; rt shows the shaded, self-
+                         shadowed ray-traced image. Needs a `--features preview`
+                         (Windows) build; never changes what is verified. Close the
+                         window to stop.
     --tensor-tiles <N>   Tensor: 16x16 output tiles / warps (default 4096).
     --tensor-iters <N>   Tensor: cmma accumulations per warp per dispatch (default
                          256). `tensor` drives the tensor cores via cooperative
@@ -819,6 +821,9 @@ fn rt_kernel_from(p: &Parsed) -> Result<crucible_gpu::rt::RtKernel, String> {
     if let Some(v) = p.get_u64("rt-iters")? {
         k.iters = v.clamp(1, 1 << 20) as u32;
     }
+    // Live window showing the shaded ray-traced image (needs a --features preview,
+    // Windows build; otherwise a no-op with a note). Never changes verification.
+    k.preview = p.has("preview");
     Ok(k)
 }
 
@@ -845,6 +850,7 @@ fn cmd_rt(rest: &[String]) -> Result<u8, String> {
             "no-report",
             "json",
             "help",
+            "preview",
         ];
         allowed.extend_from_slice(GPU_OPTS);
         allowed.extend_from_slice(SHAPE_OPTS);

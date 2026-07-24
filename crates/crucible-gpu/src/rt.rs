@@ -65,6 +65,10 @@ pub struct RtKernel {
     pub iters: u32,
     /// Read back + checksum every this many dispatches.
     pub verify_every: u64,
+    /// Pop a live window showing the shaded ray-traced image (needs a
+    /// `--features preview`, Windows build; ignored otherwise). Never affects the
+    /// traversal or the checksum.
+    pub preview: bool,
 }
 
 impl Default for RtKernel {
@@ -73,6 +77,7 @@ impl Default for RtKernel {
             device: GpuDevice::Discrete(0),
             iters: 192,
             verify_every: 64,
+            preview: false,
         }
     }
 }
@@ -97,14 +102,15 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// Uniform block handed to the shader. `repr(C)` so the layout matches WGSL's
-/// `struct Params { iters, width, height, _pad: u32 }`.
+/// `struct Params { iters, width, height, shade: u32 }`. `shade` is 1 only when a
+/// preview window is open — then the shader also writes a lit colour image.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Params {
     iters: u32,
     width: u32,
     height: u32,
-    _pad: u32,
+    shade: u32,
 }
 
 /// A displaced grid mesh — enough depth complexity that the rays hit many
@@ -199,6 +205,13 @@ struct RtContext {
     // runtime
     out_ptr: *mut u8,
     out_bytes: u64,
+    // Host-visible RGBA8 colour image the shader writes for the preview window.
+    // The buffer is always allocated + bound (so the descriptor layout is
+    // constant), but its read-back pointer is only kept for a preview build.
+    #[cfg(all(windows, feature = "preview"))]
+    color_ptr: *mut u8,
+    #[cfg(all(windows, feature = "preview"))]
+    color_bytes: u64,
     groups: u32,
 }
 
@@ -482,6 +495,10 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
         scratch_align,
         out_ptr: std::ptr::null_mut(),
         out_bytes: 0,
+        #[cfg(all(windows, feature = "preview"))]
+        color_ptr: std::ptr::null_mut(),
+        #[cfg(all(windows, feature = "preview"))]
+        color_bytes: 0,
         groups: N_RAYS.div_ceil(WG),
     };
 
@@ -523,7 +540,7 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
     // ---- Top-level acceleration structure (one instance of the BLAS) ----
     ctx.build_tlas(blas_addr)?;
 
-    // ---- Output + uniform buffers ----
+    // ---- Output + colour + uniform buffers ----
     let out_bytes = (N_RAYS as u64) * 4;
     let obuf = ctx.make_buffer(
         out_bytes,
@@ -534,11 +551,33 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
     ctx.out_ptr = obuf.ptr;
     ctx.out_bytes = out_bytes;
 
+    // Colour image (RGBA8), host-visible so the preview can read it back. Always
+    // allocated + bound (keeps one descriptor layout); the shader only writes it
+    // when shading is on, and its pointer is only kept for a preview build.
+    let color_bytes = (N_RAYS as u64) * 4;
+    let cbuf = ctx.make_buffer(
+        color_bytes,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        MemoryLocation::GpuToCpu,
+        "rt-color",
+    )?;
+    #[cfg(all(windows, feature = "preview"))]
+    {
+        ctx.color_ptr = cbuf.ptr;
+        ctx.color_bytes = color_bytes;
+    }
+
+    // `shade` = 1 only for a real preview build with the window requested.
+    #[cfg(all(windows, feature = "preview"))]
+    let shade = if kernel.preview { 1u32 } else { 0u32 };
+    #[cfg(not(all(windows, feature = "preview")))]
+    let shade = 0u32;
+
     let params = Params {
         iters: kernel.iters.clamp(1, 1 << 20),
         width: WIDTH,
         height: HEIGHT,
-        _pad: 0,
+        shade,
     };
     let ubuf = ctx.make_buffer(
         std::mem::size_of::<Params>() as u64,
@@ -556,7 +595,7 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
 
     // ---- Descriptors + pipeline ----
     ctx.build_pipeline()?;
-    ctx.write_descriptors(obuf.buffer, ubuf.buffer)?;
+    ctx.write_descriptors(obuf.buffer, ubuf.buffer, cbuf.buffer)?;
     ctx.record_dispatch();
 
     Ok(ctx)
@@ -814,6 +853,11 @@ impl RtContext {
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         self.dsl = unsafe { self.device.create_descriptor_set_layout(&dsl_ci, None) }
@@ -838,14 +882,15 @@ impl RtContext {
         .map_err(|(_, e)| format!("create_compute_pipelines: {e:?}"))?;
         self.pipeline = pipelines[0];
 
-        // Descriptor pool sized for exactly one set of our three descriptors.
+        // Descriptor pool sized for one set: 1 AS, 2 storage buffers (out +
+        // colour), 1 uniform.
         let sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1),
+                .descriptor_count(2),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1),
@@ -864,11 +909,13 @@ impl RtContext {
         Ok(())
     }
 
-    /// Point the descriptor set at the TLAS, the output buffer and the uniforms.
+    /// Point the descriptor set at the TLAS, the output/colour buffers and the
+    /// uniforms.
     fn write_descriptors(
         &mut self,
         out_buf: vk::Buffer,
         uniform_buf: vk::Buffer,
+        color_buf: vk::Buffer,
     ) -> Result<(), String> {
         // Binding 0: the TLAS (the last acceleration structure built).
         let tlas = *self
@@ -906,7 +953,17 @@ impl RtContext {
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(&uni_info);
 
-        let writes = [w0, w1, w2];
+        let color_info = [vk::DescriptorBufferInfo::default()
+            .buffer(color_buf)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let w3 = vk::WriteDescriptorSet::default()
+            .dst_set(self.desc_set)
+            .dst_binding(3)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&color_info);
+
+        let writes = [w0, w1, w2, w3];
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         Ok(())
     }
@@ -962,6 +1019,111 @@ impl RtContext {
         }
         out
     }
+
+    /// Read the shaded colour image (RGBA8) back into a Vec, for the preview.
+    #[cfg(all(windows, feature = "preview"))]
+    fn readback_color(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.color_bytes as usize];
+        if !self.color_ptr.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.color_ptr, out.as_mut_ptr(), out.len());
+            }
+        }
+        out
+    }
+}
+
+/// Live-preview holder for `rt`: a window + a wgpu device (separate from the ash
+/// compute device) that upscales and shows the shaded colour image each frame.
+///
+/// Field order matters: `presenter` (which owns the surface created from the
+/// window's raw handle) is declared before `window` so the surface is dropped
+/// before the window it borrows.
+#[cfg(all(windows, feature = "preview"))]
+struct RtPreview {
+    presenter: crate::preview::PixelPresenter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    window: crate::preview::PreviewWindow,
+}
+
+#[cfg(all(windows, feature = "preview"))]
+impl RtPreview {
+    /// Preview window edge (the traced image is upscaled to fill it).
+    const WIN: u32 = 768;
+
+    fn open(kernel: &RtKernel) -> Option<RtPreview> {
+        if !kernel.preview {
+            return None;
+        }
+        let title = format!("cec-crucible rt — {}", kernel.device.label());
+        let window = match crate::preview::PreviewWindow::open(&title, Self::WIN, Self::WIN) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("note: --preview window unavailable ({e}); running headless");
+                return None;
+            }
+        };
+        let instance = wgpu::Instance::default();
+        // Safety: the window outlives the surface (both owned by this RtPreview,
+        // `presenter` — holding the surface — dropped before `window`).
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(window.raw_display_handle()),
+            raw_window_handle: window.raw_window_handle(),
+        };
+        let surface = match unsafe { instance.create_surface_unsafe(target) } {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("note: --preview surface unavailable ({e}); running headless");
+                return None;
+            }
+        };
+        let adapter = cubecl::future::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: Some(&surface),
+            },
+        ))
+        .ok()?;
+        let (device, queue) = cubecl::future::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("rt-preview"),
+                ..Default::default()
+            },
+        ))
+        .ok()?;
+        let presenter = crate::preview::PixelPresenter::new(
+            &device,
+            &adapter,
+            surface,
+            Self::WIN,
+            Self::WIN,
+            WIDTH,
+            HEIGHT,
+        )
+        .ok()?;
+        Some(RtPreview {
+            window,
+            device,
+            queue,
+            presenter,
+        })
+    }
+
+    /// Pump the window and, when due (~60 Hz), read back the colour image and
+    /// present it. Returns false once the window has been closed.
+    fn show(&self, ctx: &RtContext) -> bool {
+        if !self.window.pump() {
+            return false;
+        }
+        if self.presenter.due() {
+            let pixels = ctx.readback_color();
+            self.presenter
+                .present_rgba(&self.device, &self.queue, &pixels);
+        }
+        true
+    }
 }
 
 impl LoadKernel for RtKernel {
@@ -1001,6 +1163,11 @@ impl LoadKernel for RtKernel {
             ));
         }
         let reference0 = fnv1a(&first);
+
+        // Optional live window (windows+preview build). A failure here just runs
+        // headless; the shader already wrote the colour image regardless.
+        #[cfg(all(windows, feature = "preview"))]
+        let preview = RtPreview::open(self);
 
         let backend = "vulkan-rt".to_string();
         let mut driver = ShapeDriver::start(budget, stop, markers, "rt", backend.clone());
@@ -1047,8 +1214,23 @@ impl LoadKernel for RtKernel {
                             None => reference = Some(h),
                         }
                     }
+
+                    #[cfg(all(windows, feature = "preview"))]
+                    if let Some(pv) = &preview {
+                        if !pv.show(&ctx) {
+                            stop.stop();
+                        }
+                    }
                 }
-                Tick::Idle => {}
+                // Keep the preview responsive through idle phases of a burst shape.
+                Tick::Idle => {
+                    #[cfg(all(windows, feature = "preview"))]
+                    if let Some(pv) = &preview {
+                        if !pv.show(&ctx) {
+                            stop.stop();
+                        }
+                    }
+                }
                 Tick::Stop => break,
             }
         }

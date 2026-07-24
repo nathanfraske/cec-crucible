@@ -158,6 +158,13 @@ coverage-per-effort:
    Validated on the RTX 3070: PASS, 0 errors, **~5.35 Gray/s** steady (~2.64 Gray/s
    burst). `--rt-iters` sets traces/ray (load + TDR knob). `gpu-allocator` handles
    device memory + the buffer-device-address allocate flag the AS build requires.
+   Optional `rt --preview` (opt-in `preview` feature, Windows) pops a live window
+   showing the ray-traced image: the shader additionally writes a shaded colour
+   image (Lambertian from the grid's analytic normal + a *traced hard shadow ray*
+   per pixel, so the surface self-shadows — visibly the RT cores doing secondary
+   rays) which a small wgpu present path upscales into the window. Gated by a
+   `shade` uniform so a plain `rt` run does zero extra ray work and the checksum is
+   byte-identical.
 
 All four implement `LoadKernel`, so they drop into the shared shape/stop/phase/
 marker machinery with no orchestrator change and immediately gain the chaos /

@@ -391,3 +391,270 @@ impl Presenter {
         frame.present();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pixel present path (for kernels that produce a CPU-side image, e.g. `rt`,
+// whose compute runs on raw Vulkan and hands us finished RGBA8 pixels)
+// ---------------------------------------------------------------------------
+
+/// A fullscreen-triangle blit that samples an uploaded image into the swapchain.
+/// Linear filtering upscales a small traced image to a comfortable window size.
+const BLIT_WGSL: &str = r#"
+@group(0) @binding(0) var img: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VsOut {
+    var o: VsOut;
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    o.uv = vec2<f32>(x, y);
+    o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    return o;
+}
+
+@fragment
+fn fs(v: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(img, samp, v.uv);
+}
+"#;
+
+/// Presents CPU-supplied RGBA8 images by uploading them to a texture and blitting
+/// (with linear upscale) to the swapchain. Used by kernels whose rendering does
+/// not happen on this wgpu device.
+pub struct PixelPresenter {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    upload: wgpu::Texture,
+    img_w: u32,
+    img_h: u32,
+    last: Cell<Instant>,
+    interval: Duration,
+}
+
+impl PixelPresenter {
+    /// `win_w`/`win_h` size the window (swapchain); `img_w`/`img_h` are the size
+    /// of the CPU images that will be uploaded and upscaled to fill it.
+    pub fn new(
+        device: &wgpu::Device,
+        adapter: &wgpu::Adapter,
+        surface: wgpu::Surface<'static>,
+        win_w: u32,
+        win_h: u32,
+        img_w: u32,
+        img_h: u32,
+    ) -> Result<Self, String> {
+        let caps = surface.get_capabilities(adapter);
+        // Prefer a non-sRGB format: the shader already gamma-encodes the image, so
+        // an sRGB swapchain would double-encode and wash it out.
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .or_else(|| caps.formats.first().copied())
+            .ok_or_else(|| "surface reports no formats".to_string())?;
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+            wgpu::PresentMode::Immediate
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: win_w,
+            height: win_h,
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            view_formats: vec![],
+        };
+        surface.configure(device, &config);
+
+        let upload = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("preview-upload"),
+            size: wgpu::Extent3d {
+                width: img_w,
+                height: img_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let upload_view = upload.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("preview-samp"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("preview-blit"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("preview-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("preview-bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&upload_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("preview-pl"),
+            bind_group_layouts: &[Some(&bgl)],
+            ..Default::default()
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("preview-pipe"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(format.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: Default::default(),
+            cache: None,
+        });
+
+        Ok(PixelPresenter {
+            surface,
+            config,
+            pipeline,
+            bind_group,
+            upload,
+            img_w,
+            img_h,
+            last: Cell::new(Instant::now() - Duration::from_secs(1)),
+            interval: Duration::from_millis(16),
+        })
+    }
+
+    /// Whether enough time has elapsed to present again (~60 Hz). Callers use
+    /// this to skip the (comparatively expensive) image read-back when not due.
+    pub fn due(&self) -> bool {
+        self.last.get().elapsed() >= self.interval
+    }
+
+    /// Upload one RGBA8 image (`img_w * img_h * 4` bytes) and blit it to the
+    /// window, rate-limited to ~60 Hz. Cheap no-op if called too soon.
+    pub fn present_rgba(&self, device: &wgpu::Device, queue: &wgpu::Queue, pixels: &[u8]) {
+        if self.last.get().elapsed() < self.interval {
+            return;
+        }
+        self.last.set(Instant::now());
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.upload,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.img_w * 4),
+                rows_per_image: Some(self.img_h),
+            },
+            wgpu::Extent3d {
+                width: self.img_w,
+                height: self.img_h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                f
+            }
+            _ => {
+                self.surface.configure(device, &self.config);
+                return;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview-blit-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: Default::default(),
+            });
+            rp.set_pipeline(&self.pipeline);
+            rp.set_bind_group(0, &self.bind_group, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        queue.submit(Some(enc.finish()));
+        frame.present();
+    }
+}

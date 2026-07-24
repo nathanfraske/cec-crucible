@@ -31,6 +31,15 @@ self-consistency read-backs at ~5.35 Gray/s (steady) / ~2.64 Gray/s (burst, 50%
 duty) — a throughput only possible with hardware RT-core acceleration. The scoping
 that led here is preserved below.
 
+Optional `rt --preview` (opt-in `preview` feature, Windows) shows the ray-tracing
+live: the shader additionally writes a shaded colour image — Lambertian off the
+grid's analytic normal plus a **traced hard shadow ray per pixel** (the surface
+self-shadows, visibly the RT cores doing primary + secondary rays) — which a small
+separate wgpu present path upscales into a hand-rolled Win32 window. Gated by a
+`shade` uniform so a plain `rt` run does zero extra ray work and produces a
+byte-identical checksum; the shading and the ~60 Hz present cost ~20% throughput
+while the window is open (they compete on the GPU), and nothing when it is closed.
+
 
 
 **[VERIFIED, `wgpu-types-29.0.4/src/features.rs`]** wgpu 29 exposes exactly one
