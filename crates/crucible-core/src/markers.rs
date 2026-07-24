@@ -8,11 +8,59 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::clock::{Clock, Timestamp};
 use crate::json::Json;
+
+/// Live per-lane activity for an in-process UI (`--ui`) or a harness readout.
+///
+/// Separate from the marker log (which only records *edges*, and only for bursty
+/// shapes): a lane carries a running work counter and a current phase, so the UI
+/// can show steady kernels and per-core activity too. Updates are plain relaxed
+/// atomics on an `Arc` each worker holds — no lock on the hot path — and the
+/// whole mechanism is inert unless a UI enabled it (see [`MarkerLog::live_on`]).
+#[derive(Debug)]
+pub struct LiveLane {
+    pub label: String,
+    pub work: AtomicU64,
+    pub errors: AtomicU64,
+    /// 0 = idle, 1 = working, 2 = done.
+    pub phase: AtomicU8,
+}
+
+pub const PHASE_IDLE: u8 = 0;
+pub const PHASE_WORK: u8 = 1;
+pub const PHASE_DONE: u8 = 2;
+
+impl LiveLane {
+    fn new(label: String) -> LiveLane {
+        LiveLane {
+            label,
+            work: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            phase: AtomicU8::new(PHASE_IDLE),
+        }
+    }
+    #[inline]
+    pub fn bump_work(&self) {
+        self.work.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn set_phase(&self, p: u8) {
+        self.phase.store(p, Ordering::Relaxed);
+    }
+}
+
+/// An immutable snapshot of one lane for the renderer.
+#[derive(Debug, Clone)]
+pub struct LaneSnap {
+    pub label: String,
+    pub work: u64,
+    pub errors: u64,
+    pub phase: u8,
+}
 
 /// The kind of transition a marker records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +125,10 @@ pub struct MarkerLog {
     clock: Clock,
     seq: AtomicU64,
     markers: Mutex<Vec<Marker>>,
+    /// Live lanes for the UI. Registered once per worker; empty and untouched
+    /// unless a UI turned tracking on.
+    live: Mutex<Vec<Arc<LiveLane>>>,
+    live_on: AtomicBool,
 }
 
 impl MarkerLog {
@@ -85,7 +137,48 @@ impl MarkerLog {
             clock,
             seq: AtomicU64::new(0),
             markers: Mutex::new(Vec::new()),
+            live: Mutex::new(Vec::new()),
+            live_on: AtomicBool::new(false),
         }
+    }
+
+    /// Turn live-lane tracking on (an in-process UI does this). While off,
+    /// [`register_lane`](Self::register_lane) returns `None`, so kernels do no
+    /// live bookkeeping at all — the default, zero-overhead path.
+    pub fn enable_live(&self) {
+        self.live_on.store(true, Ordering::Relaxed);
+    }
+
+    pub fn live_enabled(&self) -> bool {
+        self.live_on.load(Ordering::Relaxed)
+    }
+
+    /// Register (or fetch the existing) live lane for `label`. Returns `None`
+    /// when tracking is off so the caller skips all per-tick bookkeeping.
+    pub fn register_lane(&self, label: &str) -> Option<Arc<LiveLane>> {
+        if !self.live_enabled() {
+            return None;
+        }
+        let mut g = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(l) = g.iter().find(|l| l.label == label) {
+            return Some(Arc::clone(l));
+        }
+        let lane = Arc::new(LiveLane::new(label.to_string()));
+        g.push(Arc::clone(&lane));
+        Some(lane)
+    }
+
+    /// Snapshot every lane's current counters for the renderer.
+    pub fn live_snapshot(&self) -> Vec<LaneSnap> {
+        let g = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter()
+            .map(|l| LaneSnap {
+                label: l.label.clone(),
+                work: l.work.load(Ordering::Relaxed),
+                errors: l.errors.load(Ordering::Relaxed),
+                phase: l.phase.load(Ordering::Relaxed),
+            })
+            .collect()
     }
 
     /// The clock backing this log — kernels read `now()` from it when they need

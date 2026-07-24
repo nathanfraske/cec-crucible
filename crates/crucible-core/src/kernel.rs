@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::markers::{Event, MarkerLog};
+use crate::markers::{Event, LiveLane, MarkerLog, PHASE_DONE, PHASE_IDLE, PHASE_WORK};
 
 /// Which hardware domain a kernel exercises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +313,8 @@ pub struct ShapeDriver<'a> {
     seg_start: Duration,
     seg_end: Duration,
     detail: String,
+    /// Live-UI lane for this kernel; `None` unless a UI enabled tracking.
+    lane: Option<Arc<LiveLane>>,
 }
 
 impl<'a> ShapeDriver<'a> {
@@ -345,7 +347,14 @@ impl<'a> ShapeDriver<'a> {
             seg_start: Duration::ZERO,
             seg_end: Duration::ZERO,
             detail: detail.into(),
+            lane: markers.register_lane(kernel),
         }
+    }
+
+    /// Point this driver's live lane at a different label (the CPU kernel uses
+    /// this to report per-core lanes while keeping the marker kernel name "cpu").
+    pub fn relabel_lane(&mut self, label: &str) {
+        self.lane = self.markers.register_lane(label);
     }
 
     /// Cap on how long an off-phase nap runs, so the loop stays responsive to
@@ -363,9 +372,12 @@ impl<'a> ShapeDriver<'a> {
     pub fn tick(&mut self) -> Tick {
         if self.stop.stopped() || Instant::now() >= self.deadline {
             self.close_burst();
+            if let Some(l) = &self.lane {
+                l.set_phase(PHASE_DONE);
+            }
             return Tick::Stop;
         }
-        match self.shape {
+        let t = match self.shape {
             Shape::Steady => Tick::Work,
             Shape::Burst { on, off } => self.duty_tick(on, off, Self::MAX_NAP),
             // Pulse is a burst with a deep idle so the core reaches C6.
@@ -378,7 +390,19 @@ impl<'a> ShapeDriver<'a> {
                 floor_pct,
                 seed,
             } => self.jitter_tick(on_min, on_max, off_min, off_max, floor_pct, seed),
+        };
+        // Feed the live UI lane (no-op when no UI enabled tracking).
+        if let Some(l) = &self.lane {
+            match t {
+                Tick::Work => {
+                    l.set_phase(PHASE_WORK);
+                    l.bump_work();
+                }
+                Tick::Idle => l.set_phase(PHASE_IDLE),
+                Tick::Stop => {}
+            }
         }
+        t
     }
 
     /// Fixed-period duty cycle (Burst and Pulse): Work during the on-window,

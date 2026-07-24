@@ -214,6 +214,8 @@ fn run_one(
 ) -> ThreadOut {
     let pinned = pin_current_thread(core);
     let mut driver = ShapeDriver::start(budget, stop, markers, "cpu", label.to_string());
+    // Report a per-core live lane to the UI (markers still use the "cpu" name).
+    driver.relabel_lane(&format!("core {core}"));
     let start = Instant::now();
 
     let mut work_units = 0u64;

@@ -32,5 +32,7 @@ pub use clock::{Clock, Timestamp};
 pub use device::DeviceId;
 pub use json::Json;
 pub use kernel::{Budget, Kind, LoadKernel, LoadResult, Shape, ShapeDriver, StopFlag, Tick};
-pub use markers::{Event, Marker, MarkerLog};
+pub use markers::{
+    Event, LaneSnap, LiveLane, Marker, MarkerLog, PHASE_DONE, PHASE_IDLE, PHASE_WORK,
+};
 pub use report::{Report, StageReport, Verdict};
