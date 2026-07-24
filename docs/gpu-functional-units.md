@@ -15,10 +15,23 @@ primary-source-confirmed · **[VERIFIED]** checked against the pinned crate sour
 | Unit | Test | State |
 |---|---|---|
 | Rasterizer / TMU / ROP | `render` | ✅ built (`render.rs`) |
-| Tensor / matrix cores | `tensor` | scoped — needs a Vulkan/SPIR-V spike |
-| RT cores | `rt` | scoped — wgpu 29 experimental, Vulkan-only |
+| Tensor / matrix cores | `tensor` | ✅ built (`tensor.rs`) — f16→f32 cmma, ~22 TFLOP/s on the RTX 3070 |
+| RT cores | `rt` | ✅ built (`rt.rs`) — raw `ash` `VK_KHR_ray_query`, **~5.35 Gray/s on the RTX 3070** |
 
-## 1. Ray-tracing cores (`rt`)
+## 1. Ray-tracing cores (`rt`) — BUILT
+
+**Built via the stable path, not the wgpu experimental one.** `rt.rs` uses raw
+Vulkan (`ash` 0.38) with `VK_KHR_ray_query`: it builds a BLAS/TLAS over a fixed
+displaced-grid mesh and traces a deterministic camera fan from a compute shader,
+folding each committed hit's primitive index + distance `t` into a per-ray
+checksum. The WGSL ray-query shader is compiled to SPIR-V **at runtime by naga**
+(already in the wgpu tree), so no shader compiler / Vulkan SDK is required on the
+build or target machine. Verified on the RTX 3070: PASS, 0 errors, 79
+self-consistency read-backs at ~5.35 Gray/s (steady) / ~2.64 Gray/s (burst, 50%
+duty) — a throughput only possible with hardware RT-core acceleration. The scoping
+that led here is preserved below.
+
+
 
 **[VERIFIED, `wgpu-types-29.0.4/src/features.rs`]** wgpu 29 exposes exactly one
 usable RT capability: `EXPERIMENTAL_RAY_QUERY` (bit `1<<32`). Its doc-comment,

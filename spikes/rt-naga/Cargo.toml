@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Standalone spike: prove naga can compile a WGSL ray-query compute shader to
+# SPIR-V with no external shader compiler installed. Detached from the root
+# workspace via the empty [workspace] table below.
+[workspace]
+
+[package]
+name = "rt-naga-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "rt-naga-spike"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the exact naga that wgpu 29 already pulls into the GPU crate, so the
+# spike proves the version we actually ship with.
+naga = { version = "=29.0.4", features = ["wgsl-in", "spv-out"] }

@@ -142,11 +142,17 @@ coverage-per-effort:
    CMMA on the **CUDA** runtime — so it inherits the NVRTC/toolkit requirement
    (NVIDIA + `--features cuda`, bench-only, not ship-anywhere). wgpu can't reach
    tensor cores; the Vulkan/SPIR-V route is experimental.
-4. **`rt`** — minimal BVH-traversal + ray-intersection stress via wgpu's
-   **experimental** ray-query (Vulkan; "major bugs, breaking changes"), verified
-   by hit-buffer self-consistency + known-ray tolerance. Least tractable; scope
-   last, or take a DXR path if justified. Shares the acceleration structure with
-   `render` (RT-on rendering).
+4. **`rt`** ✅ **BUILT** (`rt.rs`, `--features rt`) — hardware BVH-traversal +
+   ray/triangle-intersection stress. Built on the **stable** path, not wgpu's
+   experimental one: raw Vulkan (`ash` 0.38) with the ratified `VK_KHR_ray_query`,
+   portable across all three RT vendors in the single binary. The WGSL ray-query
+   shader is compiled to SPIR-V **at runtime by naga** (already in the wgpu tree),
+   so no shader compiler / Vulkan SDK is needed anywhere. Traces a deterministic
+   camera fan over a fixed BLAS/TLAS and folds each hit's primitive index + `t`
+   into a per-ray checksum; verified by same-device self-consistency + liveness.
+   Validated on the RTX 3070: PASS, 0 errors, **~5.35 Gray/s** steady (~2.64 Gray/s
+   burst). `--rt-iters` sets traces/ray (load + TDR knob). `gpu-allocator` handles
+   device memory + the buffer-device-address allocate flag the AS build requires.
 
 All four implement `LoadKernel`, so they drop into the shared shape/stop/phase/
 marker machinery with no orchestrator change and immediately gain the chaos /

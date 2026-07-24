@@ -491,11 +491,14 @@ dependencies = [
 name = "crucible-gpu"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "crucible-core",
  "cubecl",
  "cudarc",
  "gltf",
+ "gpu-allocator",
  "half",
+ "naga",
  "wgpu",
 ]
 

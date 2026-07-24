@@ -34,6 +34,8 @@
 
 pub mod link;
 pub mod render;
+#[cfg(feature = "rt")]
+pub mod rt;
 #[cfg(feature = "tensor")]
 pub mod tensor;
 pub mod vram;

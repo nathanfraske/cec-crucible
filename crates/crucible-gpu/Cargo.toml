@@ -38,6 +38,22 @@ gltf = { version = "1.4", optional = true, default-features = false, features = 
     "import",
     "utils",
 ] }
+# RT-core (ray-query) test. Raw Vulkan (ash) is the only portable, single-binary
+# path to hardware ray traversal — wgpu's ray-query is experimental/Vulkan-only,
+# OptiX is NVIDIA-only. Pinned to 0.38 (the ABI cubecl-spirv already links, so no
+# duplicate ash in the tree). gpu-allocator handles device memory + the
+# device-address allocate flag the acceleration structures require. naga (already
+# in the wgpu tree) compiles the WGSL ray-query shader to SPIR-V at runtime, so no
+# external shader compiler is needed. All three are pulled ONLY with `rt`.
+ash = { version = "=0.38.0", optional = true, default-features = false, features = [
+    "std",
+    "loaded",
+] }
+gpu-allocator = { version = "0.28", optional = true, default-features = false, features = [
+    "vulkan",
+    "std",
+] }
+naga = { version = "=29.0.4", optional = true, features = ["wgsl-in", "spv-out"] }
 
 [features]
 # CUDA compute (the thrasher via CubeCL's CUDA runtime) needs NVRTC at runtime;
@@ -49,3 +65,8 @@ cuda = ["cubecl/cuda", "dep:cudarc"]
 tensor = ["cubecl/vulkan", "dep:half"]
 # glTF/PBR scene rendering for the `render` kernel (bundled or --scene).
 gpu-gltf = ["dep:gltf"]
+# RT-core (ray-query) test via raw Vulkan. Portable, single-binary hardware ray
+# traversal; the shader is compiled from WGSL to SPIR-V at runtime by naga, so no
+# shader compiler is required on the build or target machine.
+#   cargo build --release -p crucible-cli --features rt
+rt = ["dep:ash", "dep:gpu-allocator", "dep:naga"]

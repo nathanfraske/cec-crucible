@@ -13,3 +13,4 @@ spikes/*/*.log
 crucible-*.report.json
 crucible-*.markers.jsonl
 crucible-scratch-*.tmp
+spikes/*/*.spv

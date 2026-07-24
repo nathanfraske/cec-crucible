@@ -31,6 +31,11 @@ tensor = ["gpu", "crucible-gpu/tensor"]
 # glTF/PBR scene rendering for the `render` kernel (`--scene <file>`).
 #   cargo build --release -p crucible-cli --features gpu-gltf
 gpu-gltf = ["gpu", "crucible-gpu/gpu-gltf"]
+# Ray-tracing-core (ray-query) test — raw Vulkan, portable single binary. The
+# shader is compiled from WGSL to SPIR-V at runtime (naga), so no shader compiler
+# is needed on the build or target machine. Implies gpu.
+#   cargo build --release -p crucible-cli --features rt
+rt = ["gpu", "crucible-gpu/rt"]
 # Opt-in live terminal UI (`--ui`), built on crossterm. Off by default so the
 # standard build stays zero-dependency and scriptable for the harness.
 #   cargo build --release -p crucible-cli --features gpu,tui
