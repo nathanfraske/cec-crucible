@@ -70,6 +70,10 @@ pub struct LinkKernel {
     /// 256 MiB DMA is milliseconds) and clamped to the adapter's max buffer.
     pub buf_mb: usize,
     pub dir: LinkDir,
+    /// Use the CUDA transfer path (pinned memory + separate streams for true
+    /// full-duplex on the GPU's copy engines). NVIDIA only; requires the `cuda`
+    /// build feature. Ignored on the wgpu path.
+    pub cuda: bool,
 }
 
 impl Default for LinkKernel {
@@ -78,6 +82,7 @@ impl Default for LinkKernel {
             device: GpuDevice::Discrete(0),
             buf_mb: 256,
             dir: LinkDir::Both,
+            cuda: false,
         }
     }
 }
@@ -293,6 +298,23 @@ impl LoadKernel for LinkKernel {
             gbps(want_bytes * reps, t.elapsed().as_secs_f64())
         };
 
+        // CUDA transfer path (pinned + dual-stream full-duplex). Only compiled
+        // with the `cuda` feature and only when requested. `run_cuda` probes the
+        // driver at runtime and returns None if CUDA isn't actually available,
+        // in which case we fall through to the portable wgpu path.
+        #[cfg(feature = "cuda")]
+        if self.cuda {
+            if let Some(result) = self.run_cuda(budget, stop, markers, host_gbps, &pattern) {
+                return result;
+            }
+            markers.stamp(
+                Event::Mark,
+                "pcie",
+                "cuda-fallback",
+                "CUDA unavailable -> wgpu",
+            );
+        }
+
         // Init adapter/device + pool under catch_unwind so a driver/validation
         // panic becomes a clean setup failure instead of taking down the run.
         let gpu = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -401,6 +423,210 @@ impl LoadKernel for LinkKernel {
         }
 
         LoadResult::new(true, transfers, want_hash, errors, detail)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl LinkKernel {
+    /// CUDA transfer path. Pinned host buffers + two streams let H2D and D2H run
+    /// on the GPU's separate copy engines *at the same time* — true full-duplex,
+    /// which wgpu's single queue cannot do. Measures H2D solo, D2H solo, and the
+    /// simultaneous aggregate, splitting the budget three ways. Driver-only: no
+    /// NVRTC, so it runs with just the NVIDIA driver, no CUDA toolkit.
+    ///
+    /// Uses `cudarc` directly rather than CubeCL's CUDA runtime: CubeCL's
+    /// transfer primitives allocate a fresh buffer per call (which is what made
+    /// the wgpu-via-CubeCL numbers meaningless), and this path needs a reused
+    /// pool + explicit streams for full-duplex. It still *detects* CUDA the same
+    /// way — `CudaContext::new` probes the driver at runtime (loading nvcuda.dll
+    /// dynamically); if there is no NVIDIA driver/device this returns `None` and
+    /// the caller falls back to wgpu. It is never assumed present.
+    fn run_cuda(
+        &self,
+        budget: &Budget,
+        stop: &StopFlag,
+        markers: &MarkerLog,
+        host_gbps: f64,
+        pattern: &[u8],
+    ) -> Option<LoadResult> {
+        use cudarc::driver::CudaContext;
+        use std::panic::AssertUnwindSafe;
+
+        let bytes = pattern.len();
+
+        // Runtime capability probe: this actually initializes the CUDA driver on
+        // device 0. Absent driver / non-NVIDIA GPU -> Err/panic -> None (fall
+        // back to wgpu). This is the detection, not an assumption.
+        let setup = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<_, String> {
+            let ctx = CudaContext::new(0).map_err(|e| format!("{e:?}"))?;
+            let up = ctx.new_stream().map_err(|e| format!("{e:?}"))?;
+            let dn = ctx.new_stream().map_err(|e| format!("{e:?}"))?;
+            Ok((ctx, up, dn))
+        }));
+        let (ctx, up, dn) = match setup {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                eprintln!("note: CUDA not available ({e}); falling back to the wgpu link path");
+                return None;
+            }
+            Err(_) => {
+                eprintln!("note: CUDA not available (no NVIDIA driver?); falling back to wgpu");
+                return None;
+            }
+        };
+
+        let alloc = (|| -> Result<_, String> {
+            let dev_up = up
+                .alloc_zeros::<u8>(bytes)
+                .map_err(|e| format!("device alloc: {e:?}"))?;
+            let dev_dn = dn
+                .alloc_zeros::<u8>(bytes)
+                .map_err(|e| format!("device alloc: {e:?}"))?;
+            // SAFETY: memory is uninitialised; we fill pin_up before reading it
+            // and only ever write pin_dn from the GPU before reading it back.
+            let pin_up = unsafe { ctx.alloc_pinned::<u8>(bytes) }
+                .map_err(|e| format!("pinned alloc: {e:?}"))?;
+            let pin_dn = unsafe { ctx.alloc_pinned::<u8>(bytes) }
+                .map_err(|e| format!("pinned alloc: {e:?}"))?;
+            Ok((dev_up, dev_dn, pin_up, pin_dn))
+        })();
+        let (mut dev_up, mut dev_dn, mut pin_up, mut pin_dn) = match alloc {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "note: CUDA alloc failed ({e}); falling back to wgpu (try a smaller --link-mb)"
+                );
+                return None;
+            }
+        };
+
+        // Fill the pinned upload source, and seed the download source device
+        // buffer with the pattern (one H2D) so the read-back can be verified.
+        if let Ok(s) = pin_up.as_mut_slice() {
+            s.copy_from_slice(pattern);
+        }
+        let src: &[u8] = match pin_up.as_slice() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("note: CUDA pinned read failed ({e:?}); falling back to wgpu");
+                return None;
+            }
+        };
+        if dn.memcpy_htod(src, &mut dev_dn).is_err() || dn.synchronize().is_err() {
+            eprintln!("note: CUDA seed transfer failed; falling back to wgpu");
+            return None;
+        }
+
+        markers.stamp(
+            Event::Mark,
+            "pcie",
+            "cuda",
+            &format!(
+                "{} cuda {}MiB dual-stream",
+                self.device.label(),
+                bytes / (1024 * 1024)
+            ),
+        );
+
+        let third = budget.duration / 3;
+        let mut lost = false;
+
+        // Phase 1 — H2D solo.
+        let (mut h2d_bytes, mut h2d_secs) = (0u64, 0.0f64);
+        let end = Instant::now() + third;
+        while !stop.stopped() && Instant::now() < end && !lost {
+            let t = Instant::now();
+            if up.memcpy_htod(src, &mut dev_up).is_err() || up.synchronize().is_err() {
+                lost = true;
+                break;
+            }
+            h2d_secs += t.elapsed().as_secs_f64();
+            h2d_bytes += bytes as u64;
+        }
+
+        // Phase 2 — D2H solo.
+        let (mut d2h_bytes, mut d2h_secs) = (0u64, 0.0f64);
+        let end = Instant::now() + third;
+        while !stop.stopped() && Instant::now() < end && !lost {
+            let t = Instant::now();
+            let ok = match pin_dn.as_mut_slice() {
+                Ok(dst) => dn.memcpy_dtoh(&dev_dn, dst).is_ok(),
+                Err(_) => false,
+            };
+            if !ok || dn.synchronize().is_err() {
+                lost = true;
+                break;
+            }
+            d2h_secs += t.elapsed().as_secs_f64();
+            d2h_bytes += bytes as u64;
+        }
+
+        // Phase 3 — full-duplex: both directions enqueued before syncing, on
+        // separate streams, so they run on separate copy engines at once.
+        let (mut dup_bytes, mut dup_secs) = (0u64, 0.0f64);
+        let end = Instant::now() + third;
+        while !stop.stopped() && Instant::now() < end && !lost {
+            let t = Instant::now();
+            let enq_up = up.memcpy_htod(src, &mut dev_up).is_ok();
+            let enq_dn = match pin_dn.as_mut_slice() {
+                Ok(dst) => dn.memcpy_dtoh(&dev_dn, dst).is_ok(),
+                Err(_) => false,
+            };
+            if !enq_up || !enq_dn || up.synchronize().is_err() || dn.synchronize().is_err() {
+                lost = true;
+                break;
+            }
+            dup_secs += t.elapsed().as_secs_f64();
+            dup_bytes += 2 * bytes as u64;
+        }
+
+        // Integrity: the read-back must equal the pattern we seeded.
+        let mut errors = 0u64;
+        let mut verify_note = String::new();
+        match pin_dn.as_slice() {
+            Ok(s) if s == pattern => {}
+            Ok(s) => {
+                errors += 1;
+                let i = s.iter().zip(pattern).position(|(a, b)| a != b).unwrap_or(0);
+                verify_note = format!("; VERIFY FAIL: first mismatch at byte {i}");
+            }
+            Err(_) => {
+                errors += 1;
+                verify_note = "; VERIFY FAIL: could not read pinned buffer".to_string();
+            }
+        }
+
+        let h2d = gbps(h2d_bytes, h2d_secs);
+        let d2h = gbps(d2h_bytes, d2h_secs);
+        let dup = gbps(dup_bytes, dup_secs);
+        let total_gib = (h2d_bytes + d2h_bytes + dup_bytes) as f64 / (1024.0 * 1024.0 * 1024.0);
+        let full_duplex = dup > h2d.max(d2h) * 1.15;
+
+        let mut detail = format!(
+            "{} cuda {}MiB dual-stream, {:.1} GiB moved, H2D ~{h2d:.1} GB/s, D2H ~{d2h:.1} GB/s, \
+             full-duplex ~{dup:.1} GB/s ({}), host-RAM ~{host_gbps:.1} GB/s",
+            self.device.label(),
+            bytes / (1024 * 1024),
+            total_gib,
+            if full_duplex {
+                "both engines overlapping"
+            } else {
+                "no overlap gain"
+            },
+        );
+        if lost {
+            detail.push_str("; DEVICE LOST / transfer error");
+            errors += 1;
+        }
+        if dup_bytes == 0 && !lost {
+            detail.push_str("; NO TRANSFERS COMPLETED");
+            errors += 1;
+        }
+        detail.push_str(&verify_note);
+
+        // Keep the context alive until here.
+        drop(ctx);
+        Some(LoadResult::new(true, 1, 0, errors, detail))
     }
 }
 

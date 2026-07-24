@@ -46,6 +46,7 @@ const COMMON_BOOLS: &[&str] = &[
     "unbuffered",
     "all-drives",
     "gpu-alu-only",
+    "link-cuda",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -61,6 +62,7 @@ const GPU_OPTS: &[&str] = &[
     "vram-chunk-mb",
     "link-mb",
     "link-dir",
+    "link-cuda",
 ];
 
 const USAGE: &str = "\
@@ -137,6 +139,10 @@ GPU OPTIONS (builds with --features gpu):
     --link-mb <N>        PCIe transfer buffer size in MiB (default 256).
     --link-dir <up|down|bidir>   Transfer direction (default bidir; only bidir
                          and down verify data — up-only has no read-back).
+    --link-cuda          Use the CUDA transfer path: pinned memory + two streams
+                         for true full-duplex (both copy engines at once), which
+                         wgpu's single queue can't do. NVIDIA + `--features cuda`
+                         build; probed at runtime, falls back to wgpu if absent.
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -531,6 +537,9 @@ fn link_kernel_from(p: &Parsed) -> Result<crucible_gpu::link::LinkKernel, String
         "bidir" | "both" => LinkDir::Both,
         other => return Err(format!("--link-dir expects up|down|bidir, got '{other}'")),
     };
+    // CUDA path: pinned + dual-stream full-duplex. Probed at runtime; falls back
+    // to wgpu if no NVIDIA driver. Only compiled in a `--features cuda` build.
+    k.cuda = p.has("link-cuda");
     Ok(k)
 }
 
@@ -830,8 +839,12 @@ fn run_transient_scenario(runner: &mut Runner, p: &Parsed, profile: &str) -> Res
 /// *verifies its own data* while the platform is maximally contended, so a
 /// corruption that only appears under full load has nowhere to hide.
 ///
-/// Note this does not yet load PCIe — the GPU kernels are on-card traffic. A
-/// dedicated host↔device transfer test is a separate, planned piece.
+/// PCIe is loaded too: a verified host↔device transfer runs underneath, so the
+/// link is exercised *while* the RAM controller and DMA engines are already
+/// saturated — the condition under which a marginal riser or slot is most
+/// likely to surface (fault-mode gap G1). It respects `--link-cuda` /
+/// `--link-mb` / `--link-dir`; without them it uses the always-available wgpu
+/// path.
 fn run_worst_case(runner: &mut Runner, p: &Parsed) -> Result<u8, String> {
     let dur = Duration::from_secs(seconds_arg(p, 120)?);
     let on = p.get_u64("burst-on")?.unwrap_or(20).clamp(1, MAX_BURST_MS);
@@ -885,6 +898,19 @@ fn run_worst_case(runner: &mut Runner, p: &Parsed) -> Result<u8, String> {
         stages.push(PhasedStage {
             kernel: Box::new(vram),
             mode: format!("integrity {vram_label}"),
+            budget: Budget::steady(dur),
+            phase_offset: Duration::ZERO,
+        });
+
+        // PCIe under contention (gap G1): a verified host<->device transfer
+        // running while the RAM controller and DMA engines are already
+        // saturated by everything above. Steady, so the link is never idle.
+        let link = link_kernel_from(p)?;
+        let link_label = link.device.label();
+        let link_via = if link.cuda { "cuda" } else { "wgpu" };
+        stages.push(PhasedStage {
+            kernel: Box::new(link),
+            mode: format!("transfer {link_label} {link_via}"),
             budget: Budget::steady(dur),
             phase_offset: Duration::ZERO,
         });

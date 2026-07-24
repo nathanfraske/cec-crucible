@@ -21,6 +21,10 @@ unsafe_op_in_unsafe_fn = "warn"
 # buildable. Turn on for the full shipped binary:
 #   cargo build --release -p crucible-cli --features gpu
 gpu = ["dep:crucible-gpu"]
+# Adds the CUDA transfer path for the PCIe link test (NVIDIA, driver-only, no
+# CUDA toolkit needed). Implies gpu.
+#   cargo build --release -p crucible-cli --features cuda
+cuda = ["gpu", "crucible-gpu/cuda"]
 
 [dependencies]
 crucible-core = { path = "../crucible-core" }

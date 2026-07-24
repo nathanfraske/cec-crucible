@@ -20,9 +20,18 @@ description = "GPU load kernel for cec-crucible: CubeCL thrasher with load shape
 crucible-core = { path = "../crucible-core" }
 cubecl = { version = "0.10", features = ["wgpu"] }
 wgpu = { version = "29", default-features = false, features = ["dx12", "vulkan", "wgsl"] }
+# cudarc drives the CUDA *transfer* path for the PCIe link test (pinned host
+# memory + multiple streams = true full-duplex on the GPU's copy engines).
+# Unlike the CubeCL CUDA compute runtime, a transfer-only workload never touches
+# NVRTC, so this path runs on a machine with the driver but no CUDA toolkit.
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "driver",
+    "std",
+    "cuda-version-from-build-system",
+    "fallback-dynamic-loading",
+] }
 
 [features]
-# CUDA is opt-in only: spike 3a proved it builds without a CUDA toolkit but will
-# NOT run without one (CubeCL JIT-compiles through NVRTC, and nvrtc.dll ships
-# with the toolkit, not the driver). wgpu is the shipping default.
-cuda = ["cubecl/cuda"]
+# CUDA compute (the thrasher via CubeCL's CUDA runtime) needs NVRTC at runtime;
+# the cudarc transfer path (link test) does not. Both are gated here.
+cuda = ["cubecl/cuda", "dep:cudarc"]
