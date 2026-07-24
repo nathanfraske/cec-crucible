@@ -26,11 +26,17 @@ all three OptiX entry points + `_optix_*` intrinsics, sm_86 → JITs to Blackwel
 via nvcc + the public OptiX headers; `build_ptx.ps1` reproduces it. So **both hard
 Phase-2 unknowns are resolved**: the hand-rolled host FFI reaches a live OptiX
 context + tensor denoiser (spike `d7a87f6`), and the device `.cu` → correct PTX
-(`25a778c`). **Remaining Phase-2 work: the host integration** —
-`optixModuleCreate` (from the committed PTX) → program groups → pipeline → SBT →
-accel build (BLAS/TLAS over the knot) → `optixLaunch` → readback/verify → a
-`LoadKernel` + CLI. The full 60-entry function-table offset map is recorded (§3
-+ memory). Phase 3 (SER, §4) remains scoped-not-built.
+(`25a778c`). **Phase 2 COMPLETE** — the host integration
+(`crates/crucible-gpu/src/optix/mod.rs`, commit `6d8d078`) drives the full OptiX
+pipeline (module from committed PTX → program groups → pipeline → SBT → GAS build
+over the knot → `optixLaunch` → readback → self-consistency) via the hand-rolled
+FFI, with every struct laid out from compiler-ground-truthed sizes (a unit test
+asserts the layouts). Validated on the RTX 3070: `optix` 512×512 16spp×8bounce,
+PASS, 0 errors, 219 self-consistency verifications — the NVIDIA-native path tracer
+is deterministic + correct. `optix` cargo feature + CLI command. Phase 3 (SER,
+§4) remains scoped-not-built; the tensor denoiser (de-risked, uses `xmma`) is an
+open add-on. So all three RT tests exist: `rt` (ray-query), `pathtrace` (portable
+multi-bounce), `optix` (NVIDIA-native multi-bounce).
 
 ## 0. TL;DR
 
