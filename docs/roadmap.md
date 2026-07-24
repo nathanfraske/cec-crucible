@@ -57,12 +57,26 @@ measurements in [`docs/gpu-plan.md`](gpu-plan.md).
   CPU↔GPU transient profiles (`in-phase` / `anti-phase` / `beat`) — all validated
   against marker timestamps. Ships in the single binary behind `--features gpu`;
   the default build stays zero-dependency.
-- [ ] **3c — VRAM integrity test.** A *separate* test from the wattage thrasher:
-  pattern write/verify across VRAM to find bad memory. Not started.
+- [x] **3c — VRAM integrity test + whole-platform worst-case.** Chained
+  moving-inversion battery across VRAM (GPU-side verify, atomic first-fail
+  reporting, fault-injection validated). Plus the `worst-case` profile: CPU
+  transients anti-phase to the GPU under RAM + storage + VRAM-integrity load,
+  every domain verifying its own data. A *separate* test from the wattage
+  thrasher — watts are irrelevant to it.
 - [ ] **3d — wattage servo.** Closed-loop power targeting (NVML/ADLX readback) +
   per-GPU-model self-calibration, device-ID'd.
 - [ ] **3e — AMD validation.** No AMD hardware on the bench yet; no per-vendor
   claims until there is.
+
+## Phase 3P — PCIe / motherboard link-integrity (bad-riser detection)
+
+A distinct sub-thread from the compute tests. Scoped in
+[`docs/pcie-plan.md`](pcie-plan.md): drive sustained verified traffic across the
+x16 link as *stimulus*, and detect a marginal riser/cable/seating via link-train
+checks and WHEA/AER error deltas — because a bad link RETRIES rather than slows.
+Feasibility of the retry-detection is firmware-gated and needs Gen5 hardware +
+a known-bad riser to validate; the link-training check and the transfer+verify
+load are buildable now.
 
 ## Phase 4 — polish
 

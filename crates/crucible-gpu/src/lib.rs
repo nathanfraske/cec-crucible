@@ -32,6 +32,8 @@
 //!
 //! Either failure sets `error_count > 0`, which the report rolls up to FAIL.
 
+pub mod vram;
+
 use std::time::Instant;
 
 use crucible_core::kernel::{
@@ -336,7 +338,7 @@ impl LoadKernel for GpuKernel {
                         break;
                     }
 
-                    if dispatches % self.verify_every == 0 {
+                    if self.verify_every > 0 && dispatches.is_multiple_of(self.verify_every) {
                         match verify(&client, &handle, &mut reference) {
                             Ok(sum) => {
                                 last_checksum = sum;

@@ -437,3 +437,63 @@ afterwards.
 - **AMD still untested.** No AMD hardware on this bench; no per-vendor claims.
 - **VRAM integrity test (§4.2) is still unbuilt.** It is a separate test with a
   different objective and must not be confused with the wattage knob used here.
+
+## 14. Phase 3c results — VRAM integrity + whole-platform worst-case (2026-07-24)
+
+### VRAM integrity test (`vram` command)
+
+A **separate** test from the wattage thrasher, with a different objective: find
+bad video memory. It runs a chained moving-inversion battery — own-address,
+0x00/0xFF/0xAA/0x55 complements, and an index-derived random pattern — entirely
+on the GPU.
+
+Design decisions that matter:
+- **Index-derived patterns.** Every expected value is a pure function of the
+  element index (+ pattern id / seed), so each of the millions of GPU threads
+  computes its own expectation with no shared PRNG state, and verification needs
+  no golden copy on the host.
+- **Verify on the GPU, read back only on failure.** A check kernel compares each
+  word and reports via atomics into an 8-byte results buffer (error count +
+  lowest failing index). Dragging gigabytes back over PCIe every pass would make
+  the test bus-bound; the host reads a full chunk back *only* when an error is
+  found, to recover the observed value for the report.
+- **Grid-stride loop.** A one-element-per-thread launch needs 65,536 workgroups
+  for a 64 MiB chunk at 256 threads — over the 65,535-per-dimension dispatch
+  limit (this was a real bug, caught on first run). The grid-stride loop
+  decouples dispatch size from buffer size.
+- **Chunked allocation** under the storage-buffer binding limit (wgpu default
+  128 MiB); all chunks stay resident so the whole requested span is under test.
+
+Measured on the RTX 3070: **512 MiB across 8 chunks, 149 full passes, 447 GiB
+verified at ~22 GiB/s, 0 errors** on healthy VRAM. Fault-injection test (corrupt
+one word's expectation in the check kernel) → **FAIL**, first-fail correctly
+reported as `chunk 0 word 1000 [own-address]: expected 0x000003e8 got …` — the
+`0x3e8` = decimal 1000 confirms the own-address pattern and the host/GPU mirror
+agree.
+
+Inherent caveat, stated plainly: verification runs on the same GPU being tested,
+so a sufficiently broken device could mis-verify. This is intrinsic to GPU-side
+memory testing (memtest_vulkan has the same property) and is the price of not
+being PCIe-bound.
+
+### Whole-platform worst-case (`run worst-case`)
+
+Everything at once: CPU transients **anti-phase** to the GPU (so the VRMs and
+PSU never settle), under simultaneous RAM, storage, GPU-thrash and
+VRAM-integrity load — all under one `StopFlag`, one shared phase epoch, one
+marker timeline, **every domain verifying its own data.**
+
+Measured on the bench (25 s, all five domains concurrent): **PASS, 0 errors,
+20,590 markers.** Per-domain throughput drops under contention exactly as
+expected and intended — VRAM ~4 GiB/s (vs ~22 solo), storage ~207 MiB/s (vs
+~660 solo) — because they are now fighting for shared buses. The point is not
+any single number; it is that a corruption appearing only under full-platform
+contention has nowhere to hide. Notably the GPU thrasher (burst) and the VRAM
+integrity test (steady) coexisted on the *same* discrete GPU without conflict.
+
+### What worst-case does NOT yet cover
+
+It does not load **PCIe** — the GPU kernels are on-card compute + VRAM traffic;
+the x16 link sits nearly idle. A dedicated host↔device transfer test plus
+link-integrity checking is scoped separately in
+[`docs/pcie-plan.md`](pcie-plan.md).

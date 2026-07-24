@@ -57,6 +57,8 @@ const GPU_OPTS: &[&str] = &[
     "gpu-iters",
     "gpu-mb",
     "gpu-alu-only",
+    "vram-mb",
+    "vram-chunk-mb",
 ];
 
 const USAGE: &str = "\
@@ -72,7 +74,8 @@ COMMANDS:
     cpu                  Run the CPU FMA/AVX burn kernel.
     mem                  Run the RAM pattern kernel.
     storage              Run the storage scratch-file kernel.
-    gpu                  Run the GPU thrasher kernel.            [--features gpu]
+    gpu                  Run the GPU thrasher kernel (watts).    [--features gpu]
+    vram                 Run the VRAM integrity test.            [--features gpu]
     run <profile>        See PROFILES below.
     version              Print version.
     help                 Print this help.
@@ -85,6 +88,8 @@ PROFILES:
     in-phase             CPU+GPU burst together   -> peak draw, PSU/OCP.  [gpu]
     anti-phase           CPU and GPU alternate    -> VRM/PSU chase load.  [gpu]
     beat                 Slightly different periods -> sweeps all phases. [gpu]
+    worst-case           Everything at once: CPU transients anti-phase to the
+                         GPU, under RAM + storage + VRAM-integrity load.
 
 COMMON OPTIONS:
     --seconds <N>        Run duration in seconds.
@@ -123,6 +128,9 @@ GPU OPTIONS (builds with --features gpu):
     --gpu-mb <N>         VRAM stream buffer in MiB (default 1024).
     --gpu-alu-only       Disable the VRAM stream. Pure ALU reaches only ~75% of
                          the board power limit; the mix reaches ~92%.
+    --vram-mb <N>        VRAM to place under integrity test (default 2048).
+    --vram-chunk-mb <N>  Allocation chunk size (default 64; storage-buffer
+                         binding limits cap how large one allocation can be).
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -173,6 +181,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "mem" => cmd_mem(rest),
         "storage" => cmd_storage(rest),
         "gpu" => cmd_gpu(rest),
+        "vram" => cmd_vram(rest),
         "run" => cmd_run(rest),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -468,6 +477,54 @@ fn cmd_gpu(rest: &[String]) -> Result<u8, String> {
     }
 }
 
+#[cfg(feature = "gpu")]
+fn vram_kernel_from(p: &Parsed) -> Result<crucible_gpu::vram::VramKernel, String> {
+    let device = match p.get("gpu-device").unwrap_or("discrete") {
+        "discrete" => GpuDevice::Discrete(0),
+        "integrated" | "igpu" => GpuDevice::Integrated(0),
+        "default" => GpuDevice::Default,
+        other => {
+            return Err(format!(
+                "--gpu-device expects discrete|integrated|default, got '{other}'"
+            ))
+        }
+    };
+    let mut k = crucible_gpu::vram::VramKernel::new(device);
+    if let Some(v) = p.get_u64("vram-mb")? {
+        k.vram_mb = v.clamp(16, 65536) as usize;
+    }
+    if let Some(v) = p.get_u64("vram-chunk-mb")? {
+        // Storage-buffer binding limits cap how big one allocation can be.
+        k.chunk_mb = v.clamp(1, 128) as usize;
+    }
+    Ok(k)
+}
+
+/// VRAM **integrity** test — a different test from `gpu` (the wattage thrasher).
+/// This one hunts bad video memory; watts are irrelevant to it.
+fn cmd_vram(rest: &[String]) -> Result<u8, String> {
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = rest;
+        Err(NO_GPU.to_string())
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let p = Parsed::parse(rest, COMMON_BOOLS)?;
+        let mut allowed: Vec<&str> =
+            vec!["seconds", "device-id", "out", "no-report", "json", "help"];
+        allowed.extend_from_slice(GPU_OPTS);
+        p.reject_unknown(&allowed)?;
+
+        let seconds = seconds_arg(&p, 60)?;
+        let kernel = vram_kernel_from(&p)?;
+        let mode = format!("integrity {}", kernel.device.label());
+        let budget = Budget::steady(Duration::from_secs(seconds));
+        let mut runner = Runner::new(&p)?;
+        runner.single_stage(&kernel, &budget, &mode)
+    }
+}
+
 fn cmd_gpu_info(rest: &[String]) -> Result<u8, String> {
     #[cfg(not(feature = "gpu"))]
     {
@@ -616,14 +673,15 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         // CPU <-> GPU transient scenarios. The choreography is the test: these
         // are the worst-case VRM/PSU patterns a steady-state run cannot produce.
         "in-phase" | "anti-phase" | "beat" => run_transient_scenario(&mut runner, &p, &profile),
+        // Everything at once: CPU transients under RAM + storage + GPU + VRAM.
+        "worst-case" => run_worst_case(&mut runner, &p),
         other => Err(format!(
             "unknown profile '{other}' (expected: quick | soak | cross | power | \
-             storage-cross | in-phase | anti-phase | beat)"
+             storage-cross | in-phase | anti-phase | beat | worst-case)"
         )),
     }
 }
 
-#[cfg(feature = "gpu")]
 fn ms(v: u64) -> Duration {
     Duration::from_millis(v)
 }
@@ -701,6 +759,84 @@ fn run_transient_scenario(runner: &mut Runner, p: &Parsed, profile: &str) -> Res
         ];
         runner.concurrent_phased(stages, profile)
     }
+}
+
+/// Everything at once — the whole-platform worst case.
+///
+/// CPU transients running **anti-phase** to the GPU (so the VRMs and PSU never
+/// settle) while RAM, storage and the VRAM integrity test all run underneath.
+/// The value is not any single domain's number; it is that every domain
+/// *verifies its own data* while the platform is maximally contended, so a
+/// corruption that only appears under full load has nowhere to hide.
+///
+/// Note this does not yet load PCIe — the GPU kernels are on-card traffic. A
+/// dedicated host↔device transfer test is a separate, planned piece.
+fn run_worst_case(runner: &mut Runner, p: &Parsed) -> Result<u8, String> {
+    let dur = Duration::from_secs(seconds_arg(p, 120)?);
+    let on = p.get_u64("burst-on")?.unwrap_or(20).clamp(1, MAX_BURST_MS);
+    let off = p.get_u64("burst-off")?.unwrap_or(20).clamp(1, MAX_BURST_MS);
+    let cores = core_from(p)?;
+
+    #[allow(unused_mut)]
+    let mut stages: Vec<PhasedStage> = vec![
+        PhasedStage {
+            kernel: Box::new(CpuKernel::new(cores)),
+            mode: format!("burst {} {on}/{off}ms", cores_label(cores)),
+            budget: Budget::burst(dur, ms(on), ms(off)),
+            phase_offset: Duration::ZERO,
+        },
+        PhasedStage {
+            kernel: Box::new(MemKernel::new(mem_size_from(p, Some(2048))?)),
+            mode: "steady".into(),
+            budget: Budget::steady(dur),
+            phase_offset: Duration::ZERO,
+        },
+        PhasedStage {
+            kernel: Box::new(StorageKernel::new(storage_cfg_from(p, 512)?)),
+            mode: "steady".into(),
+            budget: Budget::steady(dur),
+            phase_offset: Duration::ZERO,
+        },
+    ];
+
+    #[cfg(feature = "gpu")]
+    {
+        // GPU bursts opposite the CPU: the load hand-off is the stressor.
+        let gpu = gpu_kernel_from(
+            p,
+            Shape::Burst {
+                on: ms(on),
+                off: ms(off),
+            },
+        )?;
+        let gpu_label = gpu.device.label();
+        stages.push(PhasedStage {
+            kernel: Box::new(gpu),
+            mode: format!("burst {gpu_label} {on}/{off}ms"),
+            budget: Budget::burst(dur, ms(on), ms(off)),
+            phase_offset: ms(on),
+        });
+
+        // VRAM integrity underneath it all — a miscompare here, under full
+        // platform contention, is the finding this whole profile exists for.
+        let vram = vram_kernel_from(p)?;
+        let vram_label = vram.device.label();
+        stages.push(PhasedStage {
+            kernel: Box::new(vram),
+            mode: format!("integrity {vram_label}"),
+            budget: Budget::steady(dur),
+            phase_offset: Duration::ZERO,
+        });
+    }
+
+    runner.note(
+        "worst-case: CPU transients anti-phase to the GPU, under simultaneous RAM, \
+         storage and VRAM-integrity load; every domain verifies its own data",
+    );
+    #[cfg(not(feature = "gpu"))]
+    runner.note("built without GPU support - running CPU + RAM + storage only");
+
+    runner.concurrent_phased(stages, "worst-case")
 }
 
 // ---------------------------------------------------------------------------
@@ -867,7 +1003,6 @@ impl Runner {
     ///   simultaneous max, and unreachable from any steady-state test.
     /// * **beat** — slightly different periods per domain, so the phase
     ///   relationship drifts through every alignment on its own.
-    #[cfg(feature = "gpu")]
     fn concurrent_phased(&mut self, stages: Vec<PhasedStage>, label: &str) -> Result<u8, String> {
         self.begin();
         self.markers.stamp(
@@ -1303,7 +1438,6 @@ fn storage_cfg_for(
 
 /// One kernel in a phased cross-load: its own load shape and its own start
 /// offset, so domains can be run in-phase, anti-phase, or at beat frequencies.
-#[cfg(feature = "gpu")]
 struct PhasedStage {
     kernel: Box<dyn LoadKernel>,
     mode: String,
