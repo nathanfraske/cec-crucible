@@ -64,6 +64,8 @@ With `--features gpu`:
 ```
 cec-crucible gpu-info                      # list usable GPUs
 cec-crucible gpu --seconds 60              # GPU thrasher (~92% of board power)
+cec-crucible vram --seconds 60             # VRAM integrity test (find bad memory)
+cec-crucible link --seconds 60             # PCIe host<->device transfer + verify
 cec-crucible gpu --seconds 60 --shape burst --burst-on 20 --burst-off 20
 cec-crucible run in-phase   --seconds 120  # CPU+GPU burst together -> peak draw
 cec-crucible run anti-phase --seconds 120  # they alternate -> VRM/PSU chase load

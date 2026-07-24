@@ -19,6 +19,8 @@ pub enum Kind {
     Mem,
     Storage,
     Gpu,
+    /// Host↔device transfer / PCIe-link load.
+    Pcie,
 }
 
 impl Kind {
@@ -28,6 +30,7 @@ impl Kind {
             Kind::Mem => "mem",
             Kind::Storage => "storage",
             Kind::Gpu => "gpu",
+            Kind::Pcie => "pcie",
         }
     }
 }

@@ -59,6 +59,8 @@ const GPU_OPTS: &[&str] = &[
     "gpu-alu-only",
     "vram-mb",
     "vram-chunk-mb",
+    "link-mb",
+    "link-dir",
 ];
 
 const USAGE: &str = "\
@@ -76,6 +78,7 @@ COMMANDS:
     storage              Run the storage scratch-file kernel.
     gpu                  Run the GPU thrasher kernel (watts).    [--features gpu]
     vram                 Run the VRAM integrity test.            [--features gpu]
+    link                 PCIe host<->device transfer + verify.   [--features gpu]
     run <profile>        See PROFILES below.
     version              Print version.
     help                 Print this help.
@@ -131,6 +134,9 @@ GPU OPTIONS (builds with --features gpu):
     --vram-mb <N>        VRAM to place under integrity test (default 2048).
     --vram-chunk-mb <N>  Allocation chunk size (default 64; storage-buffer
                          binding limits cap how large one allocation can be).
+    --link-mb <N>        PCIe transfer buffer size in MiB (default 256).
+    --link-dir <up|down|bidir>   Transfer direction (default bidir; only bidir
+                         and down verify data — up-only has no read-back).
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -182,6 +188,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "storage" => cmd_storage(rest),
         "gpu" => cmd_gpu(rest),
         "vram" => cmd_vram(rest),
+        "link" => cmd_link(rest),
         "run" => cmd_run(rest),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -498,6 +505,60 @@ fn vram_kernel_from(p: &Parsed) -> Result<crucible_gpu::vram::VramKernel, String
         k.chunk_mb = v.clamp(1, 128) as usize;
     }
     Ok(k)
+}
+
+#[cfg(feature = "gpu")]
+fn link_kernel_from(p: &Parsed) -> Result<crucible_gpu::link::LinkKernel, String> {
+    use crucible_gpu::link::LinkDir;
+    let device = match p.get("gpu-device").unwrap_or("discrete") {
+        "discrete" => GpuDevice::Discrete(0),
+        "integrated" | "igpu" => GpuDevice::Integrated(0),
+        "default" => GpuDevice::Default,
+        other => {
+            return Err(format!(
+                "--gpu-device expects discrete|integrated|default, got '{other}'"
+            ))
+        }
+    };
+    let mut k = crucible_gpu::link::LinkKernel::new(device);
+    if let Some(v) = p.get_u64("link-mb")? {
+        // Bounded: large enough to amortize, small enough to stay well under TDR.
+        k.buf_mb = v.clamp(1, 2048) as usize;
+    }
+    k.dir = match p.get("link-dir").unwrap_or("bidir") {
+        "up" => LinkDir::Up,
+        "down" => LinkDir::Down,
+        "bidir" | "both" => LinkDir::Both,
+        other => return Err(format!("--link-dir expects up|down|bidir, got '{other}'")),
+    };
+    Ok(k)
+}
+
+/// PCIe link load — sustained verified host<->device transfers. Reports achieved
+/// H2D/D2H bandwidth; catches *uncorrected* corruption across the link. (A
+/// marginal riser that retries is caught by the error plane, not here — see
+/// docs/pcie-plan.md.)
+fn cmd_link(rest: &[String]) -> Result<u8, String> {
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = rest;
+        Err(NO_GPU.to_string())
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let p = Parsed::parse(rest, COMMON_BOOLS)?;
+        let mut allowed: Vec<&str> =
+            vec!["seconds", "device-id", "out", "no-report", "json", "help"];
+        allowed.extend_from_slice(GPU_OPTS);
+        p.reject_unknown(&allowed)?;
+
+        let seconds = seconds_arg(&p, 60)?;
+        let kernel = link_kernel_from(&p)?;
+        let mode = format!("{} {}", kernel.dir.as_str(), kernel.device.label());
+        let budget = Budget::steady(Duration::from_secs(seconds));
+        let mut runner = Runner::new(&p)?;
+        runner.single_stage(&kernel, &budget, &mode)
+    }
 }
 
 /// VRAM **integrity** test — a different test from `gpu` (the wattage thrasher).

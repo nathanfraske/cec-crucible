@@ -19,6 +19,7 @@ description = "GPU load kernel for cec-crucible: CubeCL thrasher with load shape
 [dependencies]
 crucible-core = { path = "../crucible-core" }
 cubecl = { version = "0.10", features = ["wgpu"] }
+wgpu = { version = "29", default-features = false, features = ["dx12", "vulkan", "wgsl"] }
 
 [features]
 # CUDA is opt-in only: spike 3a proved it builds without a CUDA toolkit but will

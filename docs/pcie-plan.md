@@ -189,10 +189,18 @@ mistaken for a fault downtrain.
 - **P0 — Plane A link-training check.** cfgmgr32 FFI, negotiated-vs-max per
   device, topology attribution, a `link-info` / `platform` report section.
   Buildable and testable now (reports the 3070's Gen3 x16 here). Cheap, certain,
-  independently useful.
-- **P1 — Plane B transfer+verify load (wgpu).** `LinkKernel`, round-trip
-  verification, three-point baseline, marker brackets. Validate on the 3070
-  (Gen3/4): keeps the link busy, and the verifier catches an injected byte flip.
+  independently useful. **Not yet built.**
+- **P1 — Plane B transfer+verify load (wgpu). ✅ BUILT (`link` command).**
+  `LinkKernel` on raw wgpu with a **reused** staging/device/readback pool, so it
+  measures DMA rather than allocation. Verified round-trip (up/down/bidir),
+  multi-threaded host-RAM baseline, marker bracket. Measured on the RTX 3070
+  (Gen3 x16): **H2D ~7.5 GB/s, D2H ~1.9 GB/s, host-RAM ~9.7 GB/s**, 0 verify
+  errors. Two findings: (1) using CubeCL's `create_from_slice`/`read_one`
+  instead reported ~0.6 GB/s — pure allocation overhead, which would have made a
+  fast Gen5 link and a bad riser indistinguishable; hence raw wgpu with buffer
+  reuse. (2) **D2H is ~4× slower than H2D** through wgpu's single-queue readback
+  path (map + poll overhead) — expected, not a fault; the CUDA path (P2) is what
+  unlocks fast full-duplex. Ready to run on the 5090 for real Gen5 numbers.
 - **P2 — Plane B CUDA fast path (optional).** cudarc-direct pinned + multi-stream
   full-duplex, driver-only. Confirm toolkit-less deploy; measure uplift.
 - **P3 — Plane C WHEA/AER delta detector.** `wevtapi` FFI, Event 17/18 bracketed
