@@ -1,4 +1,7 @@
 /target
+spikes/*/target
+spikes/*/Cargo.lock
+spikes/*/*.log
 **/*.rs.bk
 Cargo.lock
 

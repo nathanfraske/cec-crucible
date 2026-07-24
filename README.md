@@ -96,3 +96,4 @@ here depends on the harness being present.
 - [`docs/roadmap.md`](docs/roadmap.md) — phased build plan (Phase 1 built; GPU is Phase 3).
 - [`docs/gpu-plan.md`](docs/gpu-plan.md) — Phase 3 GPU power-virus design: backend decision (CubeCL, with wgpu as its runtime floor), thrasher + VRAM + wattage servo, TDR handling, per-vendor telemetry, milestones.
 - [`docs/prior-art-and-licensing.md`](docs/prior-art-and-licensing.md) — existing tools, licensing reality, build-vs-buy.
+- [`spikes/gpu-3a/`](spikes/gpu-3a/) — the throwaway CubeCL probe that produced the Phase 3 measurements (excluded from the workspace; it pulls external crates, the core does not).

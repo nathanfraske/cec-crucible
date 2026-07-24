@@ -15,6 +15,11 @@ members = [
 # crates/crucible-gpu is Phase 3 (the long pole) and intentionally not yet a
 # workspace member — it is the one crate permitted an external toolkit.
 
+# Throwaway spikes are excluded: they pull external crates (CubeCL/wgpu) and
+# must never contaminate the zero-dependency core. `cargo build` at the root
+# does not build them. See spikes/gpu-3a/README.md.
+exclude = ["spikes/*"]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

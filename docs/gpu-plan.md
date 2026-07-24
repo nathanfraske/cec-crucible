@@ -73,16 +73,15 @@ rather than hardcoding workgroup sizes, and expect naga/WGSL translation to be
 the thing that occasionally surprises you. TDR (§6) is an OS watchdog and
 applies to every backend equally.
 
-**Deployment check (do this early):** determine whether CubeCL's CUDA runtime is
-build-time-linked or runtime-loaded. The suite is meant to ship as a compiled
-binary on a USB stick and run on a customer machine — if CUDA requires a toolkit
-present, ship the **wgpu runtime as the default build** and make CUDA an opt-in
-cargo feature for bench machines.
+**Deployment: ANSWERED by spike 3a (see §12).** The CUDA runtime **builds**
+without a CUDA toolkit but **does not run** without one — CubeCL JIT-compiles
+kernels through NVRTC, so `nvrtc.dll` (a *toolkit* component, not a driver
+component) must be present at runtime. Consequence: **ship the wgpu runtime as
+the default build**; CUDA is an opt-in cargo feature for bench machines, or
+requires redistributing NVRTC (verify the NVIDIA EULA redistributable list and
+the added binary size before going that way).
 
-**Spike 3a (1–3 days):** a CubeCL FMA-heavy compute kernel dispatched in a loop
-on NVIDIA (CUDA runtime) and on AMD + Intel (wgpu runtime), confirming via
-vendor tools that it pins each card at its power limit — and confirming the
-binary runs on a machine with no toolkit installed.
+**Spike 3a — DONE.** Results and measurements in §12.
 
 Every external dependency's license is audited before adoption (CubeCL and wgpu
 are both permissive/MIT-compatible — confirm at the pinned version) — the whole
@@ -227,10 +226,9 @@ All device-ID'd and marker-emitting, consistent with the existing commands.
 
 ## 11. Open questions
 
-1. ~~wgpu vs CubeCL~~ — **decided: CubeCL** (already CEC's multi-vendor backend
-   elsewhere; wgpu remains the runtime underneath it). Open sub-question: is the
-   CUDA runtime build-time-linked or runtime-loaded, i.e. can a CUDA-enabled
-   build still run on a machine with no toolkit?
+1. ~~wgpu vs CubeCL~~ — **decided: CubeCL**. ~~Is the CUDA runtime usable on a
+   machine with no toolkit?~~ **Answered by spike 3a: no** — it builds without a
+   toolkit but needs `nvrtc.dll` at runtime. Ship wgpu by default. See §12.
 2. How much power-telemetry to own via vendor `dlopen` FFI vs. leaning on
    LibreHardwareMonitor (HVCI/WinRing0 blocklist risk on the shop image).
 3. TDR policy: chain-short-dispatches only, or also document registry tuning for
@@ -238,3 +236,105 @@ All device-ID'd and marker-emitting, consistent with the existing commands.
 4. Integrated GPUs and laptops — in scope, or discrete-only for QC?
 5. Do we verify GPU compute correctness against a CPU reference tile, or
    GPU-internal recompute only?
+
+## 12. Spike 3a results (measured 2026-07-24)
+
+Run on the shop bench: **RTX 3070** (240 W limit, 264 W max) + **Intel UHD 630**
+iGPU, Windows 11, CubeCL 0.10.0, driver 591.86, **no CUDA toolkit installed**.
+Spike source: [`spikes/gpu-3a/`](../spikes/gpu-3a/). Idle board power 43.9 W.
+
+### It works, on two vendors, unmodified
+
+| Runtime | Device | Dispatch | Result |
+| --- | --- | --- | --- |
+| wgpu | RTX 3070 (discrete) | 27.0 ms | 5.58 TFLOP/s, output verified |
+| wgpu | UHD 630 (integrated) | 26.3 ms | 0.23 TFLOP/s, output verified |
+
+Same binary, same kernel, only a device flag differs. Kernel compile (naga →
+DX12) was 58–124 ms. **CubeCL on Windows is confirmed for NVIDIA + Intel.** AMD
+remains untested — no AMD hardware on this bench.
+
+### TDR is a non-issue when dispatches are chained
+
+Longest single dispatch **53.5 ms** against the ~2000 ms watchdog — a ~40×
+margin. ~1900 dispatches across all runs, **zero device-lost events**. The
+"chain many short dispatches" design in §6 is validated.
+
+### Wattage test: memory traffic is what gets you to the limit
+
+The decisive measurement. Identical FMA core, with and without a coalesced VRAM
+stream (1 GiB buffer, stride = thread count):
+
+| | pure ALU | ALU + VRAM |
+| --- | --- | --- |
+| Board power | 167–187 W | **208–221 W** |
+| % of 240 W limit | ~75% | **~92%** |
+| SM utilization | 71–95% | **100%** |
+| Memory utilization | 4–5% | **100%** |
+| Throughput | 5.58 TFLOP/s | 1.35 TFLOP/s |
+
+Two conclusions:
+
+1. **Pure ALU tops out around 75%.** GDDR and the memory controller are a large
+   share of board power; a FLOP-maximizing kernel is *not* a watt-maximizing
+   kernel. Throughput moved **inversely** to power (5.58 → 1.35 TFLOP/s while
+   watts rose ~35 W). For the wattage test, TFLOP/s is not the objective
+   function — watts are.
+2. **The FMA:memory ratio knob (§4.3) is necessary, and 92% came from a naive
+   first guess.** Closing the last ~8% is exactly the job of the per-model
+   calibration pass. Also note coalesced streaming beats scattered access here:
+   sustained bandwidth drives memory power, whereas a large scattered stride
+   maximizes stalls but lowers achieved bandwidth.
+
+This is the *wattage* test only. The **VRAM integrity test (§4.2) is a separate
+test** with a different objective — pattern write/verify to find bad memory, not
+to maximize watts. Do not conflate the two.
+
+### fp32 is bit-identical across NVIDIA and Intel
+
+With identical inputs both vendors produced exactly `1.0813978`. So a
+**cross-vendor golden checksum is viable** for GPU error detection — it need not
+be limited to same-device self-consistency. Caveat: this was a simple FMA
+recurrence; transcendentals or any fast-math path would need re-checking.
+
+### CUDA runtime: builds without a toolkit, does NOT run without one
+
+- `cargo build --features cuda` **succeeded** on this toolkit-less machine.
+- At runtime it **panics**: cannot load `nvrtc.dll`. CubeCL JIT-compiles kernels
+  via NVRTC, which ships with the **CUDA toolkit**, not the driver.
+
+**Decision: ship the wgpu runtime as the default build.** CUDA becomes an opt-in
+cargo feature for bench machines, or requires redistributing NVRTC (check the
+NVIDIA EULA redistributables and the size cost first). This does not weaken the
+CubeCL choice — wgpu was always the floor — but it does mean the NVIDIA-native
+fast path is **not** free for a ship-anywhere binary.
+
+### The most important finding: the failure was silent
+
+When NVRTC was missing, the panic occurred on a CubeCL **worker thread**. The
+host loop kept going and reported a completely plausible result:
+
+```
+dispatches      : 772
+elapsed         : 32.08 s
+throughput      : 1.65 TFLOP/s (fp32 FMA)     <-- for work that never executed
+```
+
+The GPU sat at 43 W (idle) the entire time. Only the output read-back caught it
+(`out[0] = 0`, nonzero = false).
+
+**Design requirement for `crucible-gpu`:** every run must verify kernel output
+and treat a device/compile error as a hard FAIL. Timing and dispatch counts can
+report a confident lie. This is the GPU instance of the suite's existing
+principle — *a pass that computed the wrong answer is still a FAIL* — and it is
+now empirically justified rather than assumed. A QC gate that cannot tell "ran
+and passed" from "never ran" is worse than no gate.
+
+### What 3b should carry forward
+
+- Keep the chained-short-dispatch schedule; it is TDR-safe with huge margin.
+- Build the wattage test around a tunable FMA:memory ratio, defaulting to mixed,
+  and implement calibration to close the last ~8%.
+- Verify output every run; treat worker-thread panics and device-lost as FAIL.
+- Default build = wgpu runtime. Gate CUDA behind a feature.
+- Get AMD hardware in front of this before committing to per-vendor claims.
