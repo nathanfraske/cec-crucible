@@ -78,6 +78,18 @@ Feasibility of the retry-detection is firmware-gated and needs Gen5 hardware +
 a known-bad riser to validate; the link-training check and the transfer+verify
 load are buildable now.
 
+## The Gauntlet — QC burn-in campaign
+
+With the domain kernels and cross-load profiles built, the
+[`docs/gauntlet.md`](gauntlet.md) campaign sequences them into a full stress
+screen: express (~2 h, the standing gate), standard (~12 h), and full (~24 h)
+tiers, each a fault-mode-ordered phase list with per-phase WHEA attribution.
+Delivered as [`scripts/gauntlet.ps1`](../scripts/gauntlet.ps1) — a per-phase
+sequencer (one CLI process per phase = durable checkpoint, resumable manifest),
+which is the safe form given reports/markers flush only at `finish()`. A native
+`run gauntlet` profile is deferred until it can replicate checkpoint + flush +
+per-phase WHEA (gauntlet.md §10).
+
 ## Phase 4 — polish
 
 - Scenario library of known-killer patterns (grown from QC field data).
