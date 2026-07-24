@@ -122,6 +122,34 @@ Intel `joint_matrix`/DPAS needs the DPC++/SYCL toolchain (not reachable from
 Rust/CubeCL); AMD rocWMMA/MFMA is Linux-centric — on Windows both are reached via
 Vulkan cooperative-matrix, same as the CubeCL-SPIR-V route.
 
+### Tensor spike recipe — [VERIFIED against `cubecl-*-0.10.0` source in-registry]
+
+The exact ingredients, confirmed by reading the pinned CubeCL 0.10 source:
+
+- **The switch to tensor cores is the `cubecl` `vulkan` feature** (`vulkan =
+  ["wgpu-spirv"]` → `cubecl-wgpu/spirv` → pulls `cubecl-spirv` + `ash` 0.38 +
+  `tracel-ash`). With it, `cubecl-wgpu`'s runtime reports `wgpu<spirv>` and the mma
+  path is enabled — `cubecl-wgpu/src/runtime.rs:87` states outright *"no wgsl
+  backends currently support manual mma."* Gate it behind a new `crucible-gpu`
+  `tensor` feature so the default `gpu` build is unchanged (it adds `ash`).
+- **cmma API** (`cubecl-core/src/frontend/cmma.rs`): `cmma::Matrix::<T>::new` /
+  `from_slice(ident, m, n, k, layout)` → `cmma::fill` / `cmma::load(&mat, slice,
+  stride)` → `cmma::execute::<A,B,C,D>(&a,&b,&c,&d)` (D = A·B + C) → `cmma::store`.
+  16×16×16 tile. Launch like the thrasher: `WgpuRuntime::client(&dev)` then
+  `kernel::launch::<T, WgpuRuntime>(...)`; **force the Vulkan backend** via
+  `init_setup`/`create_setup_for_device` (the runtime routes `wgpu::Backend::Vulkan`
+  → SPIR-V, `runtime.rs:48`).
+- **dtypes:** `I8`/`I32`/`U8` exist in the type system, **but CubeCL's own cmma
+  runtime tests (`runtime_tests/cmma.rs`) cover only f16→f32.** ⚠ So the spike must
+  *prove* int8→int32 compiles + runs on the SPIR-V backend; if it doesn't, fall
+  back to f16→f32. **int8→int32 = the cross-vendor golden; f16→f32 =
+  self-consistency only.**
+- **Spike plan:** (1) `tensor` feature + Vulkan-forced client on the 3070, first
+  with the upstream-tested **f16→f32** cmma to confirm SPIR-V + tensor cores light
+  up at all; (2) switch to **i8→i32** and confirm it compiles/runs (the load-bearing
+  unknown); (3) checksum the result buffer, wire `LoadKernel` + a `tensor` command.
+  Dep cost lands only under the feature.
+
 ## 3. Recommended build order
 
 1. **`render`** — ✅ done (portable, zero-dep, all three vendors).
