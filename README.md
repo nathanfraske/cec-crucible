@@ -35,21 +35,44 @@ for the 1kHz rig, and license-clean commercial use on customer builds.
 
 ## Build & run
 
-Zero external dependencies — a stock stable Rust toolchain builds it offline.
+The core suite has **zero external dependencies** — a stock stable Rust
+toolchain builds it offline. The GPU kernel is the one documented exception (it
+uses CubeCL), so it lives behind a cargo feature; the default build never
+compiles it.
 
 ```
-cargo build --release          # -> target/release/cec-crucible(.exe)
-cargo test --workspace         # unit tests (no real soak; tiny bounded inputs)
+cargo build --release                                  # core only, 0 deps
+cargo test                                             # unit tests, 0 deps
+cargo build --release -p crucible-cli --features gpu   # full shipped binary
 ```
+
+Both produce the same single `cec-crucible` binary — `--features gpu` just adds
+the `gpu` / `gpu-info` commands and the CPU↔GPU transient profiles. GPU commands
+in a core build fail with a message telling you to rebuild with the feature.
 
 ```
 cec-crucible info                          # device id (SMBIOS), CPU, RAM, QPC
 cec-crucible cpu     --seconds 60          # FMA/AVX burn, per-core, recompute check
 cec-crucible mem     --seconds 60 --mb 8192
 cec-crucible storage --seconds 60 --path D:\ --size-mb 4096
-cec-crucible run cross --seconds 120       # CPU + RAM + storage concurrently
+cec-crucible run cross --seconds 120       # all domains concurrently
 cec-crucible run power --seconds 60        # CPU burst, dense markers for the rig
 ```
+
+With `--features gpu`:
+
+```
+cec-crucible gpu-info                      # list usable GPUs
+cec-crucible gpu --seconds 60              # GPU thrasher (~92% of board power)
+cec-crucible gpu --seconds 60 --shape burst --burst-on 20 --burst-off 20
+cec-crucible run in-phase   --seconds 120  # CPU+GPU burst together -> peak draw
+cec-crucible run anti-phase --seconds 120  # they alternate -> VRM/PSU chase load
+cec-crucible run beat       --seconds 120  # drifting periods -> sweeps all phases
+```
+
+The transient profiles are the point: a steady 100% load cannot produce them.
+All kernels share one phase origin, so the commanded offsets hold exactly —
+verified from the marker timestamps ([`docs/gpu-plan.md` §13](docs/gpu-plan.md)).
 
 Each run writes a device-ID'd `crucible-<id>-<ts>.report.json` and a
 `…-markers.jsonl` to `--out` (default: the harness log dir if present, else the
@@ -64,12 +87,14 @@ is `0` for PASS/PARTIAL, `1` for FAIL. `cec-crucible help` lists all options.
 | `crucible-core` | QPC clock, JSON writer, SMBIOS device-id, `LoadKernel`/`StopFlag`/`ShapeDriver`, marker log, report model — all std-only |
 | `crucible-cpu` | FMA/AVX burn kernel with dual-accumulator soft-error detection + per-core pinning |
 | `crucible-mem` | moving-inversion / own-address / seeded-random RAM battery with first-fail reporting |
-| `crucible-storage` | non-destructive scratch-file write/sync/verify |
+| `crucible-storage` | non-destructive scratch-file write/sync/verify, true-uncached I/O, multi-SSD cross-load |
+| `crucible-gpu` | CubeCL GPU thrasher with load shapes, markers and per-dispatch verification — **the one crate with external dependencies** |
 | `crucible-cli` | `cec-crucible` binary: arg parsing, profiles, orchestration, report + marker output |
 
-`crucible-gpu` (Phase 3) is intentionally not yet a workspace member — it is the
-one crate permitted external dependencies (CubeCL, which runs on wgpu by default
-and CUDA where available).
+`crucible-gpu` is a workspace member (so it ships inside the one binary) but is
+excluded from `default-members`, so everyday `cargo build` / `cargo test` never
+compile its dependency tree. `Cargo.lock` is committed to keep the default build
+resolvable offline despite the optional dependency.
 
 ## How it fits the rest of the suite
 

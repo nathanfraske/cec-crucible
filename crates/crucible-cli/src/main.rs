@@ -27,6 +27,11 @@ use crucible_cpu::{CoreSel, CpuKernel};
 use crucible_mem::{MemKernel, MemSize};
 use crucible_storage::{StorageConfig, StorageKernel, StorageStats};
 
+// GPU support is behind the `gpu` cargo feature so the default build stays
+// zero-dependency and offline-buildable. The shipped binary enables it.
+#[cfg(feature = "gpu")]
+use crucible_gpu::{GpuDevice, GpuKernel};
+
 use args::Parsed;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,6 +45,18 @@ const COMMON_BOOLS: &[&str] = &[
     "buffered",
     "unbuffered",
     "all-drives",
+    "gpu-alu-only",
+];
+
+/// Options recognized for the GPU kernel (accepted even in non-GPU builds so
+/// the error message can be "rebuild with --features gpu" rather than
+/// "unknown option").
+const GPU_OPTS: &[&str] = &[
+    "gpu-device",
+    "gpu-threads",
+    "gpu-iters",
+    "gpu-mb",
+    "gpu-alu-only",
 ];
 
 const USAGE: &str = "\
@@ -51,12 +68,23 @@ USAGE:
 COMMANDS:
     info                 Print device id, CPU, memory and QPC info, then exit.
     drives               List fixed physical drives (NVMe/SATA), then exit.
+    gpu-info             List usable GPUs, then exit.            [--features gpu]
     cpu                  Run the CPU FMA/AVX burn kernel.
     mem                  Run the RAM pattern kernel.
     storage              Run the storage scratch-file kernel.
-    run <profile>        Profile: quick | soak | cross | power | storage-cross.
+    gpu                  Run the GPU thrasher kernel.            [--features gpu]
+    run <profile>        See PROFILES below.
     version              Print version.
     help                 Print this help.
+
+PROFILES:
+    quick | soak         Sequential CPU/RAM/storage QC.
+    cross                All domains concurrently (GPU included if built in).
+    power                CPU burst with dense markers for the power rig.
+    storage-cross        Multi-SSD: solo baseline vs concurrent per drive.
+    in-phase             CPU+GPU burst together   -> peak draw, PSU/OCP.  [gpu]
+    anti-phase           CPU and GPU alternate    -> VRM/PSU chase load.  [gpu]
+    beat                 Slightly different periods -> sweeps all phases. [gpu]
 
 COMMON OPTIONS:
     --seconds <N>        Run duration in seconds.
@@ -83,6 +111,18 @@ STORAGE OPTIONS:
     --all-drives         Cross-load every fixed physical drive: solo baseline
                          then concurrent, reporting per-drive slowdown.
                          (Same as `run storage-cross`.)
+
+GPU OPTIONS (builds with --features gpu):
+    --gpu-device <discrete|integrated|default>
+    --gpu-threads <N>    Total GPU threads (default 1048576).
+    --gpu-iters <N>      Work per dispatch. Default depends on the load shape:
+                         4096 for steady (max sustained power) and 256 for burst
+                         (~6 ms, fits inside the ON window so edges stay sharp).
+                         Also the load-edge granularity; any value keeps a
+                         dispatch far under the ~2000 ms Windows TDR watchdog.
+    --gpu-mb <N>         VRAM stream buffer in MiB (default 1024).
+    --gpu-alu-only       Disable the VRAM stream. Pure ALU reaches only ~75% of
+                         the board power limit; the mix reaches ~92%.
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -128,9 +168,11 @@ fn run(argv: &[String]) -> Result<u8, String> {
         }
         "info" => cmd_info(rest),
         "drives" => cmd_drives(rest),
+        "gpu-info" => cmd_gpu_info(rest),
         "cpu" => cmd_cpu(rest),
         "mem" => cmd_mem(rest),
         "storage" => cmd_storage(rest),
+        "gpu" => cmd_gpu(rest),
         "run" => cmd_run(rest),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -273,6 +315,8 @@ fn cmd_cpu(rest: &[String]) -> Result<u8, String> {
         duration: Duration::from_secs(seconds),
         shape,
         target_watts: None,
+        phase_epoch: None,
+        phase_offset: Duration::ZERO,
     };
 
     let mut runner = Runner::new(&p)?;
@@ -335,12 +379,126 @@ fn cmd_storage(rest: &[String]) -> Result<u8, String> {
 }
 
 // ---------------------------------------------------------------------------
+// gpu
+// ---------------------------------------------------------------------------
+
+/// Message shown when a GPU command is used in a build without the feature.
+#[cfg(not(feature = "gpu"))]
+const NO_GPU: &str = "this binary was built without GPU support; rebuild with:\n    \
+     cargo build --release -p crucible-cli --features gpu";
+
+/// Build the GPU kernel, defaulting work-per-dispatch to suit the load shape.
+///
+/// Steady and burst want opposite tuning and it is worth ~40 W: steady wants
+/// large dispatches so the GPU never drains (max sustained power), burst wants
+/// small ones so each dispatch fits inside the ON window and the edge stays
+/// sharp instead of smearing past it.
+#[cfg(feature = "gpu")]
+fn gpu_kernel_from(p: &Parsed, shape: Shape) -> Result<GpuKernel, String> {
+    let device = match p.get("gpu-device").unwrap_or("discrete") {
+        "discrete" => GpuDevice::Discrete(0),
+        "integrated" | "igpu" => GpuDevice::Integrated(0),
+        "default" => GpuDevice::Default,
+        other => {
+            return Err(format!(
+                "--gpu-device expects discrete|integrated|default, got '{other}'"
+            ))
+        }
+    };
+    let mut k = GpuKernel::new(device);
+    if let Some(v) = p.get_u64("gpu-threads")? {
+        k.threads = v.clamp(1024, 1 << 26) as usize;
+    }
+    k.iters = match p.get_u64("gpu-iters")? {
+        // Keep dispatches far under the ~2000 ms TDR watchdog.
+        Some(v) => v.clamp(1, 65536) as u32,
+        None => match shape {
+            // ~50 ms/dispatch on an RTX 3070: maximum sustained power.
+            Shape::Steady => 4096,
+            // ~6 ms/dispatch: fits inside a typical 20 ms ON window.
+            Shape::Burst { .. } => 256,
+        },
+    };
+    if let Some(v) = p.get_u64("gpu-mb")? {
+        k.data_mb = v.clamp(16, 32768) as usize;
+    }
+    if p.has("gpu-alu-only") {
+        // Pure ALU reaches only ~75% of the power limit; opt-in for comparison.
+        k.mix = false;
+    }
+    Ok(k)
+}
+
+fn cmd_gpu(rest: &[String]) -> Result<u8, String> {
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = rest;
+        Err(NO_GPU.to_string())
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let p = Parsed::parse(rest, COMMON_BOOLS)?;
+        let mut allowed: Vec<&str> = vec![
+            "seconds",
+            "shape",
+            "burst-on",
+            "burst-off",
+            "device-id",
+            "out",
+            "no-report",
+            "json",
+            "help",
+        ];
+        allowed.extend_from_slice(GPU_OPTS);
+        p.reject_unknown(&allowed)?;
+
+        let seconds = seconds_arg(&p, 60)?;
+        let shape = shape_from(&p)?;
+        let kernel = gpu_kernel_from(&p, shape)?;
+        let mode = format!("{} {}", shape.mode_str(), kernel.device.label());
+        let budget = Budget {
+            duration: Duration::from_secs(seconds),
+            shape,
+            target_watts: None,
+            phase_epoch: None,
+            phase_offset: Duration::ZERO,
+        };
+        let mut runner = Runner::new(&p)?;
+        runner.single_stage(&kernel, &budget, &mode)
+    }
+}
+
+fn cmd_gpu_info(rest: &[String]) -> Result<u8, String> {
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = rest;
+        Err(NO_GPU.to_string())
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let p = Parsed::parse(rest, COMMON_BOOLS)?;
+        p.reject_unknown(&["help"])?;
+        println!("GPU devices:");
+        for d in [
+            GpuDevice::Discrete(0),
+            GpuDevice::Integrated(0),
+            GpuDevice::Default,
+        ] {
+            match crucible_gpu::probe(d) {
+                Ok(s) | Err(s) => println!("  {s}"),
+            }
+        }
+        Ok(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // run <profile>
 // ---------------------------------------------------------------------------
 
 fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let p = Parsed::parse(rest, COMMON_BOOLS)?;
-    p.reject_unknown(&[
+    let mut allowed: Vec<&str> = vec![
         "seconds",
         "core",
         "shape",
@@ -359,7 +517,9 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         "no-report",
         "json",
         "help",
-    ])?;
+    ];
+    allowed.extend_from_slice(GPU_OPTS);
+    p.reject_unknown(&allowed)?;
     let profile = p
         .positional
         .first()
@@ -404,9 +564,10 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         "cross" => {
             // Concurrent CPU + RAM + storage under one stop and one timeline —
             // the worst-case transient mix that steady single-domain tests miss.
-            // (GPU joins this profile in Phase 3.)
             let budget = Budget::steady(Duration::from_secs(seconds_arg(&p, 60)?));
-            let stages: Vec<(Box<dyn LoadKernel>, String)> = vec![
+            // `mut` is only needed when the gpu feature pushes an extra stage.
+            #[allow(unused_mut)]
+            let mut stages: Vec<(Box<dyn LoadKernel>, String)> = vec![
                 (
                     Box::new(CpuKernel::new(CoreSel::All)),
                     "steady core=all".into(),
@@ -420,6 +581,13 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
                     "steady".into(),
                 ),
             ];
+            // GPU joins the full-system cross-load when built with `--features gpu`.
+            #[cfg(feature = "gpu")]
+            {
+                let gpu = gpu_kernel_from(&p, Shape::Steady)?;
+                let label = format!("steady {}", gpu.device.label());
+                stages.push((Box::new(gpu), label));
+            }
             runner.concurrent(stages, &budget)
         }
         "power" => {
@@ -429,6 +597,8 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
                 duration: Duration::from_secs(seconds_arg(&p, 60)?),
                 shape,
                 target_watts: None,
+                phase_epoch: None,
+                phase_offset: Duration::ZERO,
             };
             runner.note(
                 "power profile: CPU burst only in Phase 1; GPU wattage sweeps arrive in Phase 3",
@@ -443,9 +613,93 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             let seconds = seconds_arg(&p, 60)?;
             runner.all_drives_storage(&p, seconds)
         }
+        // CPU <-> GPU transient scenarios. The choreography is the test: these
+        // are the worst-case VRM/PSU patterns a steady-state run cannot produce.
+        "in-phase" | "anti-phase" | "beat" => run_transient_scenario(&mut runner, &p, &profile),
         other => Err(format!(
-            "unknown profile '{other}' (expected: quick | soak | cross | power | storage-cross)"
+            "unknown profile '{other}' (expected: quick | soak | cross | power | \
+             storage-cross | in-phase | anti-phase | beat)"
         )),
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn ms(v: u64) -> Duration {
+    Duration::from_millis(v)
+}
+
+/// CPU ↔ GPU transient scenarios — the choreography *is* the test.
+///
+/// A steady-state run cannot produce any of these; they are the patterns that
+/// kill marginal VRMs and PSUs. The GPU is the strongest transient source in the
+/// box (measured on an RTX 3070: ~43 W idle to ~221 W loaded, a ~180 W step).
+fn run_transient_scenario(runner: &mut Runner, p: &Parsed, profile: &str) -> Result<u8, String> {
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (runner, p);
+        Err(format!("profile '{profile}' needs a GPU; {NO_GPU}"))
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let dur = Duration::from_secs(seconds_arg(p, 60)?);
+        let on = p.get_u64("burst-on")?.unwrap_or(20).clamp(1, MAX_BURST_MS);
+        let off = p.get_u64("burst-off")?.unwrap_or(20).clamp(1, MAX_BURST_MS);
+
+        let gpu = gpu_kernel_from(
+            p,
+            Shape::Burst {
+                on: ms(on),
+                off: ms(off),
+            },
+        )?;
+        let gpu_label = gpu.device.label();
+        let cores = core_from(p)?;
+
+        // (gpu_on, gpu_off, gpu_start_delay, explanation)
+        let (gpu_on, gpu_off, delay_ms, note) = match profile {
+            "in-phase" => (
+                on,
+                off,
+                0,
+                "in-phase: CPU and GPU burst together — peak total system draw, the case \
+                 that exposes PSU headroom and trips OCP",
+            ),
+            "anti-phase" => (
+                on,
+                off,
+                // Offset by the ON time so the GPU drives while the CPU idles.
+                on,
+                "anti-phase: GPU bursts during CPU idle and vice versa — VRMs and PSU chase \
+                 load back and forth; often nastier than simultaneous max",
+            ),
+            _ => (
+                // Slightly longer GPU period: the phase relationship drifts
+                // through every alignment on its own, no enumeration needed.
+                on + 3,
+                off + 3,
+                0,
+                "beat: CPU and GPU run at slightly different periods, sweeping the entire \
+                 phase relationship over the run",
+            ),
+        };
+
+        runner.note(note);
+
+        let stages = vec![
+            PhasedStage {
+                kernel: Box::new(CpuKernel::new(cores)),
+                mode: format!("burst {} {on}/{off}ms", cores_label(cores)),
+                budget: Budget::burst(dur, ms(on), ms(off)),
+                phase_offset: Duration::ZERO,
+            },
+            PhasedStage {
+                kernel: Box::new(gpu),
+                mode: format!("burst {gpu_label} {gpu_on}/{gpu_off}ms"),
+                budget: Budget::burst(dur, ms(gpu_on), ms(gpu_off)),
+                phase_offset: ms(delay_ms),
+            },
+        ];
+        runner.concurrent_phased(stages, profile)
     }
 }
 
@@ -593,6 +847,84 @@ impl Runner {
                 kernel.name(),
                 kernel.kind(),
                 mode.clone(),
+                secs,
+                result,
+            ));
+        }
+        self.finish()
+    }
+
+    /// Cross-load with per-kernel load shapes and phase offsets.
+    ///
+    /// This is where the worst-case transients live. Unlike [`Runner::concurrent`]
+    /// (one shared budget), each kernel gets its own [`Budget`] and its own start
+    /// delay, which is what lets us run:
+    ///
+    /// * **in-phase** — every domain bursts ON together: peak total system draw,
+    ///   the case that trips a marginal PSU's OCP.
+    /// * **anti-phase** — CPU ON while GPU is OFF and vice versa: makes the VRMs
+    ///   and PSU chase load back and forth continuously. Often nastier than
+    ///   simultaneous max, and unreachable from any steady-state test.
+    /// * **beat** — slightly different periods per domain, so the phase
+    ///   relationship drifts through every alignment on its own.
+    #[cfg(feature = "gpu")]
+    fn concurrent_phased(&mut self, stages: Vec<PhasedStage>, label: &str) -> Result<u8, String> {
+        self.begin();
+        self.markers.stamp(
+            Event::StageStart,
+            "cross",
+            label,
+            &format!("{} kernel(s)", stages.len()),
+        );
+        eprintln!(
+            "cross-load [{label}]: {} kernel(s) concurrently",
+            stages.len()
+        );
+        for st in &stages {
+            eprintln!(
+                "  {} <- {} (phase +{}ms)",
+                st.kernel.name(),
+                st.mode,
+                st.phase_offset.as_millis()
+            );
+        }
+
+        // One shared phase origin for every kernel in the run. Each kernel's
+        // burst phase is measured from this, so the commanded offsets hold
+        // exactly regardless of how long each kernel takes to initialize.
+        let epoch = Instant::now();
+        let phased: Vec<Budget> = stages
+            .iter()
+            .map(|st| st.budget.clone().phased(epoch, st.phase_offset))
+            .collect();
+
+        let t0 = Instant::now();
+        let stop = &self.stop;
+        let markers = &self.markers;
+        let results: Vec<LoadResult> = std::thread::scope(|scope| {
+            let handles: Vec<_> = stages
+                .iter()
+                .zip(phased.iter())
+                .map(|(st, budget)| scope.spawn(move || st.kernel.run(budget, stop, markers)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| LoadResult::setup_failure("kernel thread panicked"))
+                })
+                .collect()
+        });
+
+        let secs = t0.elapsed().as_secs_f64();
+        self.markers.stamp(Event::StageStop, "cross", label, "");
+
+        for (st, result) in stages.iter().zip(results) {
+            print_stage(st.kernel.name(), &st.mode, secs, &result);
+            self.report.add_stage(StageReport::new(
+                st.kernel.name(),
+                st.kernel.kind(),
+                st.mode.clone(),
                 secs,
                 result,
             ));
@@ -967,6 +1299,19 @@ fn storage_cfg_for(
         keep: p.has("keep"),
         unbuffered: unbuffered_from(p),
     })
+}
+
+/// One kernel in a phased cross-load: its own load shape and its own start
+/// offset, so domains can be run in-phase, anti-phase, or at beat frequencies.
+#[cfg(feature = "gpu")]
+struct PhasedStage {
+    kernel: Box<dyn LoadKernel>,
+    mode: String,
+    budget: Budget,
+    /// Phase offset from the run's shared epoch. Applied to the burst phase
+    /// itself, not as a thread start delay — a start delay is swamped by
+    /// per-kernel setup time (GPU init is ~100 ms, dwarfing a 20 ms offset).
+    phase_offset: Duration,
 }
 
 /// One physical drive's solo baseline and concurrent throughput, for the

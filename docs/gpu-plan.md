@@ -338,3 +338,102 @@ and passed" from "never ran" is worse than no gate.
 - Verify output every run; treat worker-thread panics and device-lost as FAIL.
 - Default build = wgpu runtime. Gate CUDA behind a feature.
 - Get AMD hardware in front of this before committing to per-vendor claims.
+
+## 13. Phase 3b results — `crucible-gpu` built (2026-07-24)
+
+The GPU is now a real [`LoadKernel`], so the orchestrator drives it with the same
+`StopFlag`, `ShapeDriver` and QPC `MarkerLog` as every other domain. Measured on
+the RTX 3070 bench.
+
+### Packaging: one binary, still zero-dep by default
+
+`crucible-gpu` is a workspace member (so it ships *inside* `cec-crucible`) but is
+excluded from `default-members` and gated behind a `gpu` cargo feature:
+
+```
+cargo build --release                                   # core, 0 external deps
+cargo build --release -p crucible-cli --features gpu    # full shipped binary
+```
+
+Verified: `cargo tree -p crucible-cli` lists **only** `crucible-*`; with
+`--features gpu` it pulls 455 dependency entries. `Cargo.lock` is now committed
+so the default build stays resolvable (and offline-buildable) even though an
+optional CubeCL dependency exists in the manifest.
+
+### Steady tuning is worth ~40 W
+
+Steady and burst want *opposite* tuning, and getting it wrong silently costs a
+fifth of the power budget:
+
+| | small dispatches, sync every one | batched, large dispatches |
+| --- | --- | --- |
+| Board power | 166–184 W (~75%) | **215–221 W (~92%)** |
+| SM / mem util | 70–91% / 60–79% | **98–100% / 96–100%** |
+| Throughput | 0.70 TFLOP/s | **1.33 TFLOP/s** |
+
+So the kernel now picks per shape: **steady** batches 4 dispatches per sync at
+4096 iters (max sustained power), **burst** uses 1 dispatch at 256 iters (~6 ms,
+fits inside a 20 ms ON window so the edge stays sharp). `--gpu-iters` overrides.
+
+### Verification is live and clean
+
+Every run checks liveness (finite + non-zero) and self-consistency (the kernel is
+deterministic, so the checksum must reproduce bit-for-bit). Across all runs:
+**0 errors**, e.g. 620 dispatches / 38 verifications on a 32 s steady run. This is
+the guard against the 3a failure mode where a dead kernel reported 1.65 TFLOP/s.
+
+### Phase control: a real defect, found by measuring
+
+The first anti-phase implementation used a **thread start delay**. Marker
+analysis showed it did not work — the commanded 20 ms offset came out ~10 ms, and
+the CPU edges smeared across half the period. Two causes:
+
+1. Each CPU worker thread started its **own** `ShapeDriver`, so 20 cores produced
+   20 unsynchronized square waves rather than one sharp system-level step.
+2. A start delay is measured from when each kernel's driver starts — but GPU
+   setup (client init + shader compile) is ~100 ms+, dwarfing a 20 ms delay.
+
+Fix: `Budget` gained `phase_epoch` + `phase_offset`, so **all kernels derive
+burst phase from one shared origin**. The CPU kernel now shares a single epoch
+across its worker threads; the orchestrator hands every kernel the same epoch.
+
+`burst_on` phase distribution within the 40 ms period, from the marker file:
+
+| | 0–5 ms | 5–10 | 10–15 | 15–20 | 20–25 | 25–30 | 30–35 | 35–40 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CPU before fix | 46% | 18% | 22% | 8% | 4% | 1% | 0% | 0% |
+| GPU before fix | 0% | 0% | **99.9%** | 0% | 0% | 0% | 0% | 0% |
+| CPU after fix | **79%** | 13% | 6% | 3% | 0% | 0% | 0% | 0% |
+| GPU after fix | 0% | 0% | 0% | 0% | **100%** | 0% | 0% | 0% |
+
+The GPU now lands exactly in the commanded +20 ms bucket.
+
+### All three scenarios validated
+
+| scenario | CPU phase | GPU phase | reads as |
+| --- | --- | --- | --- |
+| `in-phase` | 80% @ 0–5 ms | 100% @ 0–5 ms | aligned — peak total draw |
+| `anti-phase` | 79% @ 0–5 ms | 100% @ 20–25 ms | opposite — VRM/PSU chases load |
+| `beat` | 65% @ 0–5 ms | 17/10/13/9/14/12/16/10% | drifts through every alignment |
+
+The flat distribution under `beat` is the signature of a drifting phase
+relationship — the whole phase space swept without enumerating it.
+
+Average GPU board power under anti-phase settles ~114–127 W against ~218 W
+steady, consistent with the ~50% duty cycle. Note that 1 Hz `nvidia-smi` sampling
+can only show that average; the 20 ms oscillation is invisible to it. **That is
+exactly what the QPC markers are for** — we timestamp the commanded edges, the
+external 1 kHz rig measures the electrical reality, and the two are correlated
+afterwards.
+
+### Known limitations
+
+- **CPU edge jitter remains.** ~21% of CPU burst edges land late (5–20 ms). Cause
+  is scheduler oversubscription: 20 pinned worker threads plus the GPU and
+  orchestrator threads contend for 20 logical cores, so some threads notice the
+  phase transition late. Leaving a core free for orchestration, or shrinking the
+  CPU work chunk, should tighten it. The GPU — the dominant transient source at a
+  ~180 W swing — is already exact.
+- **AMD still untested.** No AMD hardware on this bench; no per-vendor claims.
+- **VRAM integrity test (§4.2) is still unbuilt.** It is a separate test with a
+  different objective and must not be confused with the wattage knob used here.

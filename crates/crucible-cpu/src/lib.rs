@@ -89,6 +89,13 @@ impl LoadKernel for CpuKernel {
         let label = self.cores.label();
         let label_ref: &str = label.as_str();
 
+        // All worker threads must share one phase origin, otherwise each core's
+        // ShapeDriver measures phase from its own start and the cores burst
+        // independently — 20 unsynchronized square waves instead of one sharp
+        // system-level current step, which is the whole point of a burst shape.
+        // An orchestrator-supplied epoch (cross-load) always wins.
+        let budget = &budget.clone().phased_if_unset(Instant::now());
+
         // Scoped threads so each worker can borrow the shared stop/markers/budget.
         // `label_ref`, `core`, and the shared references are all `Copy`, so each
         // `move` closure gets its own copy rather than moving `label` out.

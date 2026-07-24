@@ -82,6 +82,19 @@ pub struct Budget {
     pub duration: Duration,
     pub shape: Shape,
     pub target_watts: Option<f64>,
+    /// Shared phase origin for burst shapes.
+    ///
+    /// Without this, every [`ShapeDriver`] derives its phase from whenever *it*
+    /// happened to start, so load edges never line up: the CPU kernel's worker
+    /// threads smear across the period instead of stepping together, and a
+    /// cross-load offset is swamped by per-kernel setup time (GPU client init +
+    /// shader compile is ~100 ms, dwarfing a 20 ms intended offset). Giving
+    /// every kernel one common origin makes in-phase / anti-phase exact and
+    /// independent of setup jitter. `None` = each driver uses its own start.
+    pub phase_epoch: Option<Instant>,
+    /// Offset from `phase_epoch` for this kernel — how the anti-phase and beat
+    /// scenarios shift one domain against another.
+    pub phase_offset: Duration,
 }
 
 impl Budget {
@@ -90,6 +103,8 @@ impl Budget {
             duration,
             shape: Shape::Steady,
             target_watts: None,
+            phase_epoch: None,
+            phase_offset: Duration::ZERO,
         }
     }
 
@@ -98,7 +113,25 @@ impl Budget {
             duration,
             shape: Shape::Burst { on, off },
             target_watts: None,
+            phase_epoch: None,
+            phase_offset: Duration::ZERO,
         }
+    }
+
+    /// Pin this budget's burst phase to a shared origin plus an offset.
+    pub fn phased(mut self, epoch: Instant, offset: Duration) -> Budget {
+        self.phase_epoch = Some(epoch);
+        self.phase_offset = offset;
+        self
+    }
+
+    /// Adopt `epoch` only if no phase origin was set, preserving any offset an
+    /// orchestrator already chose.
+    pub fn phased_if_unset(mut self, epoch: Instant) -> Budget {
+        if self.phase_epoch.is_none() {
+            self.phase_epoch = Some(epoch);
+        }
+        self
     }
 }
 
@@ -184,6 +217,10 @@ pub struct ShapeDriver<'a> {
     shape: Shape,
     mode: &'static str,
     start: Instant,
+    /// Origin the burst phase is measured from — shared across kernels so their
+    /// edges line up deterministically (see [`Budget::phase_epoch`]).
+    phase_origin: Instant,
+    phase_offset: Duration,
     deadline: Instant,
     stop: &'a StopFlag,
     markers: &'a MarkerLog,
@@ -208,6 +245,10 @@ impl<'a> ShapeDriver<'a> {
             shape: budget.shape,
             mode: budget.shape.mode_str(),
             start: now,
+            // Phase comes from the shared origin when one is supplied, so setup
+            // time before this driver started does not shift the load edges.
+            phase_origin: budget.phase_epoch.unwrap_or(now),
+            phase_offset: budget.phase_offset,
             deadline: now + budget.duration,
             stop,
             markers,
@@ -230,7 +271,7 @@ impl<'a> ShapeDriver<'a> {
             Shape::Steady => Tick::Work,
             Shape::Burst { on, off } => {
                 let period = (on + off).as_nanos().max(1);
-                let pos = self.start.elapsed().as_nanos() % period;
+                let pos = (self.phase_origin.elapsed() + self.phase_offset).as_nanos() % period;
                 let on_ns = on.as_nanos();
                 if pos < on_ns {
                     if !self.on_phase {

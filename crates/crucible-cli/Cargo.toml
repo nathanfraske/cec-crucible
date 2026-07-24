@@ -16,8 +16,15 @@ path = "src/main.rs"
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
+[features]
+# Off by default so the standard build stays zero-dependency and offline-
+# buildable. Turn on for the full shipped binary:
+#   cargo build --release -p crucible-cli --features gpu
+gpu = ["dep:crucible-gpu"]
+
 [dependencies]
 crucible-core = { path = "../crucible-core" }
 crucible-cpu = { path = "../crucible-cpu" }
 crucible-mem = { path = "../crucible-mem" }
 crucible-storage = { path = "../crucible-storage" }
+crucible-gpu = { path = "../crucible-gpu", optional = true }

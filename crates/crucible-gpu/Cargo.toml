@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+#
+# This is the one crate in the suite permitted external dependencies (CubeCL).
+# It IS a workspace member so it ships inside the single `cec-crucible` binary,
+# but it is kept out of `default-members` (see the root Cargo.toml) so the
+# everyday `cargo build` / `cargo test` never compiles this dependency tree.
+#
+# Build the full, GPU-enabled binary with:
+#   cargo build --release -p crucible-cli --features gpu
+[package]
+name = "crucible-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "GPU load kernel for cec-crucible: CubeCL thrasher with load shapes, markers and per-dispatch verification"
+
+[dependencies]
+crucible-core = { path = "../crucible-core" }
+cubecl = { version = "0.10", features = ["wgpu"] }
+
+[features]
+# CUDA is opt-in only: spike 3a proved it builds without a CUDA toolkit but will
+# NOT run without one (CubeCL JIT-compiles through NVRTC, and nvrtc.dll ships
+# with the toolkit, not the driver). wgpu is the shipping default.
+cuda = ["cubecl/cuda"]

@@ -3,7 +3,10 @@ spikes/*/target
 spikes/*/Cargo.lock
 spikes/*/*.log
 **/*.rs.bk
-Cargo.lock
+
+# Cargo.lock IS committed. This is an application, not a library, and once the
+# `gpu` feature pulls CubeCL the lockfile is what keeps the core's default build
+# resolvable (and therefore offline-buildable) without a registry round-trip.
 
 # Runtime output — reports and markers embed machine-identifying device IDs
 # (SMBIOS UUID, board serial, hostname). Never commit them.

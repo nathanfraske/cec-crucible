@@ -43,16 +43,26 @@ Basic concurrent cross-load (CPU+RAM+storage under one stop/timeline, the
 - CPU/board telemetry sampling (self-contained where possible; LibreHardwareMonitor
   interop only if needed — mind the HVCI/WinRing0 caveat from the research).
 
-## Phase 3 — GPU (the long pole)
+## Phase 3 — GPU (the long pole) — **in progress**
 
-- `crucible-gpu` on CubeCL/wgpu: thrasher (steady + burst + VRAM), multi-vendor
-  validation, TDR handling.
-- Wattage closed-loop servo (NVML/ADLX/LHM readback) + per-GPU-model
-  self-calibration, device-ID'd.
-- Full cross-load with GPU in the mix; the `power` characterization profile for
-  the 1kHz rig.
-- ~1–3 weeks graphics work for a v1 + per-generation smoke tests; needs real
-  GPUs of each vendor to validate.
+Backend decided: **CubeCL** (wgpu runtime by default). Full design and all
+measurements in [`docs/gpu-plan.md`](gpu-plan.md).
+
+- [x] **3a — backend spike.** Validated on NVIDIA + Intel, TDR-safe with chained
+  short dispatches, ~92% of board power with an ALU+VRAM mix. Established that
+  the CUDA runtime builds without a CUDA toolkit but will not *run* without one,
+  so wgpu is the shipping default.
+- [x] **3b — `crucible-gpu` as a real `LoadKernel`.** Steady + burst shapes, QPC
+  marker emission, per-dispatch liveness + self-consistency verification, and the
+  CPU↔GPU transient profiles (`in-phase` / `anti-phase` / `beat`) — all validated
+  against marker timestamps. Ships in the single binary behind `--features gpu`;
+  the default build stays zero-dependency.
+- [ ] **3c — VRAM integrity test.** A *separate* test from the wattage thrasher:
+  pattern write/verify across VRAM to find bad memory. Not started.
+- [ ] **3d — wattage servo.** Closed-loop power targeting (NVML/ADLX readback) +
+  per-GPU-model self-calibration, device-ID'd.
+- [ ] **3e — AMD validation.** No AMD hardware on the bench yet; no per-vendor
+  claims until there is.
 
 ## Phase 4 — polish
 

@@ -10,14 +10,27 @@ members = [
     "crates/crucible-cpu",
     "crates/crucible-mem",
     "crates/crucible-storage",
+    "crates/crucible-gpu",
     "crates/crucible-cli",
 ]
-# crates/crucible-gpu is Phase 3 (the long pole) and intentionally not yet a
-# workspace member — it is the one crate permitted an external toolkit.
 
-# Throwaway spikes are excluded: they pull external crates (CubeCL/wgpu) and
-# must never contaminate the zero-dependency core. `cargo build` at the root
-# does not build them. See spikes/gpu-3a/README.md.
+# `cargo build` / `cargo test` at the root operate on these only. crucible-gpu
+# is a member (so it ships inside the single `cec-crucible` binary) but is left
+# out here, so the everyday workflow never compiles its external dependency
+# tree and the core stays offline-buildable with zero dependencies.
+#
+# Full GPU-enabled binary:
+#   cargo build --release -p crucible-cli --features gpu
+default-members = [
+    "crates/crucible-core",
+    "crates/crucible-cpu",
+    "crates/crucible-mem",
+    "crates/crucible-storage",
+    "crates/crucible-cli",
+]
+
+# Throwaway spikes are excluded entirely — they are reference code, not part of
+# the product. See spikes/gpu-3a/README.md.
 exclude = ["spikes/*"]
 
 [workspace.package]
