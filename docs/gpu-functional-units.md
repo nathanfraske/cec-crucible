@@ -194,6 +194,29 @@ The exact ingredients, confirmed by reading the pinned CubeCL 0.10 source:
   unknown); (3) checksum the result buffer, wire `LoadKernel` + a `tensor` command.
   Dep cost lands only under the feature.
 
+### Tensor spike RESULT — [RAN on the RTX 3070] (`spikes/gpu-tensor`)
+
+```
+runtime: wgpu<spirv>
+f16->f32 cmma: max_err=0.0000  PASS (tensor cores reached)
+i8->i32  cmma: gpu[0]=0 ref[0]=-1  MISMATCH
+```
+
+- ✅ **The portable path is proven.** `init_setup::<Vulkan>` forces `wgpu<spirv>`,
+  and a 16×16×16 **f16→f32** `cmma` is **bit-exact vs a CPU reference** — the tensor
+  cores are genuinely reached through CubeCL-SPIR-V/Vulkan, driver-only, one binary.
+- ❌ **int8→int32 does NOT work here** — it ran without error but returned all
+  zeros (the untested-upstream risk, confirmed). Almost certainly the 3070's Vulkan
+  `VK_KHR_cooperative_matrix` doesn't expose an int8 combo (the wgpu-source note
+  said NVIDIA/AMD "primarily support f16"), or CubeCL's SPIR-V int8 emit is a gap.
+- **Consequence:** the shippable `tensor` kernel uses **f16→f32 with same-device
+  self-consistency** (like `render`), NOT the int8 cross-vendor golden. The
+  bit-exact int8 golden remains available only on the **CUDA / native-WMMA-PTX**
+  path (NVIDIA, toolkit-at-build) — a separate optional route if a cross-vendor
+  golden is ever needed. To build the kernel: promote `spikes/gpu-tensor` into a
+  `crucible-gpu` `tensor` feature (adds `cubecl/vulkan` → `ash`+`cubecl-spirv`),
+  scale from one tile to a sustained GEMM loop, wire `LoadKernel`.
+
 ## 3. Recommended build order
 
 1. **`render`** — ✅ done (portable, zero-dep, all three vendors).
@@ -209,6 +232,27 @@ All implement `LoadKernel`, so each drops into the shape/stop/phase/marker
 machinery with no orchestrator change and immediately gains the chaos / gauntlet
 profiles. Same verification bar as everything else: **verified-nothing ⇒ FAIL**,
 same-device self-consistency (int8 tensor golden is the one cross-vendor golden).
+
+## 4. Implementation plans (scoped, ready to execute)
+
+- **`render` + glTF/PBR — plan ready (~1–1.5 days).** New `gpu-gltf` feature adds
+  `gltf` 1.4 (which pulls `image` 0.25 trimmed to png+jpeg already) — all behind
+  the feature, default/`gpu` builds untouched. Loads a bundled `.glb` into
+  per-primitive draws with metallic-roughness material bind groups; PBR fragment
+  shader ported from the Khronos glTF-Sample-Renderer (Apache-2.0); `--scene
+  <file>` override; verification unchanged (framebuffer checksum, self-consistency).
+  ⚠ **LEGAL [FACT, per-asset READMEs]:** the usual defaults are BLOCKED for a
+  commercial public-MIT repo — **DamagedHelmet is CC-BY-NC** (NonCommercial) and
+  **Khronos Sponza is CryEngine-licensed**. Bundle **BoomBox (CC0-1.0, Microsoft)**
+  instead (full metal-rough PBR set + tangents; downscale textures + embed → ~1–2 MB).
+- **`rt` via `ash` `VK_KHR_ray_query` — plan ready (~few days, ~700–1000 Rust +
+  40 GLSL).** New `rt` feature adds `ash` 0.38 (+ `gpu-allocator`). All ash objects
+  built inside `run()` under `catch_unwind` like the wgpu kernels; a separate
+  `VkInstance` alongside wgpu's is fully supported. BLAS/TLAS over fixed geometry,
+  a committed prebuilt `.spv` inline-ray-query compute shader (`glslangValidator
+  --target-env vulkan1.2`), per-ray `{prim, bitcast(t)}` → fixed-order FNV hash →
+  self-consistency. Verified against ash-0.38 docs; pin `ash = "=0.38.0"` (the
+  `push_next` API differs on ash master).
 
 ## Sources
 

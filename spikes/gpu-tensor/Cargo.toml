@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+# Throwaway spike: does CubeCL cmma reach the tensor cores on the SPIR-V/Vulkan
+# backend, and does int8->int32 (the cross-vendor golden) actually run?
+# Excluded from the workspace (see root Cargo.toml `exclude = ["spikes/*"]`).
+# Standalone (not part of the cec-crucible workspace).
+[workspace]
+
+[package]
+name = "gpu-tensor-spike"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# `vulkan` = wgpu-spirv: forces the SPIR-V compiler so cmma maps to
+# CooperativeMatrixMultiply -> tensor cores (wgsl can't do mma).
+cubecl = { version = "0.10", features = ["wgpu", "vulkan"] }
+half = "2.5"
