@@ -32,6 +32,12 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
 ] }
 # f16 host type for the tensor (cmma) kernel; only pulled with `tensor`.
 half = { version = "2.5", optional = true, default-features = false }
+# glTF scene loading for the render kernel; only pulled with `gpu-gltf`. `import`
+# brings resource loading + the `image` crate already trimmed to png+jpeg.
+gltf = { version = "1.4", optional = true, default-features = false, features = [
+    "import",
+    "utils",
+] }
 
 [features]
 # CUDA compute (the thrasher via CubeCL's CUDA runtime) needs NVRTC at runtime;
@@ -41,3 +47,5 @@ cuda = ["cubecl/cuda", "dep:cudarc"]
 # cubecl-spirv) so cooperative-matrix (cmma) maps to the tensor cores — the wgsl
 # backend cannot do mma. Proven f16->f32 bit-exact on the RTX 3070.
 tensor = ["cubecl/vulkan", "dep:half"]
+# glTF/PBR scene rendering for the `render` kernel (bundled or --scene).
+gpu-gltf = ["dep:gltf"]

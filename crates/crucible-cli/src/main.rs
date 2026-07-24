@@ -71,6 +71,7 @@ const GPU_OPTS: &[&str] = &[
     "render-w",
     "render-h",
     "render-inst",
+    "scene",
     "tensor-tiles",
     "tensor-iters",
 ];
@@ -187,6 +188,8 @@ GPU OPTIONS (builds with --features gpu):
     --render-inst <N>    Mesh instances drawn per frame — the geometry/overdraw
                          knob (default 48). `render` exercises the rasterizer,
                          texture units and ROP the compute thrasher never touches.
+    --scene <FILE>       Render a glTF/.glb scene (real game geometry + texture)
+                         instead of the procedural mesh. Needs `--features gpu-gltf`.
     --tensor-tiles <N>   Tensor: 16x16 output tiles / warps (default 4096).
     --tensor-iters <N>   Tensor: cmma accumulations per warp per dispatch (default
                          256). `tensor` drives the tensor cores via cooperative
@@ -651,6 +654,10 @@ fn render_kernel_from(p: &Parsed) -> Result<crucible_gpu::render::RenderKernel, 
     if let Some(v) = p.get_u64("render-inst")? {
         k.instances = v.clamp(1, 4096) as u32;
     }
+    if let Some(path) = p.get("scene") {
+        // A glTF/.glb scene (needs a --features gpu-gltf build; load errors at run).
+        k.scene = crucible_gpu::render::SceneSource::File(path.into());
+    }
     Ok(k)
 }
 
@@ -685,8 +692,15 @@ fn cmd_render(rest: &[String]) -> Result<u8, String> {
         let seconds = seconds_arg(&p, 60)?;
         let shape = shape_from(&p)?;
         let kernel = render_kernel_from(&p)?;
+        let scene_tag = match &kernel.scene {
+            crucible_gpu::render::SceneSource::File(path) => format!(
+                " scene={}",
+                path.file_stem().and_then(|s| s.to_str()).unwrap_or("glb")
+            ),
+            crucible_gpu::render::SceneSource::Procedural => String::new(),
+        };
         let mode = format!(
-            "{} render {}x{} x{}",
+            "{} render {}x{} x{}{scene_tag}",
             shape.mode_str(),
             kernel.width,
             kernel.height,

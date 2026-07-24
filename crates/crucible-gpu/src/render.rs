@@ -52,6 +52,17 @@ struct Vertex {
     normal: [f32; 3],
 }
 
+/// Where the render geometry + texture come from.
+#[derive(Debug, Clone, Default)]
+pub enum SceneSource {
+    /// The built-in procedural grid + checker texture (zero-dep).
+    #[default]
+    Procedural,
+    /// A glTF/`.glb` file (needs the `gpu-gltf` feature). Loads the mesh and its
+    /// base-colour texture — real game geometry through the raster/TMU/ROP path.
+    File(std::path::PathBuf),
+}
+
 /// Graphics-pipeline load kernel.
 #[derive(Debug, Clone)]
 pub struct RenderKernel {
@@ -63,6 +74,8 @@ pub struct RenderKernel {
     pub instances: u32,
     /// Verify (read back + checksum) every this many frames.
     pub verify_every: u64,
+    /// Geometry/texture source (procedural or a glTF scene).
+    pub scene: SceneSource,
 }
 
 impl Default for RenderKernel {
@@ -73,6 +86,7 @@ impl Default for RenderKernel {
             height: 720,
             instances: 48,
             verify_every: 32,
+            scene: SceneSource::Procedural,
         }
     }
 }
@@ -192,6 +206,214 @@ fn build_texture() -> Vec<u8> {
     px
 }
 
+/// Geometry + a base-colour texture + a fixed fit transform for one render.
+struct SceneData {
+    verts: Vec<Vertex>,
+    idx: Vec<u32>,
+    tex: Vec<u8>, // RGBA8
+    tex_w: u32,
+    tex_h: u32,
+    view_proj: [f32; 16],
+}
+
+/// Resolve the scene: the built-in procedural mesh, or a glTF file.
+fn load_scene(k: &RenderKernel) -> Result<SceneData, String> {
+    match &k.scene {
+        SceneSource::Procedural => {
+            let (verts, idx) = build_mesh();
+            Ok(SceneData {
+                verts,
+                idx,
+                tex: build_texture(),
+                tex_w: TEX_SIZE,
+                tex_h: TEX_SIZE,
+                view_proj: view_proj(),
+            })
+        }
+        #[cfg(feature = "gpu-gltf")]
+        SceneSource::File(p) => load_gltf(p),
+        #[cfg(not(feature = "gpu-gltf"))]
+        SceneSource::File(_) => {
+            Err("glTF scene needs a build with `--features gpu-gltf`".to_string())
+        }
+    }
+}
+
+// --- 4x4 (column-major) helpers for baking glTF node transforms ---
+#[cfg(feature = "gpu-gltf")]
+fn mat_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut o = [[0.0f32; 4]; 4];
+    for (c, oc) in o.iter_mut().enumerate() {
+        for (r, orc) in oc.iter_mut().enumerate() {
+            for k in 0..4 {
+                *orc += a[k][r] * b[c][k];
+            }
+        }
+    }
+    o
+}
+#[cfg(feature = "gpu-gltf")]
+fn xform_point(m: [[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
+    let v = [p[0], p[1], p[2], 1.0];
+    let mut o = [0.0f32; 3];
+    for (r, orr) in o.iter_mut().enumerate() {
+        for (c, &vc) in v.iter().enumerate() {
+            *orr += m[c][r] * vc;
+        }
+    }
+    o
+}
+#[cfg(feature = "gpu-gltf")]
+fn xform_dir(m: [[f32; 4]; 4], d: [f32; 3]) -> [f32; 3] {
+    let mut o = [0.0f32; 3];
+    for (r, orr) in o.iter_mut().enumerate() {
+        for (c, &dc) in d.iter().enumerate() {
+            *orr += m[c][r] * dc;
+        }
+    }
+    let l = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt().max(1e-6);
+    [o[0] / l, o[1] / l, o[2] / l]
+}
+
+/// Load a glTF/.glb: merge all primitives' geometry (baking node transforms),
+/// fit it into the fixed camera's view, and grab the first base-colour texture.
+/// A single-material asset (e.g. BoomBox) renders exactly; a multi-material scene
+/// uses the first base-colour texture for all of it (a known first-cut limit —
+/// full per-material metallic-roughness PBR is a follow-up).
+#[cfg(feature = "gpu-gltf")]
+fn load_gltf(path: &std::path::Path) -> Result<SceneData, String> {
+    let (doc, buffers, images) =
+        gltf::import(path).map_err(|e| format!("glTF load failed: {e}"))?;
+
+    let scene = doc
+        .default_scene()
+        .or_else(|| doc.scenes().next())
+        .ok_or("glTF has no scene")?;
+
+    let ident = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let mut verts: Vec<Vertex> = Vec::new();
+    let mut idx: Vec<u32> = Vec::new();
+    let mut stack: Vec<(gltf::Node, [[f32; 4]; 4])> = scene.nodes().map(|n| (n, ident)).collect();
+
+    while let Some((node, parent)) = stack.pop() {
+        let world = mat_mul(parent, node.transform().matrix());
+        for child in node.children() {
+            stack.push((child, world));
+        }
+        let Some(mesh) = node.mesh() else { continue };
+        for prim in mesh.primitives() {
+            let reader = prim.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
+            let positions: Vec<[f32; 3]> = match reader.read_positions() {
+                Some(it) => it.collect(),
+                None => continue,
+            };
+            let normals: Vec<[f32; 3]> = reader
+                .read_normals()
+                .map(|it| it.collect())
+                .unwrap_or_else(|| vec![[0.0, 0.0, 1.0]; positions.len()]);
+            let uvs: Vec<[f32; 2]> = reader
+                .read_tex_coords(0)
+                .map(|t| t.into_f32().collect())
+                .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+            let base = verts.len() as u32;
+            for (i, p) in positions.iter().enumerate() {
+                verts.push(Vertex {
+                    pos: xform_point(world, *p),
+                    uv: *uvs.get(i).unwrap_or(&[0.0, 0.0]),
+                    normal: xform_dir(world, *normals.get(i).unwrap_or(&[0.0, 0.0, 1.0])),
+                });
+            }
+            match reader.read_indices() {
+                Some(it) => {
+                    for i in it.into_u32() {
+                        idx.push(base + i);
+                    }
+                }
+                None => idx.extend(base..base + positions.len() as u32),
+            }
+        }
+    }
+    if verts.is_empty() {
+        return Err("glTF scene has no geometry".to_string());
+    }
+    fit_positions(&mut verts);
+    let (tex, tex_w, tex_h) = gltf_base_texture(&doc, &images);
+    Ok(SceneData {
+        verts,
+        idx,
+        tex,
+        tex_w,
+        tex_h,
+        view_proj: view_proj(),
+    })
+}
+
+/// Center + uniformly scale positions into ~[-0.75, 0.75]^3 so the fixed camera
+/// frames the model regardless of its authored units.
+#[cfg(feature = "gpu-gltf")]
+fn fit_positions(verts: &mut [Vertex]) {
+    let mut min = [f32::MAX; 3];
+    let mut max = [f32::MIN; 3];
+    for v in verts.iter() {
+        for i in 0..3 {
+            min[i] = min[i].min(v.pos[i]);
+            max[i] = max[i].max(v.pos[i]);
+        }
+    }
+    let center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    let extent = (max[0] - min[0])
+        .max(max[1] - min[1])
+        .max(max[2] - min[2])
+        .max(1e-6);
+    let s = 1.5 / extent;
+    for v in verts.iter_mut() {
+        for (i, p) in v.pos.iter_mut().enumerate() {
+            *p = (*p - center[i]) * s;
+        }
+    }
+}
+
+/// First base-colour texture in the document, expanded to RGBA8. White 1x1 if none.
+#[cfg(feature = "gpu-gltf")]
+fn gltf_base_texture(doc: &gltf::Document, images: &[gltf::image::Data]) -> (Vec<u8>, u32, u32) {
+    use gltf::image::Format;
+    for mat in doc.materials() {
+        let Some(info) = mat.pbr_metallic_roughness().base_color_texture() else {
+            continue;
+        };
+        let Some(img) = images.get(info.texture().source().index()) else {
+            continue;
+        };
+        let (w, h) = (img.width, img.height);
+        let rgba = match img.format {
+            Format::R8G8B8A8 => img.pixels.clone(),
+            Format::R8G8B8 => img
+                .pixels
+                .chunks_exact(3)
+                .flat_map(|c| [c[0], c[1], c[2], 255])
+                .collect(),
+            Format::R8G8 => img
+                .pixels
+                .chunks_exact(2)
+                .flat_map(|c| [c[0], c[0], c[0], c[1]])
+                .collect(),
+            Format::R8 => img.pixels.iter().flat_map(|&c| [c, c, c, 255]).collect(),
+            _ => continue, // 16-bit etc — skip, fall through to white
+        };
+        return (rgba, w, h);
+    }
+    (vec![255, 255, 255, 255], 1, 1)
+}
+
 const SHADER: &str = r#"
 struct Uniforms { view_proj: mat4x4<f32>, params: vec4<f32> };
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -277,8 +499,10 @@ impl RenderGpu {
         }))
         .map_err(|e| format!("could not create device: {e}"))?;
 
-        // Geometry.
-        let (verts, idx) = build_mesh();
+        // Geometry + base texture + fit transform (procedural or a glTF scene).
+        let scene = load_scene(k)?;
+        let verts = scene.verts;
+        let idx = scene.idx;
         let index_count = idx.len() as u32;
         let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("render-vbuf"),
@@ -307,8 +531,8 @@ impl RenderGpu {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("render-tex"),
             size: wgpu::Extent3d {
-                width: TEX_SIZE,
-                height: TEX_SIZE,
+                width: scene.tex_w,
+                height: scene.tex_h,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -325,15 +549,15 @@ impl RenderGpu {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &build_texture(),
+            &scene.tex,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(TEX_SIZE * 4),
-                rows_per_image: Some(TEX_SIZE),
+                bytes_per_row: Some(scene.tex_w * 4),
+                rows_per_image: Some(scene.tex_h),
             },
             wgpu::Extent3d {
-                width: TEX_SIZE,
-                height: TEX_SIZE,
+                width: scene.tex_w,
+                height: scene.tex_h,
                 depth_or_array_layers: 1,
             },
         );
@@ -350,7 +574,7 @@ impl RenderGpu {
 
         // Uniforms.
         let mut ubytes = [0u8; 80];
-        ubytes[..64].copy_from_slice(f32_bytes(&view_proj()));
+        ubytes[..64].copy_from_slice(f32_bytes(&scene.view_proj));
         ubytes[64..].copy_from_slice(f32_bytes(&[instances as f32, 0.0, 0.0, 0.0]));
         let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("render-ubuf"),
