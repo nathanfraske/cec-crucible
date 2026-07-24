@@ -30,44 +30,83 @@ orchestrator — it joins `run cross` under the same one-stop/one-timeline model
    can be used on paid customer QC without the licensing maze of the closed
    tools.
 
-## 2. Backend decision (the first spike)
+## 2. Backend decision — **CubeCL** (decided)
 
 The rest of the suite is zero-dependency std-only. `crucible-gpu` is the
 **documented exception** — it will pull external crates. Kept in its own crate
 and out of the default build so the core suite stays dep-free and offline-buildable.
 
-| Option | Vendors | Language | License | Notes |
-| --- | --- | --- | --- | --- |
-| **wgpu** (Vulkan/DX12 compute, WGSL) | NVIDIA/AMD/Intel/Apple | Rust | MIT/Apache-2.0 | Mature, cross-vendor, MIT-compatible. **The safe floor.** |
-| **CubeCL** (Burn ecosystem) | wgpu/CUDA/ROCm backends | Rust | permissive | Nicer compute ergonomics; backend maturity varies per vendor. |
-| Vendor-native (CUDA / ROCm / oneAPI) | one vendor each | C/Rust FFI | mixed | Max control, worst portability + redistribution friction. |
+| Option | Vendors | Language | Notes |
+| --- | --- | --- | --- |
+| **CubeCL** (Burn ecosystem) — **chosen** | CUDA / ROCm / wgpu runtimes | Rust | Already CEC's multi-vendor GPU backend in another in-house project — shared toolchain and debugging experience. Adds a native CUDA path on top of wgpu. |
+| **wgpu** (Vulkan/DX12 compute, WGSL) | NVIDIA/AMD/Intel/Apple | Rust | **Not an alternative — it is one of CubeCL's runtimes.** Remains the portable floor underneath. |
+| Vendor-native (CUDA / ROCm / oneAPI direct) | one vendor each | C/Rust FFI | Max control, worst portability + redistribution friction. Not worth it. |
 
-**Recommendation:** start on **wgpu** (DX12 or Vulkan compute) — it is one
-codebase across all three desktop vendors and its license (MIT/Apache-2.0) is
-compatible with this repo's MIT. Evaluate CubeCL in parallel for kernel
-ergonomics, but treat wgpu as the fallback that must always work.
+**Decision: build on CubeCL.** Rationale:
 
-**Spike 3a (1–3 days):** a WGSL compute "hello-thrash" that dispatches an
-FMA-heavy kernel in a loop on each of NVIDIA/AMD/Intel and confirms (via vendor
-tools) it pins the card at its power limit. Gate the backend choice on this.
+1. **Toolchain consistency** — it is already the multi-vendor GPU backend in
+   another CEC project, so the kernel language, debugging workflow, and failure
+   modes are known quantities rather than new risk.
+2. **It is a superset, not a gamble** — wgpu is a CubeCL runtime. Choosing
+   CubeCL keeps the portable floor *and* adds a native CUDA path. If a backend
+   disappoints on some vendor, drop that vendor to the wgpu runtime; the
+   downside is bounded to "what we would have had anyway."
+3. **The CUDA path helps the hard part** — the open risk is not "does it run,"
+   it is "does it actually pin the board at its power limit." A native CUDA
+   runtime can push NVIDIA harder than portable WGSL, and NVIDIA is the majority
+   of the builds this shop ships.
 
-Every external dependency's license is audited before adoption — the whole point
-is to *stay* license-clean for commercial QC.
+### Windows routing reality
+
+On **Windows specifically**, CubeCL's multi-backend story narrows to
+**CUDA + wgpu**, because ROCm/HIP on Windows is limited:
+
+| Vendor | Windows runtime | Consequence |
+| --- | --- | --- |
+| NVIDIA | CUDA (native) | Best throughput; most likely to reach the true power limit. |
+| AMD | wgpu (DX12/Vulkan) | Same characteristics as a plain-wgpu build. |
+| Intel | wgpu (DX12/Vulkan) | Same; validate Arc first (weakest driver stack). |
+
+So the wgpu-path caveats still apply to AMD/Intel: **prefer the DX12 backend**
+(it is what Microsoft WHQL-certifies across vendors), **query adapter limits**
+rather than hardcoding workgroup sizes, and expect naga/WGSL translation to be
+the thing that occasionally surprises you. TDR (§6) is an OS watchdog and
+applies to every backend equally.
+
+**Deployment check (do this early):** determine whether CubeCL's CUDA runtime is
+build-time-linked or runtime-loaded. The suite is meant to ship as a compiled
+binary on a USB stick and run on a customer machine — if CUDA requires a toolkit
+present, ship the **wgpu runtime as the default build** and make CUDA an opt-in
+cargo feature for bench machines.
+
+**Spike 3a (1–3 days):** a CubeCL FMA-heavy compute kernel dispatched in a loop
+on NVIDIA (CUDA runtime) and on AMD + Intel (wgpu runtime), confirming via
+vendor tools that it pins each card at its power limit — and confirming the
+binary runs on a machine with no toolkit installed.
+
+Every external dependency's license is audited before adoption (CubeCL and wgpu
+are both permissive/MIT-compatible — confirm at the pinned version) — the whole
+point is to *stay* license-clean for commercial QC.
 
 ## 3. Crate structure
 
 ```
 crates/crucible-gpu/         (new workspace member; NOT default-built)
-  Cargo.toml                 wgpu (+ pollster or async runtime), vendor telemetry
+  Cargo.toml                 cubecl (wgpu runtime default, cuda behind a feature),
+                             vendor telemetry
   src/
     lib.rs                   GpuKernel: LoadKernel impl (thrasher + shapes)
-    adapter.rs               enumerate adapters, pick discrete GPU, caps
-    thrasher.wgsl            FMA + bandwidth compute shader
+    adapter.rs               enumerate devices, pick discrete GPU, caps/limits
+    thrasher.rs              FMA + bandwidth compute kernel (CubeCL #[cube], Rust)
     vram.rs                  VRAM pattern test (buffers, verify)
     power/                   per-vendor power readback (see §5)
     servo.rs                 closed-loop wattage controller + calibration
     tdr.rs                   device-lost detection / recovery
 ```
+
+Kernels are written in **Rust** via CubeCL's `#[cube]` macro rather than in
+WGSL, which keeps the thrasher and the VRAM battery in the same language as the
+CPU/mem kernels they mirror.
 
 `GpuKernel` implements `LoadKernel` (`kind() == Kind::Gpu`), so it flows through
 the existing orchestrator, `ShapeDriver`, `StopFlag`, and `MarkerLog` unchanged.
@@ -159,7 +198,7 @@ Real hardware of each vendor is required. At minimum:
 
 ## 9. Milestones (within Phase 3)
 
-- **3a — backend spike:** WGSL compute pins power on all 3 vendors → pick wgpu vs CubeCL.
+- **3a — backend spike:** CubeCL compute kernel pins power on all 3 vendors (CUDA on NVIDIA, wgpu on AMD/Intel) + runs with no toolkit installed.
 - **3b — thrasher:** `GpuKernel: LoadKernel`, steady + burst, markers, TDR handling, error check.
 - **3c — VRAM test:** pattern battery + read-back verify + first-fail.
 - **3d — power + servo:** NVML readback → wattage servo (hold/step/ramp/sweep) → per-model self-calibration.
@@ -188,7 +227,10 @@ All device-ID'd and marker-emitting, consistent with the existing commands.
 
 ## 11. Open questions
 
-1. wgpu vs CubeCL — decide after spike 3a on all three vendors.
+1. ~~wgpu vs CubeCL~~ — **decided: CubeCL** (already CEC's multi-vendor backend
+   elsewhere; wgpu remains the runtime underneath it). Open sub-question: is the
+   CUDA runtime build-time-linked or runtime-loaded, i.e. can a CUDA-enabled
+   build still run on a machine with no toolkit?
 2. How much power-telemetry to own via vendor `dlopen` FFI vs. leaning on
    LibreHardwareMonitor (HVCI/WinRing0 blocklist risk on the shop image).
 3. TDR policy: chain-short-dispatches only, or also document registry tuning for

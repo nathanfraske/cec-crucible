@@ -68,7 +68,8 @@ is `0` for PASS/PARTIAL, `1` for FAIL. `cec-crucible help` lists all options.
 | `crucible-cli` | `cec-crucible` binary: arg parsing, profiles, orchestration, report + marker output |
 
 `crucible-gpu` (Phase 3) is intentionally not yet a workspace member — it is the
-one crate permitted an external toolkit (CubeCL/wgpu).
+one crate permitted external dependencies (CubeCL, which runs on wgpu by default
+and CUDA where available).
 
 ## How it fits the rest of the suite
 
@@ -93,5 +94,5 @@ here depends on the harness being present.
 
 - [`docs/design.md`](docs/design.md) — architecture, zero-dependency Rust rationale, crate layout, per-domain test designs, the load-shape philosophy, QPC markers + 1kHz correlation, device-ID'd reporting.
 - [`docs/roadmap.md`](docs/roadmap.md) — phased build plan (Phase 1 built; GPU is Phase 3).
-- [`docs/gpu-plan.md`](docs/gpu-plan.md) — Phase 3 GPU power-virus design: backend choice (wgpu/CubeCL), thrasher + VRAM + wattage servo, TDR handling, per-vendor telemetry, milestones.
+- [`docs/gpu-plan.md`](docs/gpu-plan.md) — Phase 3 GPU power-virus design: backend decision (CubeCL, with wgpu as its runtime floor), thrasher + VRAM + wattage servo, TDR handling, per-vendor telemetry, milestones.
 - [`docs/prior-art-and-licensing.md`](docs/prior-art-and-licensing.md) — existing tools, licensing reality, build-vs-buy.
