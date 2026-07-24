@@ -9,7 +9,10 @@ ray-query check). Researched against **current primary documentation** (OptiX
 tags: **[FACT]** primary-source-confirmed · **[INFER]** reasoning · **[GATED]**
 hardware/maturity/licensing caveat or needs-a-spike.
 
-Nothing here is built yet — this is the scope + recommendation.
+**Status:** Phase 1 (portable inline multi-bounce, §2) is **BUILT** — `pathtrace`
+command + `pathtrace.wgsl`, commit 8ac029c; determinism validated on the RTX 3070
+(PASS, 0 errors, 423 self-consistency verifications). Phase 2 (OptiX, §3) and
+Phase 3 (SER, §4) remain scoped-not-built.
 
 ## 0. TL;DR
 
