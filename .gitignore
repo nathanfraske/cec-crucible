@@ -1,3 +1,9 @@
 /target
 **/*.rs.bk
 Cargo.lock
+
+# Runtime output — reports and markers embed machine-identifying device IDs
+# (SMBIOS UUID, board serial, hostname). Never commit them.
+crucible-*.report.json
+crucible-*.markers.jsonl
+crucible-scratch-*.tmp

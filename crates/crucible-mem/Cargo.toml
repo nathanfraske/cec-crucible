@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "crucible-mem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "RAM load kernel for cec-crucible: moving-inversion / pattern tests with first-fail reporting"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[dependencies]
+crucible-core = { path = "../crucible-core" }

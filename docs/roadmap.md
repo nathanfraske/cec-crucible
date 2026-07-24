@@ -1,29 +1,39 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: MIT -->
 
-# cec-crucible — roadmap (ideation)
+# cec-crucible — roadmap
 
 Phased so each step is buildable, testable offline, and useful on its own. The
 hard/long piece (GPU power-virus) is isolated to its own phase.
 
-## Phase 0 — repo stand-up (this)
+## Phase 0 — repo stand-up ✅ (done)
 
-Folder + ideation docs. Decide the name, the license (Apache-2.0 to match
-CEC-Autosetup, vs AGPL like cec-support-agent), and whether it's a GitHub repo
-now or local until code lands.
+Folder + design docs. **License: MIT** — maximally permissive, zero-liability
+reuse for a tool that stress-tests other people's hardware. `LICENSE` at repo
+root, SPDX headers throughout. Working name kept.
 
-## Phase 1 — core + CPU/RAM/storage (days)
+## Phase 1 — core + CPU/RAM/storage ✅ (built)
 
-- `crucible-core`: QPC markers, device-id, hand-rolled JSON, `LoadKernel`
-  trait, `StopFlag`, report model. Unit-tested with tiny inputs (no real soak
-  during `cargo test`).
-- `crucible-cpu`: real FMA burn, per-core, recompute error-check.
-- `crucible-mem`: real pattern/moving-inversion buffer test (bounded).
-- `crucible-storage`: real scratch-file read/write/verify (non-destructive).
-- `crucible-cli`: subcommands (`cpu`/`mem`/`storage`/`info`/`run`), profile
-  runner, marker + device-ID'd report output.
-- Wire the binary into CEC-Autosetup's `stress-tools/` + verified `argsTemplate`s
-  so the PowerShell harness can drive it. **Genuinely working CPU/RAM/storage
-  QC at the end of this phase.**
+Cargo workspace, zero external dependencies, 44 unit tests, `cargo clippy` clean.
+
+- [x] `crucible-core`: QPC markers (FFI + fallback), SMBIOS device-id,
+  hand-rolled JSON, `LoadKernel`/`StopFlag`/`ShapeDriver`, report model +
+  verdict. Unit-tested with tiny inputs (no real soak during `cargo test`).
+- [x] `crucible-cpu`: AVX2+FMA burn (scalar fallback), per-core pinning,
+  dual-accumulator recompute error-check. (~288 GFLOP/s on the Z490-I bench.)
+- [x] `crucible-mem`: moving-inversion / own-address / seeded-random battery,
+  disjoint per-thread chunks, first-fail (vaddr + pattern) reporting.
+- [x] `crucible-storage`: non-destructive scratch-file write/sync/verify with
+  seeded patterns and first-fail reporting.
+- [x] `crucible-cli`: subcommands (`info`/`cpu`/`mem`/`storage`/`run`), built-in
+  profiles (`quick`/`soak`/`cross`/`power`), Ctrl-C graceful stop, marker +
+  device-ID'd report output. **Genuinely working CPU/RAM/storage QC.**
+- [ ] Wire the binary into the companion QC harness's `stress-tools/` +
+  verified arg templates so the PowerShell harness can drive it. *(cross-repo;
+  the CLI contract — `--device-id`, `--out`, exit codes, report/marker
+  filenames — is in place and ready to wire.)*
+
+Basic concurrent cross-load (CPU+RAM+storage under one stop/timeline, the
+`cross` profile) already landed here — the rest of Phase 2 remains below.
 
 ## Phase 2 — cross-load + telemetry
 
@@ -47,8 +57,7 @@ now or local until code lands.
 ## Phase 4 — polish
 
 - Scenario library of known-killer patterns (grown from QC field data).
-- Report dashboard on the designated server (alongside the rehearsal-report
-  collection).
+- Report dashboard on an internal collection server.
 - Optional: wrap a licensed OCCT/BurnInTest as a certified customer-facing
   report layer, if ever wanted — our engine stays the QC gate.
 
@@ -62,4 +71,4 @@ now or local until code lands.
 4. Scratch-file storage test vs. optional raw-device (destructive, gated) mode
    for full-drive validation.
 5. Does the standalone CLI need its own report retrieval, or always go through
-   the PowerShell harness + AllMyStuff reports channel?
+   the companion PowerShell harness's reports channel?

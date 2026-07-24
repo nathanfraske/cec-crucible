@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+#
+# cec-crucible — CEC's in-house PC-build stress/validation suite.
+# Zero external dependencies by design (std only); see docs/design.md.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/crucible-core",
+    "crates/crucible-cpu",
+    "crates/crucible-mem",
+    "crates/crucible-storage",
+    "crates/crucible-cli",
+]
+# crates/crucible-gpu is Phase 3 (the long pole) and intentionally not yet a
+# workspace member — it is the one crate permitted an external toolkit.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+authors = ["Computer Exchange Corner (CEC)"]
+repository = "https://github.com/cec/cec-crucible"
+description = "CEC in-house PC-build stress/validation suite (CPU/RAM/storage; GPU planned)"
+
+# A single release profile tuned for the shipped stress binary: maximum
+# optimization so the load kernels actually saturate the hardware. `cargo test`
+# uses the (fast, unwinding) test profile and is unaffected by these settings.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

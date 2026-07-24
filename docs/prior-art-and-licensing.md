@@ -1,9 +1,9 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: MIT -->
 
 # Prior art + licensing (researched 2026-07-23)
 
-Why build our own instead of wrapping existing tools. Full sources in the
-CEC-Autosetup research doc (`docs/stress-harness.md`); summarized here as the
+Why build our own instead of wrapping existing tools. Full sources live in
+CEC's internal stress-harness research notes; summarized here as the
 justification for cec-crucible.
 
 ## Existing tools + commercial-use reality (shop = paid use on customer builds)
@@ -40,8 +40,8 @@ justification for cec-crucible.
    to match, not blockers.
 5. **Prior-art architecture to copy:** CoreCycler (open PowerShell orchestrator
    driving external stress EXEs, per-core, output-parsing) — its structure is
-   what the CEC-Autosetup harness already mirrors; cec-crucible provides the
-   native kernels it orchestrates.
+   what CEC's companion PowerShell harness already mirrors; cec-crucible
+   provides the native kernels it orchestrates.
 
 ## Conclusion
 

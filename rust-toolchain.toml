@@ -1,0 +1,5 @@
+# Pin a stable toolchain for reproducible, offline-buildable benches.
+# No component beyond the default is required — the suite is std-only.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

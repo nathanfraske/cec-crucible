@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "crucible-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Storage load kernel for cec-crucible: non-destructive scratch-file write/verify"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[dependencies]
+crucible-core = { path = "../crucible-core" }

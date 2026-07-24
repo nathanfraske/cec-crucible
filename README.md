@@ -1,10 +1,10 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: MIT -->
 
 # cec-crucible
 
-**Status: ideation / planning.** No code yet — this repo currently holds the
-design for CEC's own stress-testing suite. ("cec-crucible" is a working name;
-rename freely.)
+**Status: Phase 1 built** (CPU / RAM / storage + orchestrator CLI). Licensed
+[MIT](LICENSE). The GPU power-virus (Phase 3) is the remaining long pole. See the
+[roadmap](docs/roadmap.md). ("cec-crucible" is a working name; rename freely.)
 
 A crucible is the vessel you heat metal in past its limits to see what it's
 really made of. This is that, for finished PC builds: CEC's in-house
@@ -33,19 +33,65 @@ for the 1kHz rig, and license-clean commercial use on customer builds.
 | Cross-load | orchestrate multiple domains concurrently (CPU pinned while GPU bursts, etc.) — the worst-case transients that kill marginal builds |
 | Wattage | closed-loop power targeting (hold/step/ramp/sweep) + self-optimizing per-GPU calibration |
 
+## Build & run
+
+Zero external dependencies — a stock stable Rust toolchain builds it offline.
+
+```
+cargo build --release          # -> target/release/cec-crucible(.exe)
+cargo test --workspace         # unit tests (no real soak; tiny bounded inputs)
+```
+
+```
+cec-crucible info                          # device id (SMBIOS), CPU, RAM, QPC
+cec-crucible cpu     --seconds 60          # FMA/AVX burn, per-core, recompute check
+cec-crucible mem     --seconds 60 --mb 8192
+cec-crucible storage --seconds 60 --path D:\ --size-mb 4096
+cec-crucible run cross --seconds 120       # CPU + RAM + storage concurrently
+cec-crucible run power --seconds 60        # CPU burst, dense markers for the rig
+```
+
+Each run writes a device-ID'd `crucible-<id>-<ts>.report.json` and a
+`…-markers.jsonl` to `--out` (default: the harness log dir if present, else the
+working dir). Pass `--device-id <uuid>` to key a run to a specific machine (the
+PowerShell harness supplies this; standalone auto-detects via SMBIOS). Exit code
+is `0` for PASS/PARTIAL, `1` for FAIL. `cec-crucible help` lists all options.
+
+### Workspace layout
+
+| Crate | Role |
+| --- | --- |
+| `crucible-core` | QPC clock, JSON writer, SMBIOS device-id, `LoadKernel`/`StopFlag`/`ShapeDriver`, marker log, report model — all std-only |
+| `crucible-cpu` | FMA/AVX burn kernel with dual-accumulator soft-error detection + per-core pinning |
+| `crucible-mem` | moving-inversion / own-address / seeded-random RAM battery with first-fail reporting |
+| `crucible-storage` | non-destructive scratch-file write/sync/verify |
+| `crucible-cli` | `cec-crucible` binary: arg parsing, profiles, orchestration, report + marker output |
+
+`crucible-gpu` (Phase 3) is intentionally not yet a workspace member — it is the
+one crate permitted an external toolkit (CubeCL/wgpu).
+
 ## How it fits the rest of the suite
 
-`cec-crucible` produces **compiled binaries**. The QC stress orchestrator
-already built in the first-boot tool
-([CEC-Autosetup `docs/stress-harness.md`](../CEC-Autosetup/docs/stress-harness.md),
-`tools/Invoke-StressTest.ps1`) discovers those binaries under its `stress-tools/`
-directory and drives them per profile — WHEA gating, report aggregation, and
-device-ID'd JSONL live there. This repo owns the **load generation + fine
-telemetry + load markers**; the PowerShell harness owns **orchestration +
-hardware-error watch + reporting**. Clean split.
+`cec-crucible` produces **compiled binaries** designed to be driven by a
+companion PowerShell QC orchestration harness (part of CEC's internal first-boot
+tooling). The harness discovers these binaries, runs them per profile, and owns
+the parts that sit *around* the load: WHEA (hardware-error) gating, report
+aggregation, and the operator-facing entry point.
+
+Clean split of responsibilities:
+
+- **cec-crucible owns:** load generation, load-shape choreography, fine
+  CPU/storage telemetry, and QPC load markers.
+- **The orchestration harness owns:** profile sequencing, hardware-error watch,
+  and report collection.
+
+The two also run fully standalone — the CLI is self-sufficient (`--device-id`,
+`--out`, exit codes, and a device-ID'd JSON report + JSONL markers), so nothing
+here depends on the harness being present.
 
 ## Docs
 
-- [`docs/design.md`](docs/design.md) — architecture, zero-dependency Rust rationale, planned crate layout, per-domain test designs, the load-shape philosophy, QPC markers + 1kHz correlation, device-ID'd reporting.
-- [`docs/roadmap.md`](docs/roadmap.md) — phased build plan.
+- [`docs/design.md`](docs/design.md) — architecture, zero-dependency Rust rationale, crate layout, per-domain test designs, the load-shape philosophy, QPC markers + 1kHz correlation, device-ID'd reporting.
+- [`docs/roadmap.md`](docs/roadmap.md) — phased build plan (Phase 1 built; GPU is Phase 3).
+- [`docs/gpu-plan.md`](docs/gpu-plan.md) — Phase 3 GPU power-virus design: backend choice (wgpu/CubeCL), thrasher + VRAM + wattage servo, TDR handling, per-vendor telemetry, milestones.
 - [`docs/prior-art-and-licensing.md`](docs/prior-art-and-licensing.md) — existing tools, licensing reality, build-vs-buy.

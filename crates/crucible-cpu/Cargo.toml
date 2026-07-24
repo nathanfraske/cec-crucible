@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "crucible-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CPU load kernel for cec-crucible: FMA/AVX burn with soft-error detection"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[dependencies]
+crucible-core = { path = "../crucible-core" }

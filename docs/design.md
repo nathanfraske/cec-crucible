@@ -1,9 +1,10 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: MIT -->
 
 # cec-crucible — design (ideation)
 
-Design intent for CEC's in-house stress suite. Nothing here is built yet; this
-is the plan of record.
+Design intent for CEC's in-house stress suite. **Phase 1 (CPU/RAM/storage +
+CLI) is now built** to this design; the GPU sections remain forward-looking.
+This stays the plan of record.
 
 ## Principles
 
@@ -145,9 +146,9 @@ struct LoadResult { ok: bool, iterations, checksum, detail, error_count }
 ## Reporting
 
 - Device-ID'd JSON report (SMBIOS UUID + board serial + short id) + the marker
-  JSONL, written where the PowerShell harness collects them
-  (`%ProgramData%\firstboot\logs\`), shipped over the reports channel designed
-  in CEC-Autosetup's AllMyStuff plan.
+  JSONL, written to a `--out` directory the companion QC harness collects from
+  (default: a shared logs directory), then shipped over the harness's reports
+  channel.
 - Verdict: Pass / Fail (any kernel error or WHEA event) / Partial. WHEA is
   watched by the PowerShell harness around the whole window; kernels report
   their own compute/verify errors.
@@ -156,7 +157,8 @@ struct LoadResult { ok: bool, iterations, checksum, detail, error_count }
 
 - **cec-crucible owns:** load kernels, load shapes, fine GPU/CPU telemetry,
   load markers.
-- **CEC-Autosetup stress harness owns:** profile orchestration, WHEA gating,
-  report aggregation, device-ID'd JSONL, the CLI entrypoint operators run.
+- **The companion PowerShell QC harness owns:** profile orchestration, WHEA
+  gating, report aggregation, device-ID'd JSONL, the CLI entrypoint operators
+  run.
 - Interface: the harness invokes `cec-crucible <subcommand>` per stage and
   reads its markers/report. The two can also run fully standalone.
