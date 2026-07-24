@@ -33,6 +33,8 @@
 //! Either failure sets `error_count > 0`, which the report rolls up to FAIL.
 
 pub mod link;
+#[cfg(all(windows, feature = "preview"))]
+pub mod preview;
 pub mod render;
 #[cfg(feature = "rt")]
 pub mod rt;

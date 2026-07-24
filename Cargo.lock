@@ -499,6 +499,7 @@ dependencies = [
  "gpu-allocator",
  "half",
  "naga",
+ "raw-window-handle",
  "wgpu",
 ]
 

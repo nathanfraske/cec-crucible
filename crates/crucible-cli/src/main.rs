@@ -52,6 +52,7 @@ const COMMON_BOOLS: &[&str] = &[
     "link-cuda",
     "per-core",
     "ui",
+    "preview",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -192,6 +193,9 @@ GPU OPTIONS (builds with --features gpu):
                          texture units and ROP the compute thrasher never touches.
     --scene <FILE>       Render a glTF/.glb scene (real game geometry + texture)
                          instead of the procedural mesh. Needs `--features gpu-gltf`.
+    --preview            (render) Pop a live window mirroring the render as it runs.
+                         Needs a `--features preview` (Windows) build; the mirror
+                         never changes what is verified. Close the window to stop.
     --tensor-tiles <N>   Tensor: 16x16 output tiles / warps (default 4096).
     --tensor-iters <N>   Tensor: cmma accumulations per warp per dispatch (default
                          256). `tensor` drives the tensor cores via cooperative
@@ -665,6 +669,9 @@ fn render_kernel_from(p: &Parsed) -> Result<crucible_gpu::render::RenderKernel, 
         // A glTF/.glb scene (needs a --features gpu-gltf build; load errors at run).
         k.scene = crucible_gpu::render::SceneSource::File(path.into());
     }
+    // Live preview window (needs a --features preview, Windows build; otherwise a
+    // no-op with a note). Never changes what gets verified.
+    k.preview = p.has("preview");
     Ok(k)
 }
 
@@ -691,6 +698,7 @@ fn cmd_render(rest: &[String]) -> Result<u8, String> {
             "no-report",
             "json",
             "help",
+            "preview",
         ];
         allowed.extend_from_slice(GPU_OPTS);
         allowed.extend_from_slice(SHAPE_OPTS);

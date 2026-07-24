@@ -76,6 +76,9 @@ pub struct RenderKernel {
     pub verify_every: u64,
     /// Geometry/texture source (procedural or a glTF scene).
     pub scene: SceneSource,
+    /// Pop a live window mirroring the render (needs a `--features preview`,
+    /// Windows-only build; ignored otherwise). Never affects verification.
+    pub preview: bool,
 }
 
 impl Default for RenderKernel {
@@ -87,6 +90,7 @@ impl Default for RenderKernel {
             instances: 48,
             verify_every: 32,
             scene: SceneSource::Procedural,
+            preview: false,
         }
     }
 }
@@ -477,6 +481,12 @@ struct RenderGpu {
     height: u32,
     padded_bpr: u32,
     instances: u32,
+    // Declared before `_window` so the surface (inside the Presenter) is dropped
+    // before the window it was created from.
+    #[cfg(all(windows, feature = "preview"))]
+    preview: Option<crate::preview::Presenter>,
+    #[cfg(all(windows, feature = "preview"))]
+    _window: Option<crate::preview::PreviewWindow>,
 }
 
 impl RenderGpu {
@@ -486,10 +496,21 @@ impl RenderGpu {
         let instances = k.instances.clamp(1, 4096);
 
         let instance = wgpu::Instance::default();
+
+        // Preview window + surface must exist before adapter selection so the
+        // chosen adapter can present. Only built on a windows+preview build; any
+        // failure falls back to headless with a note (never fails the test).
+        #[cfg(all(windows, feature = "preview"))]
+        let (preview_window, preview_surface) = open_preview(&instance, k);
+        #[cfg(all(windows, feature = "preview"))]
+        let compatible: Option<&wgpu::Surface<'_>> = preview_surface.as_ref();
+        #[cfg(not(all(windows, feature = "preview")))]
+        let compatible: Option<&wgpu::Surface<'_>> = None;
+
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: k.power_preference(),
             force_fallback_adapter: false,
-            compatible_surface: None,
+            compatible_surface: compatible,
         }))
         .map_err(|e| format!("no usable GPU adapter: {e}"))?;
 
@@ -744,6 +765,23 @@ impl RenderGpu {
             mapped_at_creation: false,
         });
 
+        // Configure the swapchain now that the device exists. A preview failure
+        // here just disables the window; the render (and its verification) runs
+        // exactly as headless.
+        #[cfg(all(windows, feature = "preview"))]
+        let preview = match (preview_window.as_ref(), preview_surface) {
+            (Some(_), Some(surface)) => {
+                match crate::preview::Presenter::new(&device, &adapter, surface, width, height) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("note: --preview disabled ({e}); running headless");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Ok(RenderGpu {
             device,
             queue,
@@ -760,6 +798,10 @@ impl RenderGpu {
             height,
             padded_bpr,
             instances,
+            #[cfg(all(windows, feature = "preview"))]
+            preview,
+            #[cfg(all(windows, feature = "preview"))]
+            _window: preview_window,
         })
     }
 
@@ -809,6 +851,27 @@ impl RenderGpu {
             .poll(wgpu::PollType::wait_indefinitely())
             .is_ok()
     }
+
+    /// Pump the preview window and mirror the latest finished frame to it (rate-
+    /// limited to ~60 Hz inside `maybe_present`, so it never throttles the load).
+    /// If the window was closed, request stop. No-op unless this is a
+    /// windows+preview build with the window actually open.
+    #[cfg(all(windows, feature = "preview"))]
+    fn preview_tick(&self, stop: &StopFlag) {
+        if let Some(win) = &self._window {
+            if !win.pump() {
+                stop.stop();
+                return;
+            }
+        }
+        if let Some(p) = &self.preview {
+            p.maybe_present(&self.device, &self.queue, &self.color_tex);
+        }
+    }
+
+    #[cfg(not(all(windows, feature = "preview")))]
+    #[inline]
+    fn preview_tick(&self, _stop: &StopFlag) {}
 
     /// Copy the colour target back and checksum it (over real pixels, skipping
     /// row padding). Returns `(hash, uniform)` where `uniform` means every pixel
@@ -890,6 +953,45 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
+/// Open the preview window and create a wgpu surface from it. Returns
+/// `(None, None)` (with a note) if preview wasn't requested or anything failed —
+/// the render then runs headless, verification unchanged.
+#[cfg(all(windows, feature = "preview"))]
+fn open_preview(
+    instance: &wgpu::Instance,
+    k: &RenderKernel,
+) -> (
+    Option<crate::preview::PreviewWindow>,
+    Option<wgpu::Surface<'static>>,
+) {
+    if !k.preview {
+        return (None, None);
+    }
+    let w = k.width.clamp(64, 7680);
+    let h = k.height.clamp(64, 4320);
+    let title = format!("cec-crucible render — {}", k.device.label());
+    let window = match crate::preview::PreviewWindow::open(&title, w, h) {
+        Ok(win) => win,
+        Err(e) => {
+            eprintln!("note: --preview window unavailable ({e}); running headless");
+            return (None, None);
+        }
+    };
+    // Safety: the window outlives the surface — both are held by RenderGpu with
+    // the Presenter (surface) declared before the window, so it drops first.
+    let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+        raw_display_handle: Some(window.raw_display_handle()),
+        raw_window_handle: window.raw_window_handle(),
+    };
+    match unsafe { instance.create_surface_unsafe(target) } {
+        Ok(surface) => (Some(window), Some(surface)),
+        Err(e) => {
+            eprintln!("note: --preview surface unavailable ({e}); running headless");
+            (None, None)
+        }
+    }
+}
+
 impl LoadKernel for RenderKernel {
     fn name(&self) -> &str {
         "render"
@@ -938,6 +1040,7 @@ impl LoadKernel for RenderKernel {
                         );
                     }
                     frames += 1;
+                    gpu.preview_tick(stop);
                     if frames.is_multiple_of(self.verify_every) {
                         match gpu.checksum() {
                             Some((h, uniform)) => {
@@ -989,7 +1092,9 @@ impl LoadKernel for RenderKernel {
                         }
                     }
                 }
-                Tick::Idle => {}
+                // Keep the preview window responsive (and showing the last frame)
+                // through idle phases of a burst/pulse shape.
+                Tick::Idle => gpu.preview_tick(stop),
                 Tick::Stop => break,
             }
         }

@@ -129,7 +129,12 @@ coverage-per-effort:
    that compute bypasses, plus real draw calls and the driver command path.
    **Zero new deps** (raw wgpu, like `link.rs`), portable across all three
    vendors, verified by framebuffer pixel-checksum (same-device self-consistency;
-   cross-vendor is not bit-identical). Highest value, lowest risk.
+   cross-vendor is not bit-identical). Highest value, lowest risk. Optional
+   `render --preview` (opt-in `preview` feature, Windows) pops a live window that
+   mirrors the render as it runs — a hand-rolled Win32 window (no winit) whose
+   swapchain receives a copy of the already-finished offscreen frame, so what gets
+   verified is byte-identical to a headless run and the ≤60 Hz mirror never
+   throttles the load. Close the window to stop the test.
 2. **`render --scene` (glTF/PBR)** — optional realism upgrade: a bundled
    permissively-licensed Khronos glTF scene + a PBR shader ported from the
    Apache-2.0 glTF-Sample-Viewer, and a `--scene <file>` override so a shop
