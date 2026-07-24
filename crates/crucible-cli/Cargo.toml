@@ -25,6 +25,10 @@ gpu = ["dep:crucible-gpu"]
 # CUDA toolkit needed). Implies gpu.
 #   cargo build --release -p crucible-cli --features cuda
 cuda = ["gpu", "crucible-gpu/cuda"]
+# Opt-in live terminal UI (`--ui`), built on crossterm. Off by default so the
+# standard build stays zero-dependency and scriptable for the harness.
+#   cargo build --release -p crucible-cli --features gpu,tui
+tui = ["dep:crossterm"]
 
 [dependencies]
 crucible-core = { path = "../crucible-core" }
@@ -32,3 +36,4 @@ crucible-cpu = { path = "../crucible-cpu" }
 crucible-mem = { path = "../crucible-mem" }
 crucible-storage = { path = "../crucible-storage" }
 crucible-gpu = { path = "../crucible-gpu", optional = true }
+crossterm = { version = "0.28", optional = true }

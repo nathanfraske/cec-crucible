@@ -34,6 +34,9 @@ use crucible_gpu::{GpuDevice, GpuKernel};
 
 use args::Parsed;
 
+#[cfg(feature = "tui")]
+mod tui;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Options accepted by (nearly) every command.
@@ -48,6 +51,7 @@ const COMMON_BOOLS: &[&str] = &[
     "gpu-alu-only",
     "link-cuda",
     "per-core",
+    "ui",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -115,6 +119,8 @@ COMMON OPTIONS:
     --out <DIR>          Output directory for report + markers.
     --no-report          Do not write report/marker files.
     --json               Emit the report as JSON on stdout (pipe-friendly).
+    --ui                 Live terminal dashboard (per-core + per-domain activity).
+                         Needs a build with `--features tui`; q / Ctrl-C to stop.
 
 CPU OPTIONS:
     --core <all|N>       All cores (default) or a single logical core index.
@@ -1318,7 +1324,7 @@ fn budget_with(duration: Duration, shape: Shape) -> Budget {
 struct Runner {
     clock: Clock,
     device: DeviceId,
-    markers: MarkerLog,
+    markers: Arc<MarkerLog>,
     stop: StopFlag,
     out_dir: Option<PathBuf>,
     json: bool,
@@ -1326,13 +1332,16 @@ struct Runner {
     report: Report,
     bridge_done: Arc<AtomicBool>,
     bridge: Option<JoinHandle<()>>,
+    ui: bool,
+    ui_stop: Option<Arc<AtomicBool>>,
+    ui_handle: Option<JoinHandle<()>>,
 }
 
 impl Runner {
     fn new(p: &Parsed) -> Result<Runner, String> {
         let clock = Clock::new();
         let device = resolve_device(p);
-        let markers = MarkerLog::new(clock);
+        let markers = Arc::new(MarkerLog::new(clock));
         let stop = StopFlag::new();
 
         let out_dir = if p.has("no-report") {
@@ -1370,6 +1379,9 @@ impl Runner {
             report,
             bridge_done,
             bridge: Some(bridge),
+            ui: p.has("ui"),
+            ui_stop: None,
+            ui_handle: None,
         })
     }
 
@@ -1708,6 +1720,24 @@ impl Runner {
         );
         let ts = self.markers.stamp(Event::RunStart, "run", "", &self.stamp);
         self.report.started = Some(ts);
+
+        if self.ui {
+            #[cfg(feature = "tui")]
+            {
+                self.markers.enable_live();
+                let ui_stop = Arc::new(AtomicBool::new(false));
+                let markers = Arc::clone(&self.markers);
+                let stop_flag = Arc::clone(&ui_stop);
+                let run_stop = self.stop.clone();
+                let title = self.device.board.clone();
+                self.ui_handle = Some(std::thread::spawn(move || {
+                    tui::render_loop(markers, stop_flag, run_stop, title);
+                }));
+                self.ui_stop = Some(ui_stop);
+            }
+            #[cfg(not(feature = "tui"))]
+            eprintln!("note: --ui needs a build with `--features tui`; continuing without it");
+        }
     }
 
     fn run_one(&mut self, kernel: &dyn LoadKernel, budget: &Budget, mode: &str) {
@@ -1734,6 +1764,15 @@ impl Runner {
     }
 
     fn finish(&mut self) -> Result<u8, String> {
+        // Stop and join the live UI first, so the terminal is restored before the
+        // summary prints below.
+        if let Some(ui_stop) = self.ui_stop.take() {
+            ui_stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(h) = self.ui_handle.take() {
+            let _ = h.join();
+        }
+
         let ts = self.markers.stamp(Event::RunStop, "run", "", "");
         self.report.ended = Some(ts);
         self.report.aborted = self.stop.stopped();

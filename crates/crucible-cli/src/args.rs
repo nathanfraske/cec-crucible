@@ -66,6 +66,10 @@ impl Parsed {
     /// Reject any option key not in `allowed` (typo protection).
     pub fn reject_unknown(&self, allowed: &[&str]) -> Result<(), String> {
         for k in self.values.keys().chain(self.bools.iter()) {
+            // `--ui` (opt-in live terminal UI) is accepted by every command.
+            if k == "ui" {
+                continue;
+            }
             if !allowed.contains(&k.as_str()) {
                 return Err(format!("unknown option --{k}"));
             }
