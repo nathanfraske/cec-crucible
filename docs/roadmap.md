@@ -115,9 +115,13 @@ load *edges* and at *idle*, reached by two new load shapes (`Shape::Jitter`,
 Today the GPU coverage is general shader ALU (thrasher), VRAM, and PCIe — it
 touches **none** of the specialized silicon. A card with a dead ROP, a bad
 tensor MAC lane, or a defective RT intersection unit passes everything and fails
-at the customer's game / DLSS / ray-traced workload. Scoped, with an honest
-per-vendor feasibility matrix (render is portable today; tensor is
-NVIDIA+toolkit-gated; RT is experimental everywhere). Build order by
+at the customer's game / DLSS / ray-traced workload. Scoped against current
+primary docs and **cross-checked against the pinned `wgpu-types-29.0.4` source** —
+full detail in [`docs/gpu-functional-units.md`](gpu-functional-units.md). Honest
+reality: render is portable today; the portable tensor path is **Vulkan/SPIR-V
+only** (CubeCL `cmma`, int8→int32 golden; the wgpu-*native* coop-matrix in 29 is
+8×8-f32-only and near-useless — verified in source); RT is wgpu-29
+`EXPERIMENTAL_RAY_QUERY`, **Vulkan-only and experimental**. Build order by
 coverage-per-effort:
 
 1. **`render` (procedural)** — headless wgpu graphics pipeline to an offscreen
