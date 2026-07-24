@@ -76,6 +76,8 @@ const GPU_OPTS: &[&str] = &[
     "tensor-tiles",
     "tensor-iters",
     "rt-iters",
+    "pt-samples",
+    "pt-bounces",
 ];
 
 const USAGE: &str = "\
@@ -97,6 +99,7 @@ COMMANDS:
     render               Graphics pipeline: raster/TMU/ROP + verify. [--features gpu]
     tensor               Tensor/matrix-core cmma stress + verify.  [--features tensor]
     rt                   Ray-tracing-core (BVH traversal) + verify. [--features rt]
+    pathtrace            Multi-bounce path tracer (deep/divergent RT+SM). [--features rt]
     run <profile>        See PROFILES below.
     version              Print version.
     help                 Print this help.
@@ -206,6 +209,12 @@ GPU OPTIONS (builds with --features gpu):
                          `rt` drives the ray-tracing cores (BVH traversal +
                          triangle intersection) via VK_KHR_ray_query, verified by
                          self-consistency — needs a `--features rt` build.
+    --pt-samples <N>     Path-trace: paths per pixel per dispatch (default 16).
+    --pt-bounces <N>     Path-trace: max path depth / bounces (default 8).
+                         `pathtrace` is a deterministic multi-bounce Monte-Carlo
+                         path tracer — the deep, divergent RT-core + SM stress
+                         beyond `rt`. `--preview` shows the live GI render.
+                         Needs a `--features rt` build.
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -261,6 +270,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "render" => cmd_render(rest),
         "tensor" => cmd_tensor(rest),
         "rt" => cmd_rt(rest),
+        "pathtrace" => cmd_pathtrace(rest),
         "run" => cmd_run(rest),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -860,6 +870,79 @@ fn cmd_rt(rest: &[String]) -> Result<u8, String> {
         let shape = shape_from(&p)?;
         let kernel = rt_kernel_from(&p)?;
         let mode = format!("{} rt x{} traces", shape.mode_str(), kernel.iters);
+        let budget = Budget {
+            duration: Duration::from_secs(seconds),
+            shape,
+            target_watts: None,
+            phase_epoch: None,
+            phase_offset: Duration::ZERO,
+        };
+        let mut runner = Runner::new(&p)?;
+        runner.single_stage(&kernel, &budget, &mode)
+    }
+}
+
+#[cfg(feature = "rt")]
+fn pathtrace_kernel_from(p: &Parsed) -> Result<crucible_gpu::rt::RtKernel, String> {
+    let device = match p.get("gpu-device").unwrap_or("discrete") {
+        "discrete" => GpuDevice::Discrete(0),
+        "integrated" | "igpu" => GpuDevice::Integrated(0),
+        "default" => GpuDevice::Default,
+        other => {
+            return Err(format!(
+                "--gpu-device expects discrete|integrated|default, got '{other}'"
+            ))
+        }
+    };
+    let mut k = crucible_gpu::rt::RtKernel::path_tracer(device);
+    if let Some(v) = p.get_u64("pt-samples")? {
+        k.samples = v.clamp(1, 1 << 16) as u32;
+    }
+    if let Some(v) = p.get_u64("pt-bounces")? {
+        k.bounces = v.clamp(1, 64) as u32;
+    }
+    k.preview = p.has("preview");
+    Ok(k)
+}
+
+/// Path-tracing load — a multi-bounce Monte-Carlo path tracer (inline ray-query),
+/// the deep/divergent RT-core + SM stress beyond `rt`'s coherent single-bounce
+/// fan. Deterministic megakernel (fixed per-pixel RNG), verified by same-device
+/// self-consistency; the WGSL shader is compiled to SPIR-V at runtime by naga.
+fn cmd_pathtrace(rest: &[String]) -> Result<u8, String> {
+    #[cfg(not(feature = "rt"))]
+    {
+        let _ = rest;
+        Err("the pathtrace test needs a build with `--features rt`".to_string())
+    }
+    #[cfg(feature = "rt")]
+    {
+        let p = Parsed::parse(rest, COMMON_BOOLS)?;
+        let mut allowed: Vec<&str> = vec![
+            "seconds",
+            "shape",
+            "burst-on",
+            "burst-off",
+            "device-id",
+            "out",
+            "no-report",
+            "json",
+            "help",
+            "preview",
+        ];
+        allowed.extend_from_slice(GPU_OPTS);
+        allowed.extend_from_slice(SHAPE_OPTS);
+        p.reject_unknown(&allowed)?;
+
+        let seconds = seconds_arg(&p, 60)?;
+        let shape = shape_from(&p)?;
+        let kernel = pathtrace_kernel_from(&p)?;
+        let mode = format!(
+            "{} pathtrace {}spp x{}bounce",
+            shape.mode_str(),
+            kernel.samples,
+            kernel.bounces
+        );
         let budget = Budget {
             duration: Duration::from_secs(seconds),
             shape,

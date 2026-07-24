@@ -60,19 +60,38 @@ const PREVIEW_RES: u32 = 768;
 /// Compute workgroup size (must match the WGSL `@workgroup_size`).
 const WG: u32 = 64;
 
-/// RT-core load kernel.
+/// Which RT compute shader this kernel runs. Both share the same ash / BLAS /
+/// TLAS / descriptor / verify / preview plumbing — only the shader and the
+/// per-dispatch parameters differ, so `pathtrace` is a distinct QC identity built
+/// on the exact machinery `rt` already validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtMode {
+    /// Inline ray-query: a coherent fan of `iters` primary rays (the fast, shallow
+    /// RT-core intersection gate).
+    RayQuery,
+    /// Multi-bounce Monte-Carlo path tracer: `samples`×`bounces` incoherent rays
+    /// per pixel (the deep, divergent RT + SM stress).
+    PathTrace,
+}
+
+/// RT-core load kernel — runs either the `rt` ray-query or the `pathtrace`
+/// path-tracing shader (see [`RtMode`]).
 #[derive(Debug, Clone)]
 pub struct RtKernel {
     pub device: GpuDevice,
-    /// Traversals per ray per dispatch — the RT-core stress + TDR granularity
-    /// knob. ~192 keeps a dispatch well under the Windows 2 s watchdog on an
-    /// RTX 3070 while fully feeding the traversal units.
+    pub mode: RtMode,
+    /// `rt` mode: traversals per ray per dispatch — the RT-core stress + TDR
+    /// granularity knob. ~192 keeps a dispatch well under the Windows 2 s watchdog
+    /// on an RTX 3070 while fully feeding the traversal units.
     pub iters: u32,
+    /// `pathtrace` mode: paths per pixel per dispatch.
+    pub samples: u32,
+    /// `pathtrace` mode: max path depth (bounces).
+    pub bounces: u32,
     /// Read back + checksum every this many dispatches.
     pub verify_every: u64,
-    /// Pop a live window showing the shaded ray-traced image (needs a
-    /// `--features preview`, Windows build; ignored otherwise). Never affects the
-    /// traversal or the checksum.
+    /// Pop a live window showing the shaded image (needs a `--features preview`,
+    /// Windows build; ignored otherwise). Never affects traversal or the checksum.
     pub preview: bool,
 }
 
@@ -80,7 +99,10 @@ impl Default for RtKernel {
     fn default() -> Self {
         RtKernel {
             device: GpuDevice::Discrete(0),
+            mode: RtMode::RayQuery,
             iters: 192,
+            samples: 16,
+            bounces: 8,
             verify_every: 64,
             preview: false,
         }
@@ -91,6 +113,15 @@ impl RtKernel {
     pub fn new(device: GpuDevice) -> Self {
         RtKernel {
             device,
+            ..Default::default()
+        }
+    }
+
+    /// A path-tracing kernel on the given device.
+    pub fn path_tracer(device: GpuDevice) -> Self {
+        RtKernel {
+            device,
+            mode: RtMode::PathTrace,
             ..Default::default()
         }
     }
@@ -118,9 +149,10 @@ struct Params {
     height: u32,
     shade: u32,
     time: f32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    // Path-trace mode uses these (unused/0 in ray-query mode).
+    samples: u32,
+    bounces: u32,
+    seed: u32,
 }
 
 /// A (2,3) torus-knot tube mesh — a striking, self-occluding object (great for
@@ -209,10 +241,13 @@ fn build_torus_knot() -> (Vec<[f32; 3]>, Vec<u32>, Vec<[f32; 3]>) {
     (verts, idx, normals)
 }
 
-/// Compile the bundled WGSL ray-query shader to SPIR-V with naga. No external
-/// shader compiler is involved.
-fn compile_spirv() -> Result<Vec<u32>, String> {
-    let src = include_str!("rt.wgsl");
+/// The two bundled shaders (both inline ray-query WGSL → SPIR-V via naga).
+const RT_SHADER: &str = include_str!("rt.wgsl");
+const PATHTRACE_SHADER: &str = include_str!("pathtrace.wgsl");
+
+/// Compile one of the bundled WGSL ray-query shaders to SPIR-V with naga. No
+/// external shader compiler is involved.
+fn compile_spirv(src: &str) -> Result<Vec<u32>, String> {
     let module = naga::front::wgsl::parse_str(src)
         .map_err(|e| format!("rt shader parse: {}", e.emit_to_string(src)))?;
     let mut validator = naga::valid::Validator::new(
@@ -674,15 +709,16 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
 
     // `shade` starts 0; when previewing, the run loop sets it to 1 only for the
     // ~60 Hz frames it actually presents, so most dispatches stay pure traversal.
+    // `seed` is a fixed base so the path tracer stays deterministic.
     let params = Params {
         iters: kernel.iters.clamp(1, 1 << 20),
         width: rt_w,
         height: rt_h,
         shade: 0,
         time: 0.0,
-        _pad0: 0,
-        _pad1: 0,
-        _pad2: 0,
+        samples: kernel.samples.clamp(1, 1 << 16),
+        bounces: kernel.bounces.clamp(1, 64),
+        seed: 0x9e37_79b9,
     };
     let ubuf = ctx.make_buffer(
         std::mem::size_of::<Params>() as u64,
@@ -704,7 +740,11 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
     }
 
     // ---- Descriptors + pipeline ----
-    ctx.build_pipeline()?;
+    let shader_src = match kernel.mode {
+        RtMode::RayQuery => RT_SHADER,
+        RtMode::PathTrace => PATHTRACE_SHADER,
+    };
+    ctx.build_pipeline(shader_src)?;
     ctx.write_descriptors(obuf.buffer, ubuf.buffer, cbuf.buffer, ibuf.buffer, nbuf.buffer)?;
     ctx.record_dispatch();
 
@@ -941,8 +981,8 @@ impl RtContext {
     }
 
     /// Compile the shader and build the compute pipeline + descriptor layout.
-    fn build_pipeline(&mut self) -> Result<(), String> {
-        let spirv = compile_spirv()?;
+    fn build_pipeline(&mut self, shader_src: &str) -> Result<(), String> {
+        let spirv = compile_spirv(shader_src)?;
         let sm_ci = vk::ShaderModuleCreateInfo::default().code(&spirv);
         self.shader = unsafe { self.device.create_shader_module(&sm_ci, None) }
             .map_err(|e| format!("create_shader_module: {e:?}"))?;
@@ -1282,7 +1322,10 @@ impl RtPreview {
 
 impl LoadKernel for RtKernel {
     fn name(&self) -> &str {
-        "rt"
+        match self.mode {
+            RtMode::RayQuery => "rt",
+            RtMode::PathTrace => "pathtrace",
+        }
     }
 
     fn kind(&self) -> Kind {
@@ -1291,29 +1334,30 @@ impl LoadKernel for RtKernel {
 
     fn run(&self, budget: &Budget, stop: &StopFlag, markers: &MarkerLog) -> LoadResult {
         let label = self.device.label();
+        let kname = self.name();
 
         // All of Vulkan setup + AS build under catch_unwind: a missing loader,
         // an unsupported GPU or a driver fault becomes a clean setup failure
         // rather than a panic that takes down a whole cross-load run.
         let ctx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| setup(self))) {
             Ok(Ok(c)) => c,
-            Ok(Err(why)) => return LoadResult::setup_failure(format!("{label} rt: {why}")),
+            Ok(Err(why)) => return LoadResult::setup_failure(format!("{label} {kname}: {why}")),
             Err(_) => {
-                return LoadResult::setup_failure(format!("{label} rt: Vulkan setup panicked"))
+                return LoadResult::setup_failure(format!("{label} {kname}: Vulkan setup panicked"))
             }
         };
 
         // Probe the first dispatch: submit, wait, and require liveness (some rays
         // must hit) before entering the timed loop.
         if let Err(why) = ctx.submit_and_wait("first dispatch") {
-            return LoadResult::setup_failure(format!("{label} rt: {why}"));
+            return LoadResult::setup_failure(format!("{label} {kname}: {why}"));
         }
         let first = ctx.readback();
         // Liveness: a live traversal must leave some non-zero bytes (some rays
         // hit). A byte scan avoids any alignment assumption on the read-back Vec.
         if !first.iter().any(|&b| b != 0) {
             return LoadResult::setup_failure(format!(
-                "{label} rt: output all-zero on probe — no rays hit (bad build?)"
+                "{label} {kname}: output all-zero on probe — no rays hit (bad build?)"
             ));
         }
         let reference0 = fnv1a(&first);
@@ -1324,7 +1368,7 @@ impl LoadKernel for RtKernel {
         let preview = RtPreview::open(self, ctx.width, ctx.height);
 
         let backend = "vulkan-rt".to_string();
-        let mut driver = ShapeDriver::start(budget, stop, markers, "rt", backend.clone());
+        let mut driver = ShapeDriver::start(budget, stop, markers, kname, backend.clone());
         let start = Instant::now();
         let mut dispatches: u64 = 0;
         let mut verifications: u64 = 0;
@@ -1357,7 +1401,7 @@ impl LoadKernel for RtKernel {
                             dispatches,
                             reference.unwrap_or(0),
                             errors,
-                            format!("{label} rt: DEVICE LOST ({why})"),
+                            format!("{label} {kname}: DEVICE LOST ({why})"),
                         );
                     }
                     dispatches += 1;
@@ -1375,7 +1419,7 @@ impl LoadKernel for RtKernel {
                                     h,
                                     errors,
                                     format!(
-                                        "{label} rt: miscompare at dispatch {dispatches} \
+                                        "{label} {kname}: miscompare at dispatch {dispatches} \
                                          (got {h:#018x}, expected {r:#018x}) — RT-core soft error"
                                     ),
                                 );
@@ -1408,18 +1452,26 @@ impl LoadKernel for RtKernel {
         }
 
         let secs = start.elapsed().as_secs_f64();
-        // Every ray traces `iters` times per dispatch.
         let n_rays = ctx.width * ctx.height;
-        let traversals = dispatches as f64 * n_rays as f64 * self.iters.max(1) as f64;
+        // Rays cast per pixel per dispatch: `iters` (ray-query) or ~samples*bounces
+        // (path trace — an upper bound; paths that escape early cast fewer).
+        let (rays_per_pixel, load_desc) = match self.mode {
+            RtMode::RayQuery => (self.iters.max(1), format!("x{} traces", self.iters)),
+            RtMode::PathTrace => (
+                self.samples.max(1) * self.bounces.max(1),
+                format!("{}spp x{}bounce", self.samples, self.bounces),
+            ),
+        };
+        let traversals = dispatches as f64 * n_rays as f64 * rays_per_pixel as f64;
         let mrays = if secs > 0.0 {
             traversals / secs / 1.0e6
         } else {
             0.0
         };
         let detail = format!(
-            "{label} {backend} {}x{} rays x{} traces, {dispatches} dispatch(es), \
+            "{label} {backend} {}x{} {load_desc}, {dispatches} dispatch(es), \
              {verifications} verified, ~{mrays:.0} Mray/s",
-            ctx.width, ctx.height, self.iters
+            ctx.width, ctx.height
         );
         LoadResult::new(true, dispatches, reference.unwrap_or(0), errors, detail)
     }
@@ -1445,11 +1497,16 @@ mod tests {
     }
 
     #[test]
-    fn shader_compiles_to_spirv_with_ray_query() {
-        let words = compile_spirv().expect("naga must compile the rt shader");
-        assert_eq!(words.first().copied(), Some(0x0723_0203)); // SPIR-V magic
-        // OpTypeRayQueryKHR (4472) must be present.
-        assert!(words.iter().any(|&w| (w & 0xffff) == 4472));
+    fn shaders_compile_to_spirv_with_ray_query() {
+        for (name, src) in [("rt", RT_SHADER), ("pathtrace", PATHTRACE_SHADER)] {
+            let words = compile_spirv(src).unwrap_or_else(|e| panic!("naga must compile {name}: {e}"));
+            assert_eq!(words.first().copied(), Some(0x0723_0203), "{name} SPIR-V magic");
+            // OpTypeRayQueryKHR (4472) must be present.
+            assert!(
+                words.iter().any(|&w| (w & 0xffff) == 4472),
+                "{name} missing ray-query opcode"
+            );
+        }
     }
 
     #[test]
