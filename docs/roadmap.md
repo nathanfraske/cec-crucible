@@ -90,6 +90,67 @@ which is the safe form given reports/markers flush only at `finish()`. A native
 `run gauntlet` profile is deferred until it can replicate checkpoint + flush +
 per-phase WHEA (gauntlet.md §10).
 
+## Phase 3T — transient & light-load classes ✅ (built)
+
+The mirror image of the heavy-load suite — the fault classes that hide in the
+load *edges* and at *idle*, reached by two new load shapes (`Shape::Jitter`,
+`Shape::Pulse`) plus per-core seed decorrelation:
+
+- [x] **`chaos`** — CPU + GPU on independent seeded jitter (spike + `floor_pct`
+  trickle) over steady RAM/storage/VRAM/PCIe: the never-settle superset of
+  `beat`, hitting coincident-spike (OCP) and hand-off (VRM-chase) statistically.
+  `--per-core` decorrelates each CPU core (CPU-VRM chaos) vs one system slam.
+  `--seed` replays the commanded pattern.
+- [x] **`game-load`** — frame-paced CPU→GPU handoff at moderate power; the game
+  *electrical/thermal* signature (frame cadence, CPU-leads-GPU, VRAM streaming),
+  explicitly **not** the graphics stack (see 3G).
+- [x] **`core-cycle`** — single-core steady boost rotated over all cores: the
+  weak-core-at-max-boost hunt masked in all-core runs.
+- [x] **`c-states`** — single-core pulse + deep idle rotated: the idle /
+  C-state / low-load-voltage class. Requires BIOS C-states + boost + a deep-idle
+  power plan (no telemetry to confirm; idle-only faults show via WHEA/reboot).
+
+## Phase 3G — GPU functional-unit coverage (the immediate follow-on)
+
+Today the GPU coverage is general shader ALU (thrasher), VRAM, and PCIe — it
+touches **none** of the specialized silicon. A card with a dead ROP, a bad
+tensor MAC lane, or a defective RT intersection unit passes everything and fails
+at the customer's game / DLSS / ray-traced workload. Scoped, with an honest
+per-vendor feasibility matrix (render is portable today; tensor is
+NVIDIA+toolkit-gated; RT is experimental everywhere). Build order by
+coverage-per-effort:
+
+1. **`render` (procedural)** — headless wgpu graphics pipeline to an offscreen
+   target: exercises the **rasterizer, TMU/texture units, and ROP/blend/depth**
+   that compute bypasses, plus real draw calls and the driver command path.
+   **Zero new deps** (raw wgpu, like `link.rs`), portable across all three
+   vendors, verified by framebuffer pixel-checksum (same-device self-consistency;
+   cross-vendor is not bit-identical). Highest value, lowest risk.
+2. **`render --scene` (glTF/PBR)** — optional realism upgrade: a bundled
+   permissively-licensed Khronos glTF scene + a PBR shader ported from the
+   Apache-2.0 glTF-Sample-Viewer, and a `--scene <file>` override so a shop
+   supplies its own licensed asset (we redistribute nothing proprietary; no EULA/
+   download). Gated behind a new `gpu-gltf` feature (`gltf` + `image` crates) so
+   `--features gpu` stays glTF-free.
+3. **`tensor`** — a heavy verified low-precision GEMM (the "little ML test"):
+   **int8→int32 gives an exact cross-vendor golden** (the strongest verification
+   in the suite), fp16→fp32 self-consistency. Reaches tensor cores via CubeCL
+   CMMA on the **CUDA** runtime — so it inherits the NVRTC/toolkit requirement
+   (NVIDIA + `--features cuda`, bench-only, not ship-anywhere). wgpu can't reach
+   tensor cores; the Vulkan/SPIR-V route is experimental.
+4. **`rt`** — minimal BVH-traversal + ray-intersection stress via wgpu's
+   **experimental** ray-query (Vulkan; "major bugs, breaking changes"), verified
+   by hit-buffer self-consistency + known-ray tolerance. Least tractable; scope
+   last, or take a DXR path if justified. Shares the acceleration structure with
+   `render` (RT-on rendering).
+
+All four implement `LoadKernel`, so they drop into the shared shape/stop/phase/
+marker machinery with no orchestrator change and immediately gain the chaos /
+game-load / gauntlet profiles. Carry-forward caveat (as elsewhere): render/RT
+self-consistency has the deterministic-from-t0 blind spot; the int8 tensor golden
+and WHEA are the backstops. Video encode/decode (NVENC/NVDEC) and display scanout
+stay out of scope.
+
 ## Phase 4 — polish
 
 - Scenario library of known-killer patterns (grown from QC field data).
