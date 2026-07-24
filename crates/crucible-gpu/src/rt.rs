@@ -101,9 +101,10 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Uniform block handed to the shader. `repr(C)` so the layout matches WGSL's
-/// `struct Params { iters, width, height, shade: u32 }`. `shade` is 1 only when a
-/// preview window is open — then the shader also writes a lit colour image.
+/// Uniform block handed to the shader. `repr(C)`, padded to 32 bytes so the
+/// layout matches WGSL's uniform-struct rules. `shade` is 1 only for a frame that
+/// will be presented (the shader then also writes a lit colour image); `time`
+/// (seconds) drives the orbiting display camera. Neither affects the checksum.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Params {
@@ -111,33 +112,96 @@ struct Params {
     width: u32,
     height: u32,
     shade: u32,
+    time: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-/// A displaced grid mesh — enough depth complexity that the rays hit many
-/// different triangles, so the checksum is sensitive to BVH correctness. Returns
-/// (positions, indices). Deterministic.
-fn build_grid() -> (Vec<[f32; 3]>, Vec<u32>) {
-    const GRID: usize = 64;
-    let mut verts = Vec::with_capacity(GRID * GRID);
-    for j in 0..GRID {
-        for i in 0..GRID {
-            let u = i as f32 / (GRID - 1) as f32 * 4.0 - 2.0;
-            let v = j as f32 / (GRID - 1) as f32 * 4.0 - 2.0;
-            let z = 0.3 * (3.0 * u).sin() * (3.0 * v).cos();
-            verts.push([u, v, z]);
+/// A (2,3) torus-knot tube mesh — a striking, self-occluding object (great for
+/// the traced shadows) with plenty of triangles + depth complexity for the BVH.
+/// Returns (positions, indices, smooth per-vertex normals). Deterministic.
+///
+/// Built by sweeping a ring of `SIDES` points around the knot curve at `SEGMENTS`
+/// stations; the outward tube direction at each point is exactly the smooth
+/// surface normal, so no normal averaging is needed.
+fn build_torus_knot() -> (Vec<[f32; 3]>, Vec<u32>, Vec<[f32; 3]>) {
+    const SEGMENTS: usize = 256; // stations along the knot curve
+    const SIDES: usize = 24; // points around the tube
+    const P: f32 = 2.0;
+    const Q: f32 = 3.0;
+    const TUBE: f32 = 0.5; // tube radius (curve units)
+    const SCALE: f32 = 0.6; // fit into ~[-2, 2]
+    let tau = std::f32::consts::TAU;
+
+    let curve = |u: f32| -> [f32; 3] {
+        let r = 2.0 + (Q * u).cos();
+        [r * (P * u).cos(), r * (P * u).sin(), (Q * u).sin()]
+    };
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let normz = |a: [f32; 3]| {
+        let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt().max(1e-8);
+        [a[0] / l, a[1] / l, a[2] / l]
+    };
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+
+    let mut verts = Vec::with_capacity(SEGMENTS * SIDES);
+    let mut normals = Vec::with_capacity(SEGMENTS * SIDES);
+    let e = 0.002_f32;
+    for i in 0..SEGMENTS {
+        let u = i as f32 / SEGMENTS as f32 * tau;
+        let c = curve(u);
+        let cp = curve(u + e);
+        let cm = curve(u - e);
+        // Tangent, then a normal via the second difference orthogonalised to it.
+        let t = normz(sub(cp, cm));
+        let mut nraw = [
+            cp[0] - 2.0 * c[0] + cm[0],
+            cp[1] - 2.0 * c[1] + cm[1],
+            cp[2] - 2.0 * c[2] + cm[2],
+        ];
+        let d = dot(nraw, t);
+        nraw = [nraw[0] - d * t[0], nraw[1] - d * t[1], nraw[2] - d * t[2]];
+        let n = normz(nraw);
+        let b = cross(t, n);
+        for j in 0..SIDES {
+            let v = j as f32 / SIDES as f32 * tau;
+            let (cv, sv) = (v.cos(), v.sin());
+            // Outward tube direction = the smooth surface normal.
+            let dir = [
+                cv * n[0] + sv * b[0],
+                cv * n[1] + sv * b[1],
+                cv * n[2] + sv * b[2],
+            ];
+            verts.push([
+                (c[0] + TUBE * dir[0]) * SCALE,
+                (c[1] + TUBE * dir[1]) * SCALE,
+                (c[2] + TUBE * dir[2]) * SCALE,
+            ]);
+            normals.push(dir);
         }
     }
-    let mut idx = Vec::with_capacity((GRID - 1) * (GRID - 1) * 6);
-    for j in 0..GRID - 1 {
-        for i in 0..GRID - 1 {
-            let a = (j * GRID + i) as u32;
-            let b = a + 1;
-            let c = a + GRID as u32;
-            let d = c + 1;
+
+    let mut idx = Vec::with_capacity(SEGMENTS * SIDES * 6);
+    for i in 0..SEGMENTS {
+        let inext = (i + 1) % SEGMENTS;
+        for j in 0..SIDES {
+            let jnext = (j + 1) % SIDES;
+            let a = (i * SIDES + j) as u32;
+            let b = (i * SIDES + jnext) as u32;
+            let c = (inext * SIDES + j) as u32;
+            let d = (inext * SIDES + jnext) as u32;
             idx.extend_from_slice(&[a, c, b, b, c, d]);
         }
     }
-    (verts, idx)
+    (verts, idx, normals)
 }
 
 /// Compile the bundled WGSL ray-query shader to SPIR-V with naga. No external
@@ -212,6 +276,9 @@ struct RtContext {
     color_ptr: *mut u8,
     #[cfg(all(windows, feature = "preview"))]
     color_bytes: u64,
+    // Mapped uniform pointer, so the preview can update shade/time each frame.
+    #[cfg(all(windows, feature = "preview"))]
+    params_ptr: *mut Params,
     groups: u32,
 }
 
@@ -499,6 +566,8 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
         color_ptr: std::ptr::null_mut(),
         #[cfg(all(windows, feature = "preview"))]
         color_bytes: 0,
+        #[cfg(all(windows, feature = "preview"))]
+        params_ptr: std::ptr::null_mut(),
         groups: N_RAYS.div_ceil(WG),
     };
 
@@ -521,17 +590,32 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
     .map_err(|e| format!("create_fence: {e:?}"))?;
 
     // ---- Geometry upload (host-visible; the driver reads it during the build) ----
-    let (verts, indices) = build_grid();
+    let (verts, indices, normals) = build_torus_knot();
     let tri_count = (indices.len() / 3) as u32;
     let vbytes = std::mem::size_of_val(verts.as_slice()) as u64;
     let ibytes = std::mem::size_of_val(indices.as_slice()) as u64;
+    let nbytes = std::mem::size_of_val(normals.as_slice()) as u64;
     let as_input = vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
 
     let vbuf = ctx.make_buffer(vbytes, as_input, MemoryLocation::CpuToGpu, "rt-verts")?;
-    let ibuf = ctx.make_buffer(ibytes, as_input, MemoryLocation::CpuToGpu, "rt-index")?;
+    // The index buffer is also a shader storage buffer: the preview shader reads
+    // it (with the normals) to reconstruct the smooth normal at a hit.
+    let ibuf = ctx.make_buffer(
+        ibytes,
+        as_input | vk::BufferUsageFlags::STORAGE_BUFFER,
+        MemoryLocation::CpuToGpu,
+        "rt-index",
+    )?;
+    let nbuf = ctx.make_buffer(
+        nbytes,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        MemoryLocation::CpuToGpu,
+        "rt-normal",
+    )?;
     unsafe {
         std::ptr::copy_nonoverlapping(verts.as_ptr() as *const u8, vbuf.ptr, vbytes as usize);
         std::ptr::copy_nonoverlapping(indices.as_ptr() as *const u8, ibuf.ptr, ibytes as usize);
+        std::ptr::copy_nonoverlapping(normals.as_ptr() as *const u8, nbuf.ptr, nbytes as usize);
     }
 
     // ---- Bottom-level acceleration structure (the triangle mesh) ----
@@ -567,17 +651,17 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
         ctx.color_bytes = color_bytes;
     }
 
-    // `shade` = 1 only for a real preview build with the window requested.
-    #[cfg(all(windows, feature = "preview"))]
-    let shade = if kernel.preview { 1u32 } else { 0u32 };
-    #[cfg(not(all(windows, feature = "preview")))]
-    let shade = 0u32;
-
+    // `shade` starts 0; when previewing, the run loop sets it to 1 only for the
+    // ~60 Hz frames it actually presents, so most dispatches stay pure traversal.
     let params = Params {
         iters: kernel.iters.clamp(1, 1 << 20),
         width: WIDTH,
         height: HEIGHT,
-        shade,
+        shade: 0,
+        time: 0.0,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
     let ubuf = ctx.make_buffer(
         std::mem::size_of::<Params>() as u64,
@@ -592,10 +676,15 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
             std::mem::size_of::<Params>(),
         );
     }
+    // Keep the uniform's mapped pointer so the preview can update shade/time.
+    #[cfg(all(windows, feature = "preview"))]
+    {
+        ctx.params_ptr = ubuf.ptr as *mut Params;
+    }
 
     // ---- Descriptors + pipeline ----
     ctx.build_pipeline()?;
-    ctx.write_descriptors(obuf.buffer, ubuf.buffer, cbuf.buffer)?;
+    ctx.write_descriptors(obuf.buffer, ubuf.buffer, cbuf.buffer, ibuf.buffer, nbuf.buffer)?;
     ctx.record_dispatch();
 
     Ok(ctx)
@@ -858,6 +947,18 @@ impl RtContext {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // 4: triangle indices, 5: per-vertex normals — read by the preview
+            // shader to reconstruct the smooth normal at a hit.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         self.dsl = unsafe { self.device.create_descriptor_set_layout(&dsl_ci, None) }
@@ -882,15 +983,15 @@ impl RtContext {
         .map_err(|(_, e)| format!("create_compute_pipelines: {e:?}"))?;
         self.pipeline = pipelines[0];
 
-        // Descriptor pool sized for one set: 1 AS, 2 storage buffers (out +
-        // colour), 1 uniform.
+        // Descriptor pool sized for one set: 1 AS, 4 storage buffers (out, colour,
+        // indices, normals), 1 uniform.
         let sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(2),
+                .descriptor_count(4),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1),
@@ -909,13 +1010,15 @@ impl RtContext {
         Ok(())
     }
 
-    /// Point the descriptor set at the TLAS, the output/colour buffers and the
-    /// uniforms.
+    /// Point the descriptor set at the TLAS, the output/colour buffers, the
+    /// uniforms, and the index/normal buffers (for preview shading).
     fn write_descriptors(
         &mut self,
         out_buf: vk::Buffer,
         uniform_buf: vk::Buffer,
         color_buf: vk::Buffer,
+        index_buf: vk::Buffer,
+        normal_buf: vk::Buffer,
     ) -> Result<(), String> {
         // Binding 0: the TLAS (the last acceleration structure built).
         let tlas = *self
@@ -963,7 +1066,27 @@ impl RtContext {
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&color_info);
 
-        let writes = [w0, w1, w2, w3];
+        let index_info = [vk::DescriptorBufferInfo::default()
+            .buffer(index_buf)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let w4 = vk::WriteDescriptorSet::default()
+            .dst_set(self.desc_set)
+            .dst_binding(4)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&index_info);
+
+        let normal_info = [vk::DescriptorBufferInfo::default()
+            .buffer(normal_buf)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let w5 = vk::WriteDescriptorSet::default()
+            .dst_set(self.desc_set)
+            .dst_binding(5)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&normal_info);
+
+        let writes = [w0, w1, w2, w3, w4, w5];
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
         Ok(())
     }
@@ -1030,6 +1153,19 @@ impl RtContext {
             }
         }
         out
+    }
+
+    /// Update the preview's uniform: `shade` gates the (expensive) shading so it
+    /// runs only for frames that will be presented, and `time` orbits the camera.
+    /// Written between dispatches, so no GPU access races the host write.
+    #[cfg(all(windows, feature = "preview"))]
+    fn update_display(&self, shade: u32, time: f32) {
+        if !self.params_ptr.is_null() {
+            unsafe {
+                (*self.params_ptr).shade = shade;
+                (*self.params_ptr).time = time;
+            }
+        }
     }
 }
 
@@ -1111,18 +1247,22 @@ impl RtPreview {
         })
     }
 
-    /// Pump the window and, when due (~60 Hz), read back the colour image and
-    /// present it. Returns false once the window has been closed.
-    fn show(&self, ctx: &RtContext) -> bool {
-        if !self.window.pump() {
-            return false;
-        }
-        if self.presenter.due() {
-            let pixels = ctx.readback_color();
-            self.presenter
-                .present_rgba(&self.device, &self.queue, &pixels);
-        }
-        true
+    /// Is it time to present another frame (~60 Hz)? The run loop uses this to
+    /// decide whether to shade the upcoming dispatch.
+    fn due(&self) -> bool {
+        self.presenter.due()
+    }
+
+    /// Drain window messages; returns false once the window has been closed.
+    fn pump(&self) -> bool {
+        self.window.pump()
+    }
+
+    /// Read back the (just-shaded) colour image and present it.
+    fn present(&self, ctx: &RtContext) {
+        let pixels = ctx.readback_color();
+        self.presenter
+            .present_rgba(&self.device, &self.queue, &pixels);
     }
 }
 
@@ -1180,6 +1320,22 @@ impl LoadKernel for RtKernel {
         loop {
             match driver.tick() {
                 Tick::Work => {
+                    // When previewing, only the frame we're about to present is
+                    // shaded (shade=1) + given the current time for the orbit;
+                    // every other dispatch stays pure traversal (shade=0).
+                    #[cfg(all(windows, feature = "preview"))]
+                    let present_now = match &preview {
+                        Some(pv) => {
+                            let due = pv.due();
+                            ctx.update_display(
+                                if due { 1 } else { 0 },
+                                start.elapsed().as_secs_f32(),
+                            );
+                            due
+                        }
+                        None => false,
+                    };
+
                     if let Err(why) = ctx.submit_and_wait("dispatch") {
                         errors += 1;
                         return LoadResult::new(
@@ -1217,8 +1373,10 @@ impl LoadKernel for RtKernel {
 
                     #[cfg(all(windows, feature = "preview"))]
                     if let Some(pv) = &preview {
-                        if !pv.show(&ctx) {
+                        if !pv.pump() {
                             stop.stop();
+                        } else if present_now {
+                            pv.present(&ctx);
                         }
                     }
                 }
@@ -1226,7 +1384,7 @@ impl LoadKernel for RtKernel {
                 Tick::Idle => {
                     #[cfg(all(windows, feature = "preview"))]
                     if let Some(pv) = &preview {
-                        if !pv.show(&ctx) {
+                        if !pv.pump() {
                             stop.stop();
                         }
                     }
@@ -1258,12 +1416,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grid_is_watertight_indices() {
-        let (verts, idx) = build_grid();
-        assert_eq!(verts.len(), 64 * 64);
-        assert_eq!(idx.len(), 63 * 63 * 6);
+    fn torus_knot_mesh_is_consistent() {
+        let (verts, idx, normals) = build_torus_knot();
+        assert_eq!(verts.len(), 256 * 24);
+        assert_eq!(normals.len(), verts.len());
+        assert_eq!(idx.len(), 256 * 24 * 6);
         // Every index is in range.
         assert!(idx.iter().all(|&i| (i as usize) < verts.len()));
+        // Normals are unit length.
+        for n in &normals {
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-3, "normal not unit: {len}");
+        }
     }
 
     #[test]

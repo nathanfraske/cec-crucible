@@ -159,11 +159,14 @@ coverage-per-effort:
    burst). `--rt-iters` sets traces/ray (load + TDR knob). `gpu-allocator` handles
    device memory + the buffer-device-address allocate flag the AS build requires.
    Optional `rt --preview` (opt-in `preview` feature, Windows) pops a live window
-   showing the ray-traced image: the shader additionally writes a shaded colour
-   image (Lambertian from the grid's analytic normal + a *traced hard shadow ray*
-   per pixel, so the surface self-shadows — visibly the RT cores doing secondary
-   rays) which a small wgpu present path upscales into the window. Gated by a
-   `shade` uniform so a plain `rt` run does zero extra ray work and the checksum is
+   showing a real object being ray-traced in realtime: a procedural **torus knot**
+   (the traced geometry) lit with interpolated mesh normals + a *traced hard shadow
+   ray* per pixel (self-shadows — visibly the RT cores doing secondary rays), under
+   an **orbiting camera** so it rotates. A small separate wgpu path upscales the
+   image into the window. Verification is untouched: the checksum traces a *fixed*
+   camera, while only the (unverified) display uses the orbiting camera; and the
+   shading runs only on the ~60 Hz frames actually presented (gated by a `shade`
+   uniform), so a plain `rt` run does zero extra ray work and the checksum is
    byte-identical.
 
 All four implement `LoadKernel`, so they drop into the shared shape/stop/phase/
