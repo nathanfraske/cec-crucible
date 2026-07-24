@@ -309,7 +309,10 @@ impl LoadKernel for GpuKernel {
         // of being smeared by queued work.
         let batch = match budget.shape {
             Shape::Steady => 4,
-            Shape::Burst { .. } => 1,
+            // Burst, pulse and jitter all want one dispatch per sync so the
+            // on/off edges track the shape driver instead of being smeared by
+            // queued work.
+            Shape::Burst { .. } | Shape::Pulse { .. } | Shape::Jitter { .. } => 1,
         };
 
         let mut driver = ShapeDriver::start(budget, stop, markers, "gpu", self.mode_detail());

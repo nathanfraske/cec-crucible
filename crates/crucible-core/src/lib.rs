@@ -24,6 +24,7 @@ pub mod json;
 pub mod kernel;
 pub mod markers;
 pub mod report;
+pub mod rng;
 pub mod sysinfo;
 
 // Flat re-exports of the most-used types for ergonomic downstream `use`.

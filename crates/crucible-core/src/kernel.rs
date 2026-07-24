@@ -57,16 +57,50 @@ impl StopFlag {
 
 /// How the load moves over time.
 ///
-/// `Steady` and `Burst` are implemented in Phase 1. `Ramp`/`Sweep` (for the
-/// closed-loop wattage servo) are Phase 3 and intentionally absent here rather
-/// than stubbed — add them with the servo that drives them.
+/// `Ramp`/`Sweep` (for the closed-loop wattage servo) are Phase 3 and
+/// intentionally absent here rather than stubbed — add them with the servo that
+/// drives them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Shape {
     /// Continuous full load.
     Steady,
     /// Duty cycle: `on` under load, `off` idle, repeating. Hammers VRM
-    /// transient response.
+    /// transient response with a *fixed* period. The off-phase parks only
+    /// briefly (2 ms slices) so the core stays responsive but shallow — it does
+    /// *not* reach deep C-states. For that, use `Pulse`.
     Burst { on: Duration, off: Duration },
+    /// A burst with a *deep* idle: a short `work` pulse followed by a long,
+    /// genuinely-parked `idle` (slept in ~50 ms slices, not 2 ms), so the core
+    /// demotes into C6 between pulses. This is the only shape that exercises
+    /// C-state entry/exit, the idle→boost voltage step, and low-load/idle
+    /// undervolt instability — the "crashes at idle, passes Prime95" class.
+    /// Pair with single-core pinning so one core cycles C0↔C6 while the rest of
+    /// the package idles.
+    Pulse { work: Duration, idle: Duration },
+    /// Randomized burst — the "never-settle" transient. Each on (spike) and off
+    /// (floor) segment length is drawn from a seeded PRNG within
+    /// `[on_min, on_max]` / `[off_min, off_max]`, keyed on the segment *index* so
+    /// the schedule is a pure function of `(seed, phase_origin)` — every worker
+    /// thread and every kernel sharing the seed agrees on it regardless of tick
+    /// rate, exactly as `Burst` stays aligned via `elapsed % period`. Because the
+    /// period never repeats and each kernel is seeded independently, the domains
+    /// swap at uncorrelated offsets and no VRM/PSU control loop ever settles.
+    ///
+    /// `floor_pct` is the "barely loaded, then slam" trickle: during an off
+    /// segment the driver runs a light micro-duty of `floor_pct`% instead of
+    /// going fully idle, so the rail stays out of its deep-idle/skip regulation
+    /// mode and every spike lands on an already-perturbed baseline. `0` = a
+    /// burst-style dead idle. (It is approximate — the work chunk quantizes it
+    /// upward.) The `seed` makes the *commanded* pattern reproducible (subject to
+    /// OS-scheduler jitter on the exact wall-clock edges); log it to re-run.
+    Jitter {
+        on_min: Duration,
+        on_max: Duration,
+        off_min: Duration,
+        off_max: Duration,
+        floor_pct: u8,
+        seed: u64,
+    },
 }
 
 impl Shape {
@@ -74,6 +108,8 @@ impl Shape {
         match self {
             Shape::Steady => "steady",
             Shape::Burst { .. } => "burst",
+            Shape::Pulse { .. } => "pulse",
+            Shape::Jitter { .. } => "jitter",
         }
     }
 }
@@ -115,6 +151,45 @@ impl Budget {
         Budget {
             duration,
             shape: Shape::Burst { on, off },
+            target_watts: None,
+            phase_epoch: None,
+            phase_offset: Duration::ZERO,
+        }
+    }
+
+    /// A deep-idle pulse budget (for the C-state / idle-boost test).
+    pub fn pulse(duration: Duration, work: Duration, idle: Duration) -> Budget {
+        Budget {
+            duration,
+            shape: Shape::Pulse { work, idle },
+            target_watts: None,
+            phase_epoch: None,
+            phase_offset: Duration::ZERO,
+        }
+    }
+
+    /// A randomized-burst budget. `seed` seeds this kernel's PRNG — give each
+    /// concurrent kernel a distinct seed so their streams decorrelate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn jitter(
+        duration: Duration,
+        on_min: Duration,
+        on_max: Duration,
+        off_min: Duration,
+        off_max: Duration,
+        floor_pct: u8,
+        seed: u64,
+    ) -> Budget {
+        Budget {
+            duration,
+            shape: Shape::Jitter {
+                on_min,
+                on_max,
+                off_min,
+                off_max,
+                floor_pct,
+                seed,
+            },
             target_watts: None,
             phase_epoch: None,
             phase_offset: Duration::ZERO,
@@ -228,8 +303,15 @@ pub struct ShapeDriver<'a> {
     stop: &'a StopFlag,
     markers: &'a MarkerLog,
     kernel: &'a str,
-    /// Current burst phase (only meaningful for `Burst`).
+    /// Current on/off phase (`Burst`, `Pulse`, `Jitter`).
     on_phase: bool,
+    /// `Jitter` segment cursor: the active segment's index and its phase-relative
+    /// `[start, end)`. Boundaries are a deterministic prefix-sum of per-index
+    /// draws, so every thread/kernel sharing the seed lands on the same segment
+    /// for a given elapsed time — no shared mutable PRNG state to desync.
+    seg_idx: u64,
+    seg_start: Duration,
+    seg_end: Duration,
     detail: String,
 }
 
@@ -257,6 +339,11 @@ impl<'a> ShapeDriver<'a> {
             markers,
             kernel,
             on_phase: false,
+            // `seg_idx = MAX` so the first advance wraps to segment 0 (a spike);
+            // `seg_end = 0` makes the first tick cross into it.
+            seg_idx: u64::MAX,
+            seg_start: Duration::ZERO,
+            seg_end: Duration::ZERO,
             detail: detail.into(),
         }
     }
@@ -265,6 +352,14 @@ impl<'a> ShapeDriver<'a> {
     /// the stop flag even with long burst `off` periods.
     const MAX_NAP: Duration = Duration::from_millis(2);
 
+    /// Off-phase nap cap for `Pulse` — long enough for the core to actually
+    /// demote into C6 (a 2 ms burst nap never does), short enough to keep stop
+    /// latency and package-idle disruption bounded.
+    const PULSE_IDLE_CHUNK: Duration = Duration::from_millis(50);
+
+    /// Floor micro-duty slot for `Jitter` — the trickle repeats on this period.
+    const FLOOR_SLOT: Duration = Duration::from_millis(10);
+
     pub fn tick(&mut self) -> Tick {
         if self.stop.stopped() || Instant::now() >= self.deadline {
             self.close_burst();
@@ -272,30 +367,102 @@ impl<'a> ShapeDriver<'a> {
         }
         match self.shape {
             Shape::Steady => Tick::Work,
-            Shape::Burst { on, off } => {
-                let period = (on + off).as_nanos().max(1);
-                let pos = (self.phase_origin.elapsed() + self.phase_offset).as_nanos() % period;
-                let on_ns = on.as_nanos();
-                if pos < on_ns {
-                    if !self.on_phase {
-                        self.markers
-                            .stamp(Event::BurstOn, self.kernel, self.mode, &self.detail);
-                        self.on_phase = true;
-                    }
-                    Tick::Work
-                } else {
-                    if self.on_phase {
-                        self.markers
-                            .stamp(Event::BurstOff, self.kernel, self.mode, &self.detail);
-                        self.on_phase = false;
-                    }
-                    let remaining = (period - pos) as u64;
-                    let nap = Duration::from_nanos(remaining).min(Self::MAX_NAP);
-                    std::thread::sleep(nap);
-                    Tick::Idle
-                }
+            Shape::Burst { on, off } => self.duty_tick(on, off, Self::MAX_NAP),
+            // Pulse is a burst with a deep idle so the core reaches C6.
+            Shape::Pulse { work, idle } => self.duty_tick(work, idle, Self::PULSE_IDLE_CHUNK),
+            Shape::Jitter {
+                on_min,
+                on_max,
+                off_min,
+                off_max,
+                floor_pct,
+                seed,
+            } => self.jitter_tick(on_min, on_max, off_min, off_max, floor_pct, seed),
+        }
+    }
+
+    /// Fixed-period duty cycle (Burst and Pulse): Work during the on-window,
+    /// Idle during the off-window. `nap_cap` is the only difference between a
+    /// shallow burst (2 ms, stays responsive) and a deep pulse (50 ms, lets the
+    /// core demote into C6). Position is taken from the shared `phase_origin`, so
+    /// all workers step together regardless of when each started.
+    fn duty_tick(&mut self, on: Duration, off: Duration, nap_cap: Duration) -> Tick {
+        let period = (on + off).as_nanos().max(1);
+        let pos = (self.phase_origin.elapsed() + self.phase_offset).as_nanos() % period;
+        if pos < on.as_nanos() {
+            if !self.on_phase {
+                self.markers
+                    .stamp(Event::BurstOn, self.kernel, self.mode, &self.detail);
+                self.on_phase = true;
+            }
+            Tick::Work
+        } else {
+            if self.on_phase {
+                self.markers
+                    .stamp(Event::BurstOff, self.kernel, self.mode, &self.detail);
+                self.on_phase = false;
+            }
+            let remaining = (period - pos) as u64;
+            let nap = Duration::from_nanos(remaining).min(nap_cap);
+            std::thread::sleep(nap);
+            Tick::Idle
+        }
+    }
+
+    /// Randomized duty cycle. Segment boundaries are a deterministic prefix-sum
+    /// of per-index draws measured from `phase_origin`, so this is a pure
+    /// function of `(seed, elapsed)` — identical across every thread and kernel
+    /// that shares the seed, independent of start time or tick rate. That is what
+    /// keeps a multi-threaded kernel producing *one* system-level step instead of
+    /// N desynchronized ones.
+    #[allow(clippy::too_many_arguments)]
+    fn jitter_tick(
+        &mut self,
+        on_min: Duration,
+        on_max: Duration,
+        off_min: Duration,
+        off_max: Duration,
+        floor_pct: u8,
+        seed: u64,
+    ) -> Tick {
+        let elapsed = self.phase_origin.elapsed() + self.phase_offset;
+        // Advance to the segment containing `elapsed`. `while` (not `if`) lets a
+        // late starter catch up to the right segment in a single tick.
+        while elapsed >= self.seg_end {
+            self.seg_idx = self.seg_idx.wrapping_add(1); // MAX -> 0 on first tick
+            self.seg_start = self.seg_end;
+            let spike = self.seg_idx % 2 == 0; // even = spike, odd = floor
+            let (min, max) = if spike {
+                (on_min, on_max)
+            } else {
+                (off_min, off_max)
+            };
+            self.seg_end = self.seg_start + jitter_interval(seed, self.seg_idx, min, max);
+            let event = if spike {
+                Event::BurstOn
+            } else {
+                Event::BurstOff
+            };
+            self.markers
+                .stamp(event, self.kernel, self.mode, &self.detail);
+            self.on_phase = spike;
+        }
+        if self.on_phase {
+            return Tick::Work; // spike ("slam")
+        }
+        // Floor segment: a light `floor_pct` micro-duty keeps the rail out of its
+        // deep-idle regulation mode so the next spike lands on a perturbed
+        // baseline. `floor_pct == 0` degenerates to a dead idle.
+        if floor_pct > 0 {
+            let into = elapsed.saturating_sub(self.seg_start).as_nanos();
+            let slot = Self::FLOOR_SLOT.as_nanos();
+            if into % slot < slot * floor_pct.min(100) as u128 / 100 {
+                return Tick::Work; // the trickle
             }
         }
+        let nap = self.seg_end.saturating_sub(elapsed).min(Self::MAX_NAP);
+        std::thread::sleep(nap);
+        Tick::Idle
     }
 
     /// Stamp a trailing `burst_off` if we ended mid-burst. Idempotent.
@@ -311,6 +478,17 @@ impl<'a> ShapeDriver<'a> {
     pub fn elapsed_secs(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
     }
+}
+
+/// One jitter segment's length, a pure function of `(seed, index)` — no mutable
+/// stream, so every thread agrees on the schedule for a given index.
+fn jitter_interval(seed: u64, index: u64, min: Duration, max: Duration) -> Duration {
+    let lo = min.as_nanos() as u64;
+    let hi = (max.as_nanos() as u64).max(lo);
+    if hi == lo {
+        return Duration::from_nanos(lo);
+    }
+    Duration::from_nanos(lo + crate::rng::hash2(seed, index) % (hi - lo))
 }
 
 #[cfg(test)]
@@ -354,6 +532,80 @@ mod tests {
         let mut driver = ShapeDriver::start(&budget, &stop, &markers, "test", "");
         stop.stop();
         assert_eq!(driver.tick(), Tick::Stop);
+    }
+
+    #[test]
+    fn jitter_interval_is_pure_and_bounded() {
+        // A pure function of (seed, index): same inputs -> same length, always.
+        // This is what makes the whole jitter schedule thread-independent.
+        let (lo, hi) = (Duration::from_millis(5), Duration::from_millis(50));
+        let a = jitter_interval(0xABCD, 7, lo, hi);
+        assert_eq!(a, jitter_interval(0xABCD, 7, lo, hi));
+        assert!(a >= lo && a < hi, "must stay within [min, max)");
+        assert_ne!(
+            jitter_interval(0xABCD, 7, lo, hi),
+            jitter_interval(0xABCD, 8, lo, hi),
+            "adjacent indices decorrelate"
+        );
+        // Degenerate range collapses to the bound (no modulo-by-zero).
+        assert_eq!(jitter_interval(1, 1, lo, lo), lo);
+    }
+
+    #[test]
+    fn jitter_driver_emits_edges_and_naps() {
+        let stop = StopFlag::new();
+        let markers = MarkerLog::new(Clock::new());
+        let budget = Budget::jitter(
+            Duration::from_millis(150),
+            Duration::from_millis(4),
+            Duration::from_millis(12),
+            Duration::from_millis(4),
+            Duration::from_millis(12),
+            12,
+            0xABCD,
+        );
+        let mut driver = ShapeDriver::start(&budget, &stop, &markers, "cpu", "jitter");
+        let mut saw_work = false;
+        let mut saw_idle = false;
+        loop {
+            match driver.tick() {
+                Tick::Work => saw_work = true,
+                Tick::Idle => saw_idle = true,
+                Tick::Stop => break,
+            }
+        }
+        assert!(saw_work, "jitter should have on-phase work");
+        assert!(saw_idle, "jitter should have off-phase idle");
+        assert!(
+            markers.len() >= 2,
+            "expected several jitter edges, got {}",
+            markers.len()
+        );
+    }
+
+    #[test]
+    fn pulse_driver_pulses_and_deep_idles() {
+        let stop = StopFlag::new();
+        let markers = MarkerLog::new(Clock::new());
+        // Short work pulse, long deep idle.
+        let budget = Budget::pulse(
+            Duration::from_millis(120),
+            Duration::from_millis(3),
+            Duration::from_millis(40),
+        );
+        let mut driver = ShapeDriver::start(&budget, &stop, &markers, "cpu", "pulse");
+        let mut saw_work = false;
+        let mut saw_idle = false;
+        loop {
+            match driver.tick() {
+                Tick::Work => saw_work = true,
+                Tick::Idle => saw_idle = true,
+                Tick::Stop => break,
+            }
+        }
+        assert!(saw_work, "pulse should have a work phase");
+        assert!(saw_idle, "pulse should have a deep-idle phase");
+        assert!(markers.len() >= 2, "pulse should emit on/off edges");
     }
 
     #[test]

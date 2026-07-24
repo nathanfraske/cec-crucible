@@ -19,7 +19,9 @@
 
 use std::time::Instant;
 
-use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, ShapeDriver, StopFlag, Tick};
+use crucible_core::kernel::{
+    Budget, Kind, LoadKernel, LoadResult, Shape, ShapeDriver, StopFlag, Tick,
+};
 use crucible_core::markers::MarkerLog;
 use crucible_core::sysinfo;
 
@@ -52,11 +54,20 @@ impl CoreSel {
 #[derive(Debug, Clone)]
 pub struct CpuKernel {
     pub cores: CoreSel,
+    /// For the `Jitter` shape only: decorrelate each core's random schedule by
+    /// mixing its index into the seed, so the CPU VRM sees N uncorrelated
+    /// idle↔max walks (per-phase chaos, per-core boost/idle thrash) instead of
+    /// one synchronized system-level step. Ignored for other shapes and for
+    /// single-core runs. Default `false` (synchronized).
+    pub per_core_jitter: bool,
 }
 
 impl CpuKernel {
     pub fn new(cores: CoreSel) -> CpuKernel {
-        CpuKernel { cores }
+        CpuKernel {
+            cores,
+            per_core_jitter: false,
+        }
     }
 
     /// Human-readable name of the instruction path selected at runtime.
@@ -94,15 +105,28 @@ impl LoadKernel for CpuKernel {
         // independently — 20 unsynchronized square waves instead of one sharp
         // system-level current step, which is the whole point of a burst shape.
         // An orchestrator-supplied epoch (cross-load) always wins.
-        let budget = &budget.clone().phased_if_unset(Instant::now());
+        let base = budget.clone().phased_if_unset(Instant::now());
+        let per_core = self.per_core_jitter;
 
-        // Scoped threads so each worker can borrow the shared stop/markers/budget.
+        // Scoped threads so each worker can borrow the shared stop/markers.
         // `label_ref`, `core`, and the shared references are all `Copy`, so each
         // `move` closure gets its own copy rather than moving `label` out.
         let (outs, panics): (Vec<ThreadOut>, u64) = std::thread::scope(|scope| {
             let handles: Vec<_> = cores
                 .iter()
-                .map(|&core| scope.spawn(move || run_one(core, label_ref, budget, stop, markers)))
+                .map(|&core| {
+                    // Per-core jitter decorrelates each core's schedule by index;
+                    // otherwise every worker shares the seed and steps together.
+                    // The phase origin stays shared either way (same epoch), so
+                    // decorrelation comes purely from the seed.
+                    let mut wb = base.clone();
+                    if per_core {
+                        if let Shape::Jitter { seed, .. } = &mut wb.shape {
+                            *seed = crucible_core::rng::hash2(*seed, core as u64);
+                        }
+                    }
+                    scope.spawn(move || run_one(core, label_ref, &wb, stop, markers))
+                })
                 .collect();
             // A panicked worker must not silently vanish into a zeroed result —
             // count it as an error so the verdict reflects it.

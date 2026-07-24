@@ -437,8 +437,9 @@ fn gpu_kernel_from(p: &Parsed, shape: Shape) -> Result<GpuKernel, String> {
         None => match shape {
             // ~50 ms/dispatch on an RTX 3070: maximum sustained power.
             Shape::Steady => 4096,
-            // ~6 ms/dispatch: fits inside a typical 20 ms ON window.
-            Shape::Burst { .. } => 256,
+            // ~6 ms/dispatch: fits inside a typical 20 ms ON window. Pulse and
+            // jitter want the same sharp-edged granularity as burst.
+            Shape::Burst { .. } | Shape::Pulse { .. } | Shape::Jitter { .. } => 256,
         },
     };
     if let Some(v) = p.get_u64("gpu-mb")? {
