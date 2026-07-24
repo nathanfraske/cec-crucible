@@ -34,6 +34,8 @@
 
 pub mod link;
 pub mod render;
+#[cfg(feature = "tensor")]
+pub mod tensor;
 pub mod vram;
 
 use std::time::Instant;

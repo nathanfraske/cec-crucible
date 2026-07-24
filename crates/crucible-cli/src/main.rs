@@ -71,6 +71,8 @@ const GPU_OPTS: &[&str] = &[
     "render-w",
     "render-h",
     "render-inst",
+    "tensor-tiles",
+    "tensor-iters",
 ];
 
 const USAGE: &str = "\
@@ -90,6 +92,7 @@ COMMANDS:
     vram                 Run the VRAM integrity test.            [--features gpu]
     link                 PCIe host<->device transfer + verify.   [--features gpu]
     render               Graphics pipeline: raster/TMU/ROP + verify. [--features gpu]
+    tensor               Tensor/matrix-core cmma stress + verify.  [--features tensor]
     run <profile>        See PROFILES below.
     version              Print version.
     help                 Print this help.
@@ -184,6 +187,10 @@ GPU OPTIONS (builds with --features gpu):
     --render-inst <N>    Mesh instances drawn per frame — the geometry/overdraw
                          knob (default 48). `render` exercises the rasterizer,
                          texture units and ROP the compute thrasher never touches.
+    --tensor-tiles <N>   Tensor: 16x16 output tiles / warps (default 4096).
+    --tensor-iters <N>   Tensor: cmma accumulations per warp per dispatch (default
+                         256). `tensor` drives the tensor cores via cooperative
+                         matrix (f16->f32) — needs a `--features tensor` build.
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -237,6 +244,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "vram" => cmd_vram(rest),
         "link" => cmd_link(rest),
         "render" => cmd_render(rest),
+        "tensor" => cmd_tensor(rest),
         "run" => cmd_run(rest),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -683,6 +691,76 @@ fn cmd_render(rest: &[String]) -> Result<u8, String> {
             kernel.width,
             kernel.height,
             kernel.instances
+        );
+        let budget = Budget {
+            duration: Duration::from_secs(seconds),
+            shape,
+            target_watts: None,
+            phase_epoch: None,
+            phase_offset: Duration::ZERO,
+        };
+        let mut runner = Runner::new(&p)?;
+        runner.single_stage(&kernel, &budget, &mode)
+    }
+}
+
+#[cfg(feature = "tensor")]
+fn tensor_kernel_from(p: &Parsed) -> Result<crucible_gpu::tensor::TensorKernel, String> {
+    let device = match p.get("gpu-device").unwrap_or("discrete") {
+        "discrete" => GpuDevice::Discrete(0),
+        "integrated" | "igpu" => GpuDevice::Integrated(0),
+        "default" => GpuDevice::Default,
+        other => {
+            return Err(format!(
+                "--gpu-device expects discrete|integrated|default, got '{other}'"
+            ))
+        }
+    };
+    let mut k = crucible_gpu::tensor::TensorKernel::new(device);
+    if let Some(v) = p.get_u64("tensor-tiles")? {
+        k.tiles = v.clamp(1, 1 << 20) as u32;
+    }
+    if let Some(v) = p.get_u64("tensor-iters")? {
+        k.iters = v.clamp(1, 1 << 20) as u32;
+    }
+    Ok(k)
+}
+
+/// Tensor / matrix-core load — a sustained cooperative-matrix (cmma) chain on the
+/// tensor cores (the one GPU unit the FMA thrasher can't reach), verified by
+/// same-device self-consistency. Forces the Vulkan/SPIR-V backend.
+fn cmd_tensor(rest: &[String]) -> Result<u8, String> {
+    #[cfg(not(feature = "tensor"))]
+    {
+        let _ = rest;
+        Err("the tensor test needs a build with `--features tensor`".to_string())
+    }
+    #[cfg(feature = "tensor")]
+    {
+        let p = Parsed::parse(rest, COMMON_BOOLS)?;
+        let mut allowed: Vec<&str> = vec![
+            "seconds",
+            "shape",
+            "burst-on",
+            "burst-off",
+            "device-id",
+            "out",
+            "no-report",
+            "json",
+            "help",
+        ];
+        allowed.extend_from_slice(GPU_OPTS);
+        allowed.extend_from_slice(SHAPE_OPTS);
+        p.reject_unknown(&allowed)?;
+
+        let seconds = seconds_arg(&p, 60)?;
+        let shape = shape_from(&p)?;
+        let kernel = tensor_kernel_from(&p)?;
+        let mode = format!(
+            "{} tensor {}tiles x{}",
+            shape.mode_str(),
+            kernel.tiles,
+            kernel.iters
         );
         let budget = Budget {
             duration: Duration::from_secs(seconds),

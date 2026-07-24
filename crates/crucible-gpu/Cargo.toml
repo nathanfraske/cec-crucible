@@ -30,8 +30,14 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
     "cuda-version-from-build-system",
     "fallback-dynamic-loading",
 ] }
+# f16 host type for the tensor (cmma) kernel; only pulled with `tensor`.
+half = { version = "2.5", optional = true, default-features = false }
 
 [features]
 # CUDA compute (the thrasher via CubeCL's CUDA runtime) needs NVRTC at runtime;
 # the cudarc transfer path (link test) does not. Both are gated here.
 cuda = ["cubecl/cuda", "dep:cudarc"]
+# Tensor-core test: enables CubeCL's Vulkan/SPIR-V backend (adds ash +
+# cubecl-spirv) so cooperative-matrix (cmma) maps to the tensor cores — the wgsl
+# backend cannot do mma. Proven f16->f32 bit-exact on the RTX 3070.
+tensor = ["cubecl/vulkan", "dep:half"]
