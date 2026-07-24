@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+# Standalone spike: prove a HAND-ROLLED OptiX host FFI (zero NVIDIA SDK source)
+# can reach a live OptiX device context against the already-installed driver, on
+# a machine with NO CUDA toolkit — the load-bearing de-risk for the OptiX path-
+# tracing test (Phase 2). Detached from the root workspace.
+[workspace]
+
+[package]
+name = "optix-ffi-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "optix-ffi-spike"
+path = "src/main.rs"
+
+[dependencies]
+# Driver-only CUDA (no toolkit / NVRTC), exactly as the suite's link path uses it,
+# to make the CUcontext OptiX binds to.
+cudarc = { version = "0.19", default-features = false, features = [
+    "driver",
+    "std",
+    "cuda-version-from-build-system",
+    "fallback-dynamic-loading",
+] }

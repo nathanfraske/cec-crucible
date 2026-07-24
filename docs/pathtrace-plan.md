@@ -11,8 +11,18 @@ hardware/maturity/licensing caveat or needs-a-spike.
 
 **Status:** Phase 1 (portable inline multi-bounce, §2) is **BUILT** — `pathtrace`
 command + `pathtrace.wgsl`, commit 8ac029c; determinism validated on the RTX 3070
-(PASS, 0 errors, 423 self-consistency verifications). Phase 2 (OptiX, §3) and
-Phase 3 (SER, §4) remain scoped-not-built.
+(PASS, 0 errors, 423 self-consistency verifications). **Phase 2 (OptiX) host FFI +
+denoiser DE-RISKED** on the bench (`spikes/optix-ffi`, no CUDA toolkit): a
+hand-rolled FFI (zero NVIDIA SDK source) reached a live `OptixDeviceContext` on
+driver 591.86, read `RTCORE_VERSION=20` (Ampere RT gen 2) from the hardware, and
+instantiated the AI Denoiser — whose own log reports `buffers: fp16, xmma/xmma-jit
+convolution`, i.e. **tensor-core** execution confirmed. The ABI-118 function table
+is exactly 60 entries; the brute-force size probe + the full offset map (module 12,
+program-group 24, pipeline 27, accel 33, sbt 48, launch 49, denoiser 52-54) are
+recorded for the build. **Remaining Phase-2 blocker: `nvcc` (CUDA toolkit) is not
+installed — needed at build time to compile the path-tracer device `.cu` → the
+committed PTX blob** (the target still needs nothing but the driver). Phase 3
+(SER, §4) remains scoped-not-built.
 
 ## 0. TL;DR
 
