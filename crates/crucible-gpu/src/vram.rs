@@ -21,6 +21,11 @@
 //!   pass wrote and lays down the next one in the same dispatch, so a cell is
 //!   rewritten immediately after being read — the property moving-inversion
 //!   testing depends on.
+//! * **Battery:** own-address, constant 0x00/0xFF/0xAA/0x55, checkerboard +
+//!   inverse, walking-ones / walking-zeros across every bit position, and a
+//!   seeded index-hash — all pure functions of the index. (The ordered March
+//!   tests are CPU-only: their fault sensitization needs strict address
+//!   ordering, which massively-parallel GPU execution destroys.)
 //! * **Chunked allocation.** VRAM is allocated as several buffers rather than
 //!   one, because storage-buffer binding size is limited (wgpu's default is
 //!   128 MiB) and because a failure read-back should cost one chunk, not the
@@ -43,17 +48,26 @@ use cubecl::wgpu::WgpuRuntime;
 use crate::GpuDevice;
 
 /// Pattern generators. Kept as small integers so they can be passed as runtime
-/// scalars and the same kernel serves every pattern.
+/// scalars and the same kernel serves every pattern. All are pure functions of
+/// the element index, which is what lets each GPU thread verify independently.
 const MODE_OWN_ADDRESS: u32 = 0;
 const MODE_CONSTANT: u32 = 1;
 const MODE_RANDOM: u32 = 2;
+/// A single 1 walking through the 32-bit word; `value` carries the step.
+const MODE_WALK_ONE: u32 = 3;
+/// A single 0 walking through an all-ones word; `value` carries the step.
+const MODE_WALK_ZERO: u32 = 4;
+/// Adjacent cells held at 0xAAAA.. / 0x5555..; `value` carries the phase (0/1).
+const MODE_CHECKER: u32 = 5;
+
+const WORD_BITS: u32 = 32;
 
 /// Expected content of element `i` under a given pattern — the single source of
 /// truth, mirrored on the host by [`expected_host`].
 #[cube]
 fn expected_value(i: usize, mode: u32, value: u32, seed: u32) -> u32 {
     let idx = u32::cast_from(i);
-    let mut out = value;
+    let mut out = value; // MODE_CONSTANT default
     if mode == MODE_OWN_ADDRESS {
         // Catches address-decode faults: every cell holds its own address.
         out = idx;
@@ -65,12 +79,24 @@ fn expected_value(i: usize, mode: u32, value: u32, seed: u32) -> u32 {
         z = (z ^ (z >> 15)) * 0x846c_a68bu32;
         z = z ^ (z >> 16);
         out = z;
+    } else if mode == MODE_WALK_ONE {
+        // Isolated single set bit — the hardest bit to drive; targets data-line
+        // coupling. The (idx + step) offset gives a diagonal so neighbours differ.
+        out = 1u32 << ((idx + value) % WORD_BITS);
+    } else if mode == MODE_WALK_ZERO {
+        out = !(1u32 << ((idx + value) % WORD_BITS));
+    } else if mode == MODE_CHECKER {
+        let mut c = 0xAAAA_AAAAu32;
+        if ((idx ^ value) & 1) != 0 {
+            c = 0x5555_5555u32;
+        }
+        out = c;
     }
     out
 }
 
 /// Host-side twin of [`expected_value`], for reporting what a failing cell
-/// should have held.
+/// should have held. Must stay bit-identical to the `#[cube]` version above.
 fn expected_host(i: usize, mode: u32, value: u32, seed: u32) -> u32 {
     let idx = i as u32;
     match mode {
@@ -80,6 +106,15 @@ fn expected_host(i: usize, mode: u32, value: u32, seed: u32) -> u32 {
             z = (z ^ (z >> 16)).wrapping_mul(0x7feb352d);
             z = (z ^ (z >> 15)).wrapping_mul(0x846ca68b);
             z ^ (z >> 16)
+        }
+        MODE_WALK_ONE => 1u32 << ((idx.wrapping_add(value)) % WORD_BITS),
+        MODE_WALK_ZERO => !(1u32 << ((idx.wrapping_add(value)) % WORD_BITS)),
+        MODE_CHECKER => {
+            if ((idx ^ value) & 1) != 0 {
+                0x5555_5555
+            } else {
+                0xAAAA_AAAA
+            }
         }
         _ => value,
     }
@@ -142,10 +177,12 @@ struct Step {
     label: &'static str,
 }
 
-/// The pattern chain. Each step verifies what the previous step wrote, so the
-/// complements (0x00/0xFF, 0xAA/0x55) form genuine moving inversions.
-fn battery(seed: u32) -> [Step; 6] {
-    [
+/// The pattern chain. Each step verifies what the previous step wrote and lays
+/// down the next, so consecutive complements (0x00/0xFF, 0xAA/0x55, checker
+/// phases) form genuine moving inversions. Walking-bit steps march an isolated
+/// 1 (then 0) through every bit position for data-line / isolated-bit coverage.
+fn battery(seed: u32) -> Vec<Step> {
+    let mut steps = vec![
         Step {
             mode: MODE_OWN_ADDRESS,
             value: 0,
@@ -177,12 +214,42 @@ fn battery(seed: u32) -> [Step; 6] {
             label: "const-55",
         },
         Step {
-            mode: MODE_RANDOM,
+            mode: MODE_CHECKER,
             value: 0,
-            seed,
-            label: "random",
+            seed: 0,
+            label: "checker",
         },
-    ]
+        Step {
+            mode: MODE_CHECKER,
+            value: 1,
+            seed: 0,
+            label: "checker-inv",
+        },
+    ];
+    // Walking ones then walking zeros across all bit positions.
+    for step in 0..WORD_BITS {
+        steps.push(Step {
+            mode: MODE_WALK_ONE,
+            value: step,
+            seed: 0,
+            label: "walk-one",
+        });
+    }
+    for step in 0..WORD_BITS {
+        steps.push(Step {
+            mode: MODE_WALK_ZERO,
+            value: step,
+            seed: 0,
+            label: "walk-zero",
+        });
+    }
+    steps.push(Step {
+        mode: MODE_RANDOM,
+        value: 0,
+        seed,
+        label: "random",
+    });
+    steps
 }
 
 /// Details of the first bad word found.

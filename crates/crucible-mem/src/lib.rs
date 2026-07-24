@@ -12,6 +12,14 @@
 //! * **moving inversions** over `0x00`, `0xFF`, `0xAA`, `0x55` fills — write a
 //!   pattern, verify + write its complement ascending, verify + rewrite
 //!   descending (catches stuck/coupled bits);
+//! * **checkerboard** and its inverse (adjacent-cell complement stress);
+//! * **walking ones / walking zeros** — an isolated set/clear bit marched
+//!   through every position (isolated-bit drive strength, data-line coupling);
+//! * **March C- (10N)** — the classic ordered ascending/descending
+//!   read-modify-write march, which *isolates* transition faults from coupling
+//!   faults in a way the parallel-friendly patterns above cannot;
+//! * **modulo-20** — one cell in twenty holds `P` amid `!P` neighbours (isolated
+//!   coupling + cache-masking defeat);
 //! * **seeded pseudo-random** — fill from a SplitMix64 stream, then re-seed and
 //!   verify (catches data-dependent instability).
 //!
@@ -259,6 +267,20 @@ fn run_battery(base: usize, buf: &mut [u64], stop: &StopFlag, deadline: Instant)
                 break 'outer;
             }
         }
+        if !scan.checkerboard(buf) {
+            break 'outer;
+        }
+        if !scan.walking(buf) {
+            break 'outer;
+        }
+        // March C- and modulo-20 add ordered / isolated-cell coupling coverage
+        // the parallel patterns above cannot.
+        if !scan.march_c_minus(buf) {
+            break 'outer;
+        }
+        if !scan.modulo20(buf) {
+            break 'outer;
+        }
         let seed = 0xC0FF_EE00_u64
             .wrapping_add(cycles.wrapping_mul(0x9E37_79B9_7F4A_7C15))
             .wrapping_add(base as u64);
@@ -447,6 +469,194 @@ impl<'a> Scan<'a> {
         }
         true
     }
+
+    /// Fill every cell from `f`, then read back and verify against `f`. Two full
+    /// passes so the verify actually reaches DRAM rather than cache. `f` takes
+    /// the cell's *absolute* word index.
+    fn fill_verify(
+        &mut self,
+        buf: &mut [u64],
+        label: &'static str,
+        f: impl Fn(usize) -> u64,
+    ) -> bool {
+        let n = buf.len();
+        let mut i = 0;
+        while i < n {
+            let end = (i + CHECK_STRIDE).min(n);
+            for (off, cell) in buf[i..end].iter_mut().enumerate() {
+                *cell = f(self.base + i + off);
+            }
+            self.bytes += ((end - i) as u64) * 8;
+            if self.interrupted() {
+                return false;
+            }
+            i = end;
+        }
+        i = 0;
+        while i < n {
+            let end = (i + CHECK_STRIDE).min(n);
+            for j in i..end {
+                let want = f(self.base + j);
+                let got = buf[j];
+                self.checksum = self.checksum.wrapping_add(got);
+                if got != want {
+                    self.record(buf, j, want, got, label);
+                }
+            }
+            self.bytes += ((end - i) as u64) * 8;
+            if self.interrupted() {
+                return false;
+            }
+            i = end;
+        }
+        true
+    }
+
+    /// Checkerboard and its inverse: physically-adjacent cells held at opposite
+    /// values at once (best-effort — logical index adjacency only). Complement
+    /// pair, so it is also a moving inversion.
+    fn checkerboard(&mut self, buf: &mut [u64]) -> bool {
+        const A: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        const B: u64 = 0x5555_5555_5555_5555;
+        self.fill_verify(buf, "checker", |idx| if idx & 1 == 0 { A } else { B })
+            && self.fill_verify(buf, "checker-inv", |idx| if idx & 1 == 0 { B } else { A })
+    }
+
+    /// Walking ones then walking zeros: an isolated set (then clear) bit marches
+    /// through every bit position. The `+ step` offset makes neighbouring cells
+    /// carry the bit in adjacent positions (a diagonal), so a single pass covers
+    /// all 64 positions across the buffer; two steps add coupling variety.
+    fn walking(&mut self, buf: &mut [u64]) -> bool {
+        for step in [0usize, 32] {
+            if !self.fill_verify(buf, "walk-one", |idx| 1u64 << ((idx + step) % 64)) {
+                return false;
+            }
+        }
+        for step in [0usize, 32] {
+            if !self.fill_verify(buf, "walk-zero", |idx| !(1u64 << ((idx + step) % 64))) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Modulo-20: one cell in twenty holds `P` while the other nineteen hold
+    /// `!P`, cycling which residue is the odd one out. Isolated-cell coupling
+    /// plus cache/write-buffer masking defeat. A subset of residues is sampled
+    /// to keep it bounded (full 0..20 would be 20 passes each).
+    fn modulo20(&mut self, buf: &mut [u64]) -> bool {
+        for p in [0u64, u64::MAX] {
+            for r in [0usize, 5, 10, 15] {
+                if !self.fill_verify(buf, "modulo20", |idx| if idx % 20 == r { p } else { !p }) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// March C- (10N): the classic ordered march. Its ascending-then-descending
+    /// read-modify-write elements *isolate* transition faults (verified in place)
+    /// from coupling faults in a way the parallel-friendly moving-inversions
+    /// cannot. `0` = all-zero words, `1` = all-one words. Block-stride preserves
+    /// global address order, which the march depends on.
+    fn march_c_minus(&mut self, buf: &mut [u64]) -> bool {
+        const P0: u64 = 0x0000_0000_0000_0000;
+        const P1: u64 = u64::MAX;
+        self.fill(buf, P0)
+            && self.march(buf, true, P0, P1, "march-up-r0w1")
+            && self.march(buf, true, P1, P0, "march-up-r1w0")
+            && self.march(buf, false, P0, P1, "march-dn-r0w1")
+            && self.march(buf, false, P1, P0, "march-dn-r1w0")
+            && self.verify_all(buf, P0, "march-r0")
+    }
+
+    /// Block-stride fill (write pass only).
+    fn fill(&mut self, buf: &mut [u64], p: u64) -> bool {
+        let n = buf.len();
+        let mut i = 0;
+        while i < n {
+            let end = (i + CHECK_STRIDE).min(n);
+            buf[i..end].fill(p);
+            self.bytes += ((end - i) as u64) * 8;
+            if self.interrupted() {
+                return false;
+            }
+            i = end;
+        }
+        true
+    }
+
+    /// One march element: in strict `ascending`/descending order, verify each
+    /// cell holds `expect` then immediately write `write`.
+    fn march(
+        &mut self,
+        buf: &mut [u64],
+        ascending: bool,
+        expect: u64,
+        write: u64,
+        label: &'static str,
+    ) -> bool {
+        let n = buf.len();
+        if ascending {
+            let mut i = 0;
+            while i < n {
+                let end = (i + CHECK_STRIDE).min(n);
+                for j in i..end {
+                    let got = buf[j];
+                    if got != expect {
+                        self.record(buf, j, expect, got, label);
+                    }
+                    buf[j] = write;
+                }
+                self.bytes += ((end - i) as u64) * 8;
+                if self.interrupted() {
+                    return false;
+                }
+                i = end;
+            }
+        } else {
+            let mut done = n;
+            while done > 0 {
+                let start = done.saturating_sub(CHECK_STRIDE);
+                for j in (start..done).rev() {
+                    let got = buf[j];
+                    if got != expect {
+                        self.record(buf, j, expect, got, label);
+                    }
+                    buf[j] = write;
+                }
+                self.bytes += ((done - start) as u64) * 8;
+                if self.interrupted() {
+                    return false;
+                }
+                done = start;
+            }
+        }
+        true
+    }
+
+    /// Read pass: verify every cell holds `p`.
+    fn verify_all(&mut self, buf: &mut [u64], p: u64, label: &'static str) -> bool {
+        let n = buf.len();
+        let mut i = 0;
+        while i < n {
+            let end = (i + CHECK_STRIDE).min(n);
+            for j in i..end {
+                let got = buf[j];
+                self.checksum = self.checksum.wrapping_add(got);
+                if got != p {
+                    self.record(buf, j, p, got, label);
+                }
+            }
+            self.bytes += ((end - i) as u64) * 8;
+            if self.interrupted() {
+                return false;
+            }
+            i = end;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -516,6 +726,34 @@ mod tests {
         let mut scan = Scan::new(0, &stop, Instant::now() + Duration::from_secs(60));
         assert!(scan.random(&mut buf, 0xABCD));
         assert_eq!(scan.errors, 0);
+    }
+
+    #[test]
+    fn new_batteries_are_clean_on_healthy_memory() {
+        // fill_verify uses one closure for both fill and check, so the new
+        // walking / checkerboard / modulo-20 patterns must never self-mismatch.
+        let mut buf = vec![0u64; 4096];
+        let stop = StopFlag::new();
+        let mut scan = Scan::new(100, &stop, Instant::now() + Duration::from_secs(60));
+        assert!(scan.checkerboard(&mut buf));
+        assert!(scan.walking(&mut buf));
+        assert!(scan.modulo20(&mut buf));
+        assert!(scan.march_c_minus(&mut buf));
+        assert_eq!(scan.errors, 0, "new batteries produced a false miscompare");
+    }
+
+    #[test]
+    fn march_element_catches_mismatch() {
+        // A march element reading `expect` from cells that hold something else
+        // must record every mismatch — this guards the ordered read/write path.
+        let mut buf = vec![0u64; 512]; // all zero
+        let stop = StopFlag::new();
+        let mut scan = Scan::new(0, &stop, Instant::now() + Duration::from_secs(60));
+        // Expect all-ones but the buffer is all-zero: every cell mismatches.
+        assert!(scan.march(&mut buf, true, u64::MAX, 0, "test"));
+        assert_eq!(scan.errors, 512);
+        // And it wrote 0 (the `write` value) — buffer unchanged here, all zero.
+        assert!(buf.iter().all(|&w| w == 0));
     }
 
     #[test]
