@@ -32,7 +32,10 @@
 //!
 //! Either failure sets `error_count > 0`, which the report rolls up to FAIL.
 
+pub(crate) mod geom;
 pub mod link;
+#[cfg(feature = "optix")]
+pub mod optix;
 #[cfg(all(windows, feature = "preview"))]
 pub mod preview;
 pub mod render;

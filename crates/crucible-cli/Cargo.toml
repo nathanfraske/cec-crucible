@@ -36,6 +36,9 @@ gpu-gltf = ["gpu", "crucible-gpu/gpu-gltf"]
 # is needed on the build or target machine. Implies gpu.
 #   cargo build --release -p crucible-cli --features rt
 rt = ["gpu", "crucible-gpu/rt"]
+# OptiX NVIDIA-native path tracer (RT + SM). Driver-resident, NVIDIA-only.
+#   CUDARC_CUDA_VERSION=13030 cargo build --release -p crucible-cli --features optix
+optix = ["gpu", "crucible-gpu/optix"]
 # Live-preview window for `render --preview` (Windows-only). Implies gpu.
 #   cargo build --release -p crucible-cli --features preview
 preview = ["gpu", "crucible-gpu/preview"]

@@ -78,6 +78,8 @@ const GPU_OPTS: &[&str] = &[
     "rt-iters",
     "pt-samples",
     "pt-bounces",
+    "optix-samples",
+    "optix-bounces",
 ];
 
 const USAGE: &str = "\
@@ -100,6 +102,7 @@ COMMANDS:
     tensor               Tensor/matrix-core cmma stress + verify.  [--features tensor]
     rt                   Ray-tracing-core (BVH traversal) + verify. [--features rt]
     pathtrace            Multi-bounce path tracer (deep/divergent RT+SM). [--features rt]
+    optix                NVIDIA-native OptiX path tracer (RT+SM).   [--features optix]
     run <profile>        See PROFILES below.
     version              Print version.
     help                 Print this help.
@@ -215,6 +218,12 @@ GPU OPTIONS (builds with --features gpu):
                          path tracer — the deep, divergent RT-core + SM stress
                          beyond `rt`. `--preview` shows the live GI render.
                          Needs a `--features rt` build.
+    --optix-samples <N>  OptiX: paths per pixel per launch (default 16).
+    --optix-bounces <N>  OptiX: max path depth / bounces (default 8).
+                         `optix` is the NVIDIA-native path tracer on the OptiX
+                         ray-tracing pipeline (driver-resident, NVIDIA-only),
+                         deterministic + self-consistency verified. Needs a
+                         `--features optix` build.
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -271,6 +280,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "tensor" => cmd_tensor(rest),
         "rt" => cmd_rt(rest),
         "pathtrace" => cmd_pathtrace(rest),
+        "optix" => cmd_optix(rest),
         "run" => cmd_run(rest),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -939,6 +949,77 @@ fn cmd_pathtrace(rest: &[String]) -> Result<u8, String> {
         let kernel = pathtrace_kernel_from(&p)?;
         let mode = format!(
             "{} pathtrace {}spp x{}bounce",
+            shape.mode_str(),
+            kernel.samples,
+            kernel.bounces
+        );
+        let budget = Budget {
+            duration: Duration::from_secs(seconds),
+            shape,
+            target_watts: None,
+            phase_epoch: None,
+            phase_offset: Duration::ZERO,
+        };
+        let mut runner = Runner::new(&p)?;
+        runner.single_stage(&kernel, &budget, &mode)
+    }
+}
+
+#[cfg(feature = "optix")]
+fn optix_kernel_from(p: &Parsed) -> Result<crucible_gpu::optix::OptixKernel, String> {
+    let device = match p.get("gpu-device").unwrap_or("discrete") {
+        "discrete" => GpuDevice::Discrete(0),
+        "integrated" | "igpu" => GpuDevice::Integrated(0),
+        "default" => GpuDevice::Default,
+        other => {
+            return Err(format!(
+                "--gpu-device expects discrete|integrated|default, got '{other}'"
+            ))
+        }
+    };
+    let mut k = crucible_gpu::optix::OptixKernel::new(device);
+    if let Some(v) = p.get_u64("optix-samples")? {
+        k.samples = v.clamp(1, 1 << 16) as u32;
+    }
+    if let Some(v) = p.get_u64("optix-bounces")? {
+        k.bounces = v.clamp(1, 64) as u32;
+    }
+    Ok(k)
+}
+
+/// OptiX NVIDIA-native path tracer — a multi-bounce Monte-Carlo path tracer on the
+/// OptiX ray-tracing pipeline (driver-resident; NVIDIA-only). Deterministic,
+/// verified by same-device self-consistency. The device kernel ships as committed
+/// PTX (JIT-linked by the driver), so the target needs only the NVIDIA driver.
+fn cmd_optix(rest: &[String]) -> Result<u8, String> {
+    #[cfg(not(feature = "optix"))]
+    {
+        let _ = rest;
+        Err("the optix test needs a build with `--features optix` (NVIDIA only)".to_string())
+    }
+    #[cfg(feature = "optix")]
+    {
+        let p = Parsed::parse(rest, COMMON_BOOLS)?;
+        let mut allowed: Vec<&str> = vec![
+            "seconds",
+            "shape",
+            "burst-on",
+            "burst-off",
+            "device-id",
+            "out",
+            "no-report",
+            "json",
+            "help",
+        ];
+        allowed.extend_from_slice(GPU_OPTS);
+        allowed.extend_from_slice(SHAPE_OPTS);
+        p.reject_unknown(&allowed)?;
+
+        let seconds = seconds_arg(&p, 60)?;
+        let shape = shape_from(&p)?;
+        let kernel = optix_kernel_from(&p)?;
+        let mode = format!(
+            "{} optix {}spp x{}bounce",
             shape.mode_str(),
             kernel.samples,
             kernel.bounces

@@ -74,6 +74,12 @@ gpu-gltf = ["dep:gltf"]
 # shader compiler is required on the build or target machine.
 #   cargo build --release -p crucible-cli --features rt
 rt = ["dep:ash", "dep:gpu-allocator", "dep:naga"]
+# OptiX NVIDIA-native path tracer (RT + SM). Driver-resident OptiX via a
+# hand-rolled FFI + the committed device PTX; CUDA context/memory via cudarc
+# (driver-only). NVIDIA-only. Build needs CUDARC_CUDA_VERSION set (or nvcc on
+# PATH) since cudarc detects the CUDA version at build.
+#   CUDARC_CUDA_VERSION=13030 cargo build --release -p crucible-cli --features optix
+optix = ["dep:cudarc"]
 # Live-preview window for the `render` kernel (`render --preview`). Windows-only
 # (hand-rolled Win32 window); mirrors the offscreen frame to a swapchain, so the
 # verified bytes are unchanged from a headless run.
