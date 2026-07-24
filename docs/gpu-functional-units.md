@@ -48,10 +48,54 @@ pipeline — the pipeline only changes shader scheduling — so inline query is 
   DXR spec]** committed closest-hit over opaque triangles is deterministic on
   fixed hardware; **not** cross-vendor bit-identical (watertight, but `t`/
   barycentric LSBs differ) — same stance as `render`.
-- **[GATED]** Recommendation: stage in `spikes/` (as with `gpu-3a`), promote to a
-  shipped kernel when the trigger fires — **wgpu drops the `EXPERIMENTAL_` prefix,
-  or `EXPERIMENTAL_RAY_QUERY` gains DX12** (neither has happened as of wgpu v30).
-  No Cargo change needed to prototype (the `vulkan` wgpu feature is already on).
+### RT path decision — four options (both agents, cross-checked)
+
+Deeper research (NVIDIA OptiX + AMD/Intel native) reframed this. The wgpu path is
+the *easiest* but the *least stable*; there are three stable alternatives:
+
+| Path | Vendors | OS | Stable? | Runtime | Rust | Effort |
+|---|---|---|---|---|---|---|
+| **wgpu `EXPERIMENTAL_RAY_QUERY`** | all 3 | Win+Linux | ❌ "major bugs / breaking" | driver | in-tree (wgpu) | **low** (a kernel) |
+| **raw `ash` `VK_KHR_ray_query`** | all 3 | Win+Linux | ✅ ratified 2020 | driver (ship SPIR-V) | `ash` 0.38 | high (hand Vulkan) |
+| **DXR 1.1 inline RayQuery** | all 3 | **Win only** | ✅ stable | driver (ship DXIL) | `windows` crate | high (d3d12 FFI) |
+| **OptiX** | **NVIDIA only** | Win+Linux | ✅ battle-tested | driver (`nvoptix.dll`) | hand-roll FFI | high (~1.5–3 wk) |
+
+- **OptiX [FACT, verified]: GO for a public-MIT, driver-only, runtime-dispatched
+  kernel — with one rule.** Since OptiX 7 the runtime lives *in the driver*
+  (`nvoptix.dll`, min R435; use OptiX 9 / R570 for Blackwell); device programs
+  AOT-compile to PTX at build (nvcc) and the driver JITs to SASS at runtime — **no
+  NVRTC, no toolkit, no SDK on the target**, exactly the cudarc philosophy. Ship a
+  committed `compute_50` PTX (`include_bytes!`). **License:** a *compiled binary*
+  built with OptiX is royalty-free redistributable (commercial or OSS), **but you
+  may not commit NVIDIA's SDK headers as source** — so **hand-roll the FFI**
+  (~15 fns / ~20 structs; declare the function table, `LoadLibrary` the driver) and
+  the repo carries zero NVIDIA source, sidestepping the license question entirely.
+  No maintained Rust crate exists (`optix` is 2019/OptiX-5; `optix-sys`
+  unpublished). 3070 (Ampere, RT v2.0) and 5090 (Blackwell, 4th-gen RT) both fine.
+- **AMD/Intel native [FACT]:** AMD **HIPRT** is real + MIT + hits the Ray
+  Accelerators + runtime-dispatchable, but has **no Rust bindings** (hand FFI +
+  bundled bitcode) and DXR/Vulkan already drive the same units — not worth it
+  unless stressing AMD's own traversal stack is a goal. Intel **Embree-GPU** is
+  **unreachable from Rust** (SYCL-C++ only). So AMD/Intel RT = DXR or `ash`-Vulkan.
+- **Determinism [FACT]:** no formal OptiX/RT bitwise guarantee, but the *committed
+  closest hit* is deterministic on fixed HW+driver. Design the check as: each ray
+  writes `{primitive_id, bitcast(t)}` to a per-ray buffer → reduce in **fixed host
+  order** → hash; **self-consistency, not a repo-baked golden** (AS layout + SASS
+  vary across driver/GPU). Avoid any-hit-order-dependent logic and cross-thread
+  float atomics. Same stance as `render`.
+
+**Recommendation:** the strategic winner is **raw `ash` `VK_KHR_ray_query`** — one
+*stable*, cross-vendor, cross-OS, driver-only implementation covers the whole bench
+(NVIDIA now, AMD/Intel later) for effort comparable to OptiX, whereas OptiX is
+NVIDIA-only (choosing it means writing a *second* RT path for other vendors
+anyway). Use **wgpu** only for a throwaway prototype (in-tree, but pin it and
+expect breakage); add **OptiX** only if stressing NVIDIA's OptiX driver-compiler
+stack is itself a QC goal. **Cross-check status:** the wgpu claims were verified
+verbatim against the pinned `wgpu-types-29.0.4` source; the OptiX/`ash`/HIPRT/Embree
+facts are agent-cited to current primary docs (OptiX 8.1 guide, Khronos, crates.io)
+and one agent self-corrected the HIPRT license by reading the raw `license.txt` —
+but the OptiX EULA + `ash` ray-query API should get a direct read before we commit
+code (moot for OptiX if we hand-roll and vendor nothing).
 
 ## 2. Tensor / matrix cores (`tensor`)
 
