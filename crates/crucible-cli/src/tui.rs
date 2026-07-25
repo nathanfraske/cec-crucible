@@ -290,16 +290,17 @@ fn draw_core_grid(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Thermal heatmap ramp for a core by its normalised load: a neutral slate at
-/// idle → amber → harsh red when hot. Reads as "how loaded" the way a thermal
-/// gradient does, which is what makes a load heatmap legible at a glance.
+/// Heatmap ramp for a core by its normalised load: a neutral bluish slate at idle
+/// → amber → CEC pink when hot. The amber midpoint bridges the cool idle and the
+/// warm brand pink, so it reads as a smooth thermal-ish gradient rather than a
+/// gray→pink clash — on-brand but still legible as "how loaded".
 fn core_heat(frac: f64) -> Color {
     let f = frac.clamp(0.0, 1.0);
-    // neutral (78,84,104) → amber (242,166,24) → red (238,11,42)
+    // neutral (78,84,104) → amber (242,166,24) → pink (237,35,152)
     let (a, b, t) = if f < 0.5 {
         ([78.0, 84.0, 104.0], [242.0, 166.0, 24.0], f * 2.0)
     } else {
-        ([242.0, 166.0, 24.0], [238.0, 11.0, 42.0], (f - 0.5) * 2.0)
+        ([242.0, 166.0, 24.0], [237.0, 35.0, 152.0], (f - 0.5) * 2.0)
     };
     let lerp = |i: usize| (a[i] + (b[i] - a[i]) * t) as u8;
     Color::Rgb(lerp(0), lerp(1), lerp(2))
