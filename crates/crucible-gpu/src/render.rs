@@ -79,6 +79,13 @@ pub struct RenderKernel {
     /// Pop a live window mirroring the render (needs a `--features preview`,
     /// Windows-only build; ignored otherwise). Never affects verification.
     pub preview: bool,
+    /// Full-rate graphics benchmark mode. When set (and built windows+preview),
+    /// `run` ignores the resolution / instance / scene fields above, renders a
+    /// fixed standardized scene, presents every frame at full rate (vsync off)
+    /// and reports a frame-pacing SCORE in the result detail. The normal render
+    /// path is used unchanged when this is `false` (the default). Settable
+    /// directly; see [`RenderKernel::into_benchmark`].
+    pub benchmark: bool,
 }
 
 impl Default for RenderKernel {
@@ -91,6 +98,7 @@ impl Default for RenderKernel {
             verify_every: 32,
             scene: SceneSource::Procedural,
             preview: false,
+            benchmark: false,
         }
     }
 }
@@ -101,6 +109,14 @@ impl RenderKernel {
             device,
             ..Default::default()
         }
+    }
+
+    /// Turn this kernel into a benchmark run (fixed standardized workload, full-
+    /// rate present, frame-pacing score). Convenience for callers that already
+    /// have a `RenderKernel`; equivalent to setting `.benchmark = true`.
+    pub fn into_benchmark(mut self) -> Self {
+        self.benchmark = true;
+        self
     }
 
     fn power_preference(&self) -> wgpu::PowerPreference {
@@ -771,7 +787,9 @@ impl RenderGpu {
         #[cfg(all(windows, feature = "preview"))]
         let preview = match (preview_window.as_ref(), preview_surface) {
             (Some(_), Some(surface)) => {
-                match crate::preview::Presenter::new(&device, &adapter, surface, width, height) {
+                match crate::preview::Presenter::new(
+                    &device, &adapter, surface, width, height, k.benchmark,
+                ) {
                     Ok(p) => Some(p),
                     Err(e) => {
                         eprintln!("note: --preview disabled ({e}); running headless");
@@ -872,6 +890,25 @@ impl RenderGpu {
     #[cfg(not(all(windows, feature = "preview")))]
     #[inline]
     fn preview_tick(&self, _stop: &StopFlag) {}
+
+    /// Benchmark present: pump the window and present the just-rendered frame at
+    /// full rate — no ~60 Hz throttle — so present-to-present is the true frame
+    /// time. Requests stop if the window was closed. If the preview window could
+    /// not be opened (headless fallback) this is a no-op and the caller instead
+    /// times frame completions, which is valid because `frame` fully drains the
+    /// GPU each call. Only built on a windows+preview build.
+    #[cfg(all(windows, feature = "preview"))]
+    fn benchmark_present(&self, stop: &StopFlag) {
+        if let Some(win) = &self._window {
+            if !win.pump() {
+                stop.stop();
+                return;
+            }
+        }
+        if let Some(p) = &self.preview {
+            p.present_now(&self.device, &self.queue, &self.color_tex);
+        }
+    }
 
     /// Copy the colour target back and checksum it (over real pixels, skipping
     /// row padding). Returns `(hash, uniform)` where `uniform` means every pixel
@@ -992,6 +1029,187 @@ fn open_preview(
     }
 }
 
+/// The fixed, standardized benchmark workload — identical on every machine so
+/// scores are comparable. In benchmark mode these override the kernel's
+/// `width`/`height`/`instances` and force the built-in procedural scene, so a
+/// user's resolution, instance or `--scene` overrides cannot change what is
+/// measured. 1920×1080 is the reference resolution; the instance count sets a
+/// fixed amount of geometry/overdraw for the raster/TMU/ROP path.
+#[cfg(all(windows, feature = "preview"))]
+const BENCH_WIDTH: u32 = 1920;
+#[cfg(all(windows, feature = "preview"))]
+const BENCH_HEIGHT: u32 = 1080;
+#[cfg(all(windows, feature = "preview"))]
+const BENCH_INSTANCES: u32 = 64;
+
+#[cfg(all(windows, feature = "preview"))]
+impl RenderKernel {
+    /// Full-rate graphics benchmark — the foundation of a 3DMark-style score.
+    ///
+    /// Renders the fixed standardized scene (see [`BENCH_WIDTH`] et al.), presents
+    /// every frame at full rate with vsync off, and records present-to-present
+    /// frame times in a [`FrameTimer`](crate::frame_timer::FrameTimer). At the end
+    /// it reports a single normalized SCORE plus the pacing stats in the result
+    /// detail (`bench: score=… VALID …`), which flows into the JSON report and
+    /// results CSV with no schema change.
+    ///
+    /// **Error-gated.** The render is checksummed for self-consistency exactly as
+    /// the headless path is (liveness + first-frame reference). If *any*
+    /// verification error is seen — a miscompare, a blank frame, a lost device —
+    /// the result is reported `INVALID` with a score of 0: a benchmark measured
+    /// over wrong pixels is meaningless.
+    fn run_benchmark(&self, budget: &Budget, stop: &StopFlag, markers: &MarkerLog) -> LoadResult {
+        use crate::frame_timer::FrameTimer;
+
+        // Fixed standardized workload: override the user's resolution / instance /
+        // scene so every machine renders byte-identical frames, and force the
+        // preview on — the benchmark presents each frame (falling back to timing
+        // frame completions if the window cannot open).
+        let mut fixed = self.clone();
+        fixed.width = BENCH_WIDTH;
+        fixed.height = BENCH_HEIGHT;
+        fixed.instances = BENCH_INSTANCES;
+        fixed.scene = SceneSource::Procedural;
+        fixed.preview = true;
+
+        // Init + first frame under catch_unwind — a driver/shader-compile panic
+        // becomes a clean setup failure, never takes down the run.
+        let gpu = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            RenderGpu::init(&fixed)
+        })) {
+            Ok(Ok(g)) => g,
+            Ok(Err(e)) => return LoadResult::setup_failure(e),
+            Err(_) => {
+                return LoadResult::setup_failure(format!(
+                    "render benchmark init panicked for {}",
+                    self.device.label()
+                ))
+            }
+        };
+
+        let label = self.device.label();
+        let mut driver = ShapeDriver::start(budget, stop, markers, "render", "bench");
+        let start = Instant::now();
+
+        let mut timer = FrameTimer::new();
+        let mut frames: u64 = 0;
+        let mut verifications: u64 = 0;
+        let mut errors: u64 = 0;
+        let mut reference: Option<u64> = None;
+        // Short reason captured on the first (fatal) verification error, surfaced
+        // in the INVALID detail line.
+        let mut invalid_reason = String::new();
+        // Throttle for the (locking) live-status push — touched ~10x/s, not per
+        // frame. Seeded in the past so the first tick publishes immediately.
+        let mut last_note = Instant::now() - Duration::from_secs(1);
+
+        loop {
+            match driver.tick() {
+                Tick::Work => {
+                    if !gpu.frame() {
+                        errors += 1;
+                        invalid_reason = format!("device lost after {frames} frame(s)");
+                        break;
+                    }
+                    frames += 1;
+                    // Present at full rate, then stamp the present time — the
+                    // present-to-present delta is this frame's time.
+                    gpu.benchmark_present(stop);
+                    timer.present(Instant::now());
+
+                    // Throttled live status for the UI (no alloc when headless).
+                    if driver.live() && last_note.elapsed() >= Duration::from_millis(90) {
+                        last_note = Instant::now();
+                        driver.set_status(&format!(
+                            "bench: {}x{}\nfps: {:.0}",
+                            gpu.width,
+                            gpu.height,
+                            timer.fps()
+                        ));
+                    }
+
+                    if frames.is_multiple_of(self.verify_every) {
+                        match gpu.checksum() {
+                            Some((h, uniform)) => {
+                                verifications += 1;
+                                // Publish the live self-consistency checksum.
+                                driver.set_hash(h);
+                                match reference {
+                                    None => {
+                                        // Liveness: a uniform frame means nothing was drawn.
+                                        if uniform {
+                                            errors += 1;
+                                            invalid_reason =
+                                                "framebuffer uniform — nothing drawn".to_string();
+                                            break;
+                                        }
+                                        reference = Some(h);
+                                    }
+                                    Some(r) if r != h => {
+                                        errors += 1;
+                                        invalid_reason = format!(
+                                            "framebuffer miscompare at frame {frames} \
+                                             (got {h:#018x}, expected {r:#018x})"
+                                        );
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            None => {
+                                errors += 1;
+                                invalid_reason = "read-back failed (device lost)".to_string();
+                                break;
+                            }
+                        }
+                        // The verify read-back stalls this frame; break the
+                        // interval so the stall is never sampled as a frame time.
+                        timer.interrupt();
+                    }
+                }
+                // Keep the window responsive through idle phases of a burst/pulse
+                // shape; an off-phase gap must not be timed as a frame.
+                Tick::Idle => {
+                    gpu.benchmark_present(stop);
+                    timer.interrupt();
+                }
+                Tick::Stop => break,
+            }
+        }
+
+        let stats = timer.stats();
+        // A benchmark result is valid only if the render verified clean and we
+        // actually measured frames.
+        let valid = errors == 0 && verifications > 0 && stats.frames > 0;
+        let detail = if valid {
+            format!("{label} {}", stats.detail_valid())
+        } else {
+            if invalid_reason.is_empty() {
+                invalid_reason = if verifications == 0 {
+                    format!("no frame verified in {:.1}s", start.elapsed().as_secs_f64())
+                } else {
+                    "no frames presented".to_string()
+                };
+            }
+            format!(
+                "{label} bench: score=0 INVALID ({invalid_reason}) frames={} verified={}",
+                stats.frames, verifications
+            )
+        };
+
+        // `ok=false` only when nothing was validated (mirrors the headless path);
+        // otherwise it ran, and `error_count` carries any verification failure
+        // through to the report's FAIL rollup.
+        LoadResult::new(
+            verifications > 0,
+            frames,
+            reference.unwrap_or(0),
+            errors,
+            detail,
+        )
+    }
+}
+
 impl LoadKernel for RenderKernel {
     fn name(&self) -> &str {
         "render"
@@ -1002,6 +1220,15 @@ impl LoadKernel for RenderKernel {
     }
 
     fn run(&self, budget: &Budget, stop: &StopFlag, markers: &MarkerLog) -> LoadResult {
+        // Full-rate benchmark is an opt-in, windows+preview-only path with its own
+        // fixed workload and scoring; the normal render below is left untouched.
+        #[cfg(all(windows, feature = "preview"))]
+        {
+            if self.benchmark {
+                return self.run_benchmark(budget, stop, markers);
+            }
+        }
+
         // Init + first frame under catch_unwind — a driver/shader-compile panic
         // becomes a clean setup failure, never takes down the run.
         let gpu = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -298,12 +298,19 @@ pub struct Presenter {
 impl Presenter {
     /// Configure the swapchain. `surface` must have been created from `window`'s
     /// raw handles; the caller guarantees the window outlives this Presenter.
+    ///
+    /// `benchmark` selects the present policy: the live preview prefers Mailbox
+    /// (non-blocking, drops stale frames — a smooth mirror), while the benchmark
+    /// forces `Immediate` (vsync off, every frame presented untorn-be-damned) so
+    /// that present-to-present is the true frame time. Both fall back to Fifo
+    /// only if the surface offers nothing better.
     pub fn new(
         device: &wgpu::Device,
         adapter: &wgpu::Adapter,
         surface: wgpu::Surface<'static>,
         width: u32,
         height: u32,
+        benchmark: bool,
     ) -> Result<Self, String> {
         let caps = surface.get_capabilities(adapter);
         if !caps.formats.contains(&PREVIEW_FORMAT) {
@@ -311,11 +318,22 @@ impl Presenter {
                 "surface does not support {PREVIEW_FORMAT:?} (preview needs a straight copy)"
             ));
         }
-        // Prefer a non-vsync mode so presenting never blocks the loop; our own
-        // ~60 Hz timer is what limits the present rate.
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        let has = |m: wgpu::PresentMode| caps.present_modes.contains(&m);
+        let present_mode = if benchmark {
+            // Benchmark: present every rendered frame with no vsync coalescing, so
+            // the loop's frame time is measured, not the display's refresh.
+            if has(wgpu::PresentMode::Immediate) {
+                wgpu::PresentMode::Immediate
+            } else if has(wgpu::PresentMode::Mailbox) {
+                wgpu::PresentMode::Mailbox
+            } else {
+                wgpu::PresentMode::Fifo
+            }
+        } else if has(wgpu::PresentMode::Mailbox) {
+            // Live preview: prefer a non-vsync mode so presenting never blocks the
+            // loop; our own ~60 Hz timer is what limits the present rate.
             wgpu::PresentMode::Mailbox
-        } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+        } else if has(wgpu::PresentMode::Immediate) {
             wgpu::PresentMode::Immediate
         } else {
             wgpu::PresentMode::Fifo
@@ -344,6 +362,8 @@ impl Presenter {
 
     /// If ~16 ms have elapsed, copy the finished colour target to the swapchain
     /// and present. Cheap no-op otherwise, so it is safe to call every frame.
+    /// This is the live-preview path — the ~60 Hz throttle keeps mirroring from
+    /// slowing the stress load.
     pub fn maybe_present(
         &self,
         device: &wgpu::Device,
@@ -354,7 +374,31 @@ impl Presenter {
             return;
         }
         self.last.set(Instant::now());
+        self.present_frame(device, queue, color_tex);
+    }
 
+    /// Present the finished colour target *now*, bypassing the ~60 Hz throttle —
+    /// the benchmark path, where every rendered frame must reach the swapchain so
+    /// present-to-present is the true frame time. Paired with `PresentMode::
+    /// Immediate` (see [`Presenter::new`]) so it does not block on vsync.
+    pub fn present_now(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        color_tex: &wgpu::Texture,
+    ) {
+        self.present_frame(device, queue, color_tex);
+    }
+
+    /// Copy the offscreen colour target into the current swapchain image and
+    /// present it. Shared by the throttled `maybe_present` and the unthrottled
+    /// `present_now`. A minimized / resized / lost surface reconfigures and skips.
+    fn present_frame(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        color_tex: &wgpu::Texture,
+    ) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
                 f

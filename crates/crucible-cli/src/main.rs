@@ -61,6 +61,7 @@ const COMMON_BOOLS: &[&str] = &[
     "preview",
     "csv",
     "telemetry-csv",
+    "benchmark",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -731,6 +732,9 @@ fn render_kernel_from(p: &Parsed) -> Result<crucible_gpu::render::RenderKernel, 
     // Live preview window (needs a --features preview, Windows build; otherwise a
     // no-op with a note). Never changes what gets verified.
     k.preview = p.has("preview");
+    // Full-rate graphics benchmark (fixed 1920x1080 scene, present every frame,
+    // vsync off → frame-pacing score). Overrides w/h/inst for comparability.
+    k.benchmark = p.has("benchmark");
     Ok(k)
 }
 
@@ -758,6 +762,7 @@ fn cmd_render(rest: &[String]) -> Result<u8, String> {
             "json",
             "help",
             "preview",
+            "benchmark",
         ];
         allowed.extend_from_slice(GPU_OPTS);
         allowed.extend_from_slice(SHAPE_OPTS);
@@ -773,13 +778,17 @@ fn cmd_render(rest: &[String]) -> Result<u8, String> {
             ),
             crucible_gpu::render::SceneSource::Procedural => String::new(),
         };
-        let mode = format!(
-            "{} render {}x{} x{}{scene_tag}",
-            shape.mode_str(),
-            kernel.width,
-            kernel.height,
-            kernel.instances
-        );
+        let mode = if kernel.benchmark {
+            format!("{} render BENCHMARK (1080p full-rate)", shape.mode_str())
+        } else {
+            format!(
+                "{} render {}x{} x{}{scene_tag}",
+                shape.mode_str(),
+                kernel.width,
+                kernel.height,
+                kernel.instances
+            )
+        };
         let budget = Budget {
             duration: Duration::from_secs(seconds),
             shape,
