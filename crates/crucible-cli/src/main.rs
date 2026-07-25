@@ -891,6 +891,8 @@ fn rt_kernel_from(p: &Parsed) -> Result<crucible_gpu::rt::RtKernel, String> {
     // Live window showing the shaded ray-traced image (needs a --features preview,
     // Windows build; otherwise a no-op with a note). Never changes verification.
     k.preview = p.has("preview");
+    // Benchmark mode: fixed standardized workload + a normalized throughput score.
+    k.benchmark = p.has("benchmark");
     Ok(k)
 }
 
@@ -918,6 +920,7 @@ fn cmd_rt(rest: &[String]) -> Result<u8, String> {
             "json",
             "help",
             "preview",
+            "benchmark",
         ];
         allowed.extend_from_slice(GPU_OPTS);
         allowed.extend_from_slice(SHAPE_OPTS);
@@ -926,7 +929,11 @@ fn cmd_rt(rest: &[String]) -> Result<u8, String> {
         let seconds = seconds_arg(&p, 60)?;
         let shape = shape_from(&p)?;
         let kernel = rt_kernel_from(&p)?;
-        let mode = format!("{} rt x{} traces", shape.mode_str(), kernel.iters);
+        let mode = if kernel.benchmark {
+            "rt BENCHMARK (fixed workload)".to_string()
+        } else {
+            format!("{} rt x{} traces", shape.mode_str(), kernel.iters)
+        };
         let budget = Budget {
             duration: Duration::from_secs(seconds),
             shape,
@@ -975,6 +982,8 @@ fn pathtrace_kernel_from(p: &Parsed) -> Result<crucible_gpu::rt::RtKernel, Strin
         };
     }
     k.preview = p.has("preview");
+    // Benchmark mode: fixed standardized workload + a normalized throughput score.
+    k.benchmark = p.has("benchmark");
     Ok(k)
 }
 
@@ -1003,6 +1012,7 @@ fn cmd_pathtrace(rest: &[String]) -> Result<u8, String> {
             "help",
             "preview",
             "material",
+            "benchmark",
         ];
         allowed.extend_from_slice(GPU_OPTS);
         allowed.extend_from_slice(SHAPE_OPTS);
@@ -1020,13 +1030,17 @@ fn cmd_pathtrace(rest: &[String]) -> Result<u8, String> {
             6 => "marble",
             _ => "metal",
         };
-        let mode = format!(
-            "{} pathtrace {} {}spp x{}bounce",
-            shape.mode_str(),
-            mat_name,
-            kernel.samples,
-            kernel.bounces
-        );
+        let mode = if kernel.benchmark {
+            "pathtrace BENCHMARK (fixed workload)".to_string()
+        } else {
+            format!(
+                "{} pathtrace {} {}spp x{}bounce",
+                shape.mode_str(),
+                mat_name,
+                kernel.samples,
+                kernel.bounces
+            )
+        };
         let budget = Budget {
             duration: Duration::from_secs(seconds),
             shape,

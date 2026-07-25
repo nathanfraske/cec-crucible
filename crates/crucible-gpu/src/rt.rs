@@ -98,7 +98,26 @@ pub struct RtKernel {
     /// Pop a live window showing the shaded image (needs a `--features preview`,
     /// Windows build; ignored otherwise). Never affects traversal or the checksum.
     pub preview: bool,
+    /// Benchmark mode: run the fixed standardized workload (see [`BENCH_ITERS`]
+    /// et al.), then report a normalized throughput SCORE in the result detail
+    /// (`bench: score=… VALID …`). Error-gated exactly like the stress path — any
+    /// miscompare or device-loss makes the result INVALID with no score.
+    pub benchmark: bool,
 }
+
+/// The fixed, standardized benchmark workload for the RT engines — identical on
+/// every machine so scores compare. The compute resolution is already fixed
+/// ([`WIDTH`]×[`HEIGHT`]); these pin the per-dispatch traversal load. The `SCALE`
+/// constants are calibrated so an RTX 3070 scores ~10000 on each engine, matching
+/// the `render` benchmark's reference, so the composite is balanced.
+const BENCH_ITERS: u32 = 192; // ray-query: traversals per ray per dispatch
+const BENCH_SAMPLES: u32 = 16; // path-trace: paths per pixel per dispatch
+const BENCH_BOUNCES: u32 = 8; // path-trace: max path depth
+/// Mray/s → score, calibrated so an RTX 3070 (the reference part) scores ~10000
+/// on each engine. Measured on the bench: rt ~4480 Mray/s, pathtrace ~9558
+/// Mray/s at the fixed workloads above.
+const SCALE_RAYQUERY: f64 = 10_000.0 / 4_480.0;
+const SCALE_PATHTRACE: f64 = 10_000.0 / 9_558.0;
 
 impl Default for RtKernel {
     fn default() -> Self {
@@ -111,6 +130,7 @@ impl Default for RtKernel {
             material: 0,
             verify_every: 64,
             preview: false,
+            benchmark: false,
         }
     }
 }
@@ -141,6 +161,45 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// Pull the `~<n> Mray/s` throughput back out of a normal RT run's detail.
+fn parse_mrays(detail: &str) -> Option<f64> {
+    let tail = detail.rsplit_once('~')?.1; // "<n> Mray/s"
+    tail.split_whitespace().next()?.parse().ok()
+}
+
+/// Convert a completed (fixed-workload) RT run into a normalized benchmark score.
+/// Error-gated: a run that did not verify clean scores 0 / INVALID — a benchmark
+/// measured over wrong pixels is meaningless. The score is `Mray/s · SCALE`, the
+/// SCALE calibrated so an RTX 3070 lands near 10000 on each engine.
+fn bench_score(mode: RtMode, res: LoadResult) -> LoadResult {
+    let name = match mode {
+        RtMode::RayQuery => "rt",
+        RtMode::PathTrace => "pathtrace",
+    };
+    if !res.ok || res.error_count > 0 {
+        return LoadResult::new(
+            res.ok,
+            res.iterations,
+            res.checksum,
+            res.error_count.max(1),
+            format!("{name} bench: score=0 INVALID ({})", res.detail),
+        );
+    }
+    let mrays = parse_mrays(&res.detail).unwrap_or(0.0);
+    let scale = match mode {
+        RtMode::RayQuery => SCALE_RAYQUERY,
+        RtMode::PathTrace => SCALE_PATHTRACE,
+    };
+    let score = (mrays * scale).round().max(0.0) as u64;
+    LoadResult::new(
+        true,
+        res.iterations,
+        res.checksum,
+        0,
+        format!("{name} bench: score={score} VALID mray_s={mrays:.0} {}", res.detail),
+    )
 }
 
 /// Uniform block handed to the shader. `repr(C)`, padded to 32 bytes so the
@@ -1422,6 +1481,20 @@ impl LoadKernel for RtKernel {
     }
 
     fn run(&self, budget: &Budget, stop: &StopFlag, markers: &MarkerLog) -> LoadResult {
+        // Benchmark mode: run the fixed standardized workload through the normal
+        // (verified) path with the benchmark flag cleared — avoiding recursion —
+        // then convert the clean result into a normalized throughput score.
+        if self.benchmark {
+            let mut fixed = self.clone();
+            fixed.benchmark = false;
+            fixed.iters = BENCH_ITERS;
+            fixed.samples = BENCH_SAMPLES;
+            fixed.bounces = BENCH_BOUNCES;
+            fixed.preview = false;
+            let res = fixed.run(budget, stop, markers);
+            return bench_score(self.mode, res);
+        }
+
         let label = self.device.label();
         let kname = self.name();
 
@@ -1703,5 +1776,28 @@ mod tests {
         assert_eq!(align_up(256, 256), 256);
         assert_eq!(align_up(257, 256), 512);
         assert_eq!(align_up(42, 1), 42);
+    }
+
+    #[test]
+    fn parse_mrays_reads_throughput() {
+        let d = "discrete0 vulkan-rt 256x256 x192 traces, 2849 dispatch(es), 44 verified, ~4480 Mray/s";
+        assert_eq!(parse_mrays(d), Some(4480.0));
+        assert_eq!(parse_mrays("no tilde here"), None);
+    }
+
+    #[test]
+    fn bench_score_calibrates_and_gates() {
+        // A clean run at the 3070 reference throughput scores ~10000.
+        let clean = LoadResult::new(true, 100, 0xabcd, 0, "… ~4480 Mray/s".to_string());
+        let scored = bench_score(RtMode::RayQuery, clean);
+        assert_eq!(scored.error_count, 0);
+        assert!(scored.detail.contains("VALID"));
+        assert!(scored.detail.contains("score=10000"), "detail: {}", scored.detail);
+
+        // Any verification error -> INVALID with no score, whatever the throughput.
+        let dirty = LoadResult::new(true, 100, 0, 3, "miscompare … ~9000 Mray/s".to_string());
+        let scored = bench_score(RtMode::PathTrace, dirty);
+        assert!(scored.error_count >= 1);
+        assert!(scored.detail.contains("score=0 INVALID"), "detail: {}", scored.detail);
     }
 }
