@@ -26,10 +26,10 @@ pub mod drives;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, StopFlag};
-use crucible_core::markers::{Event, MarkerLog};
+use crucible_core::markers::{Event, MarkerLog, PHASE_DONE, PHASE_WORK};
 
 /// Default scratch-file size when the caller does not specify one.
 pub const DEFAULT_FILE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
@@ -180,6 +180,12 @@ impl StorageKernel {
         let mut first_fail: Option<FailInfo> = None;
         let mut io_error: Option<String> = None;
 
+        // Live-UI lane (None unless a UI is attached); fed verbosely from the
+        // per-block checkpoints below so the dashboard shows the I/O in flight.
+        let lane = markers.register_lane("storage");
+        let mut last_note = Instant::now() - Duration::from_secs(1);
+        let dir_label = self.config.dir.display().to_string();
+
         'passes: loop {
             if stop.stopped() || Instant::now() >= deadline {
                 break;
@@ -199,10 +205,27 @@ impl StorageKernel {
                     break 'passes;
                 }
                 bytes_written += block_bytes as u64;
-                if (b & 0x3F) == 0 && (stop.stopped() || Instant::now() >= deadline) {
-                    // Interrupted mid-write: no verify for a partial pass.
-                    write_secs += w_start.elapsed().as_secs_f64();
-                    break 'passes;
+                if (b & 0x3F) == 0 {
+                    if let Some(l) = &lane {
+                        l.set_phase(PHASE_WORK);
+                        l.bump_work();
+                        let now = Instant::now();
+                        if now.duration_since(last_note) >= Duration::from_millis(90) {
+                            last_note = now;
+                            let secs = w_start.elapsed().as_secs_f64().max(1e-6);
+                            let mbps = ((b + 1) * block_bytes as u64) as f64 / secs / (1024.0 * 1024.0);
+                            let gib = bytes_written as f64 / (1024.0 * 1024.0 * 1024.0);
+                            l.set_detail(&format!(
+                                "mode: {io_mode}\nphase: WRITE\nrate: {mbps:.0} MB/s\nblock: {} KiB\npass: {pass}\nwritten: {gib:.2} GiB\ndir: {dir_label}",
+                                block_bytes / 1024
+                            ));
+                        }
+                    }
+                    if stop.stopped() || Instant::now() >= deadline {
+                        // Interrupted mid-write: no verify for a partial pass.
+                        write_secs += w_start.elapsed().as_secs_f64();
+                        break 'passes;
+                    }
                 }
             }
             // Flush to the device so the read-back reflects persisted data.
@@ -245,13 +268,33 @@ impl StorageKernel {
                         }
                     }
                 }
-                if (b & 0x3F) == 0 && (stop.stopped() || Instant::now() >= deadline) {
-                    read_secs += r_start.elapsed().as_secs_f64();
-                    break 'passes;
+                if (b & 0x3F) == 0 {
+                    if let Some(l) = &lane {
+                        l.bump_work();
+                        let now = Instant::now();
+                        if now.duration_since(last_note) >= Duration::from_millis(90) {
+                            last_note = now;
+                            let secs = r_start.elapsed().as_secs_f64().max(1e-6);
+                            let mbps = ((b + 1) * block_bytes as u64) as f64 / secs / (1024.0 * 1024.0);
+                            let gib = bytes_read as f64 / (1024.0 * 1024.0 * 1024.0);
+                            l.set_hash(checksum);
+                            l.set_detail(&format!(
+                                "mode: {io_mode}\nphase: VERIFY\nrate: {mbps:.0} MB/s\nerrors: {errors}\npass: {pass}\nverified: {gib:.2} GiB\ndir: {dir_label}"
+                            ));
+                        }
+                    }
+                    if stop.stopped() || Instant::now() >= deadline {
+                        read_secs += r_start.elapsed().as_secs_f64();
+                        break 'passes;
+                    }
                 }
             }
             read_secs += r_start.elapsed().as_secs_f64();
             pass += 1;
+        }
+        if let Some(l) = &lane {
+            l.set_hash(checksum);
+            l.set_phase(PHASE_DONE);
         }
 
         // Clean up the scratch file unless asked to keep it.
