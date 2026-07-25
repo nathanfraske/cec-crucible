@@ -44,6 +44,10 @@ mod tui;
 #[cfg(feature = "tui")]
 mod menu;
 
+// Opt-in PresentMon driver — Windows + presenting (gpu) only. No bundling.
+#[cfg(all(windows, feature = "gpu"))]
+mod presentmon;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Options accepted by (nearly) every command.
@@ -63,6 +67,7 @@ const COMMON_BOOLS: &[&str] = &[
     "csv",
     "telemetry-csv",
     "benchmark",
+    "presentmon",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -232,8 +237,9 @@ GPU OPTIONS (builds with --features gpu):
     --pt-samples <N>     Path-trace: paths per pixel per dispatch (default 16).
     --pt-bounces <N>     Path-trace: max path depth / bounces (default 8).
     --material <name>    Path-trace surface: metal (default), matte, plastic,
-                         mirror, glass, velvet, marble. Each is a distinct (still
-                         deterministic, self-verified) BSDF workload.
+                         mirror, glass, velvet, marble, fur. Each is a distinct
+                         (deterministic, self-verified) BSDF workload; fur is the
+                         heaviest / most divergent (an SM stressor).
                          `pathtrace` is a deterministic multi-bounce Monte-Carlo
                          path tracer — the deep, divergent RT-core + SM stress
                          beyond `rt`. `--preview` shows the live GI render.
@@ -244,6 +250,14 @@ GPU OPTIONS (builds with --features gpu):
                          ray-tracing pipeline (driver-resident, NVIDIA-only),
                          deterministic + self-consistency verified. Needs a
                          `--features optix` build.
+    --presentmon         (render) Also capture ETW frame data with an installed
+                         PresentMon (github.com/GameTechDev/PresentMon 2.x) — the
+                         *displayed* frames + compositor drops the app can't self-
+                         measure. Not bundled: found via --presentmon-path,
+                         CRUCIBLE_PRESENTMON, or PATH. Usually needs an elevated
+                         (admin) run for the ETW session; a `.presentmon.csv`
+                         lands in --out. Never fails the run if absent.
+    --presentmon-path <FILE>   Explicit path to PresentMon.exe for --presentmon.
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -767,6 +781,8 @@ fn cmd_render(rest: &[String]) -> Result<u8, String> {
             "help",
             "preview",
             "benchmark",
+            "presentmon",
+            "presentmon-path",
         ];
         allowed.extend_from_slice(GPU_OPTS);
         allowed.extend_from_slice(SHAPE_OPTS);
@@ -801,7 +817,80 @@ fn cmd_render(rest: &[String]) -> Result<u8, String> {
             phase_offset: Duration::ZERO,
         };
         let mut runner = Runner::new(&p)?;
-        runner.single_stage(&kernel, &budget, &mode)
+        // Optional PresentMon ETW capture wrapping the presenting run. Windows
+        // only; a no-op unless --presentmon is set and PresentMon is installed.
+        #[cfg(windows)]
+        let pm = start_presentmon(&p, seconds);
+        let out = runner.single_stage(&kernel, &budget, &mode);
+        #[cfg(windows)]
+        finish_presentmon(pm);
+        out
+    }
+}
+
+/// Locate + spawn a PresentMon capture bound to this process, writing its CSV
+/// beside the usual reports. Returns None (with a `note:`) if --presentmon is
+/// unset, PresentMon isn't found, or it fails to start — never fails the run.
+#[cfg(all(windows, feature = "gpu"))]
+fn start_presentmon(p: &Parsed, seconds: u64) -> Option<presentmon::Capture> {
+    if !p.has("presentmon") {
+        return None;
+    }
+    let exe = match presentmon::locate(p.get("presentmon-path")) {
+        Some(e) => e,
+        None => {
+            eprintln!(
+                "note: --presentmon set but PresentMon.exe not found — pass \
+                 --presentmon-path, set CRUCIBLE_PRESENTMON, or put it on PATH \
+                 (get it from github.com/GameTechDev/PresentMon). Continuing without \
+                 ETW capture."
+            );
+            return None;
+        }
+    };
+    let dir = match p.get("out") {
+        Some(d) => PathBuf::from(d),
+        None => default_out_dir(),
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let device = resolve_device(p);
+    let unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let csv = dir.join(format!("crucible-{}-{unix}.presentmon.csv", device.short_id));
+    match presentmon::Capture::start(&exe, csv, seconds) {
+        Ok(c) => {
+            eprintln!("presentmon: ETW capture via {}", exe.display());
+            Some(c)
+        }
+        Err(e) => {
+            eprintln!("note: PresentMon failed to start ({e}); continuing without ETW capture.");
+            None
+        }
+    }
+}
+
+/// Wait for a PresentMon capture to flush + report its CSV (with a one-line
+/// displayed-frame summary). A missing CSV almost always means the ETW session
+/// needed elevation.
+#[cfg(all(windows, feature = "gpu"))]
+fn finish_presentmon(pm: Option<presentmon::Capture>) {
+    if let Some(c) = pm {
+        match c.finish() {
+            Some(csv) => {
+                let extra = presentmon::summarize(&csv)
+                    .map(|s| format!(" — {s}"))
+                    .unwrap_or_default();
+                eprintln!("presentmon: {}{extra}", csv.display());
+            }
+            None => eprintln!(
+                "note: PresentMon produced no CSV — the ETW session likely needs an \
+                 elevated (admin) run."
+            ),
+        }
     }
 }
 
