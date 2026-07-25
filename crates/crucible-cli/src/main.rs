@@ -863,7 +863,11 @@ fn start_presentmon(p: &Parsed, seconds: u64) -> Option<presentmon::Capture> {
     let csv = dir.join(format!("crucible-{}-{unix}.presentmon.csv", device.short_id));
     match presentmon::Capture::start(&exe, csv, seconds) {
         Ok(c) => {
-            eprintln!("presentmon: ETW capture via {}", exe.display());
+            eprintln!(
+                "presentmon: ETW capture via {} (approve the UAC prompt if one appears — \
+                 the ETW session needs elevation)",
+                exe.display()
+            );
             Some(c)
         }
         Err(e) => {
@@ -881,14 +885,14 @@ fn finish_presentmon(pm: Option<presentmon::Capture>) {
     if let Some(c) = pm {
         match c.finish() {
             Some(csv) => {
-                let extra = presentmon::summarize(&csv)
-                    .map(|s| format!(" — {s}"))
-                    .unwrap_or_default();
-                eprintln!("presentmon: {}{extra}", csv.display());
+                if let Some(s) = presentmon::summarize(&csv) {
+                    println!("  {}", s.line());
+                }
+                eprintln!("presentmon: {}", csv.display());
             }
             None => eprintln!(
-                "note: PresentMon produced no CSV — the ETW session likely needs an \
-                 elevated (admin) run."
+                "note: PresentMon produced no CSV — the ETW session needs elevation \
+                 (approve the UAC prompt, or run cec-crucible from an admin shell)."
             ),
         }
     }
