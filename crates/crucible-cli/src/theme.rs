@@ -29,3 +29,5 @@ pub const CAT_CPU: Color = Color::Rgb(255, 190, 100);
 pub const CAT_GPU: Color = Color::Rgb(225, 130, 245);
 pub const CAT_PROFILE: Color = Color::Rgb(180, 160, 255);
 pub const FIRE: Color = Color::Rgb(240, 70, 60); // the FIRE button
+pub const FIRE_BG: Color = Color::Rgb(60, 16, 14); // FIRE button fill when focused
+pub const SEL_BG: Color = Color::Rgb(22, 40, 54); // selected-row bar (terminal only)
