@@ -740,7 +740,7 @@ mod tests {
         let mut buf = vec![0u64; 4096];
         let stop = StopFlag::new();
         let base = 1000;
-        let mut scan = Scan::new(base, &stop, Instant::now() + Duration::from_secs(60));
+        let mut scan = Scan::new(base, &stop, Instant::now() + Duration::from_secs(60), None);
         assert!(scan.own_address(&mut buf));
         assert_eq!(scan.errors, 0);
         // After the pass every cell holds its absolute word address — this is
@@ -756,7 +756,7 @@ mod tests {
         // wrong value before the verify sees it by using a custom sequence.
         let mut buf = vec![0u64; 1024];
         let stop = StopFlag::new();
-        let mut scan = Scan::new(0, &stop, Instant::now() + Duration::from_secs(60));
+        let mut scan = Scan::new(0, &stop, Instant::now() + Duration::from_secs(60), None);
         // Pre-corrupt: fill with 0xFF, but the kernel will fill with p=0 first,
         // so instead we test the verify math directly: fill p, poke, verify.
         buf.fill(0);
@@ -779,7 +779,7 @@ mod tests {
     fn random_pass_is_deterministic_and_clean() {
         let mut buf = vec![0u64; 8192];
         let stop = StopFlag::new();
-        let mut scan = Scan::new(0, &stop, Instant::now() + Duration::from_secs(60));
+        let mut scan = Scan::new(0, &stop, Instant::now() + Duration::from_secs(60), None);
         assert!(scan.random(&mut buf, 0xABCD));
         assert_eq!(scan.errors, 0);
     }
@@ -790,7 +790,7 @@ mod tests {
         // walking / checkerboard / modulo-20 patterns must never self-mismatch.
         let mut buf = vec![0u64; 4096];
         let stop = StopFlag::new();
-        let mut scan = Scan::new(100, &stop, Instant::now() + Duration::from_secs(60));
+        let mut scan = Scan::new(100, &stop, Instant::now() + Duration::from_secs(60), None);
         assert!(scan.checkerboard(&mut buf));
         assert!(scan.walking(&mut buf));
         assert!(scan.modulo20(&mut buf));
@@ -804,7 +804,7 @@ mod tests {
         // must record every mismatch — this guards the ordered read/write path.
         let mut buf = vec![0u64; 512]; // all zero
         let stop = StopFlag::new();
-        let mut scan = Scan::new(0, &stop, Instant::now() + Duration::from_secs(60));
+        let mut scan = Scan::new(0, &stop, Instant::now() + Duration::from_secs(60), None);
         // Expect all-ones but the buffer is all-zero: every cell mismatches.
         assert!(scan.march(&mut buf, true, u64::MAX, 0, "test"));
         assert_eq!(scan.errors, 512);
