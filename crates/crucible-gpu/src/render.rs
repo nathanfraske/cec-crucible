@@ -1256,6 +1256,12 @@ impl LoadKernel for RenderKernel {
         // frame. Seeded in the past so the first tick publishes immediately.
         let mut last_note = Instant::now() - Duration::from_secs(1);
 
+        // Flat-out frame-pacing over the whole run. The percentiles/stutter it
+        // yields reveal soak-time throttling that the average fps hides; the
+        // verify read-back stall and burst idle phases are interrupted so they
+        // never pollute the distribution. Stats are reduced once, at the end.
+        let mut ft = crate::frame_timer::FrameTimer::new();
+
         loop {
             match driver.tick() {
                 Tick::Work => {
@@ -1270,6 +1276,7 @@ impl LoadKernel for RenderKernel {
                         );
                     }
                     frames += 1;
+                    ft.present(Instant::now());
                     gpu.preview_tick(stop);
 
                     // Throttled live status for the UI (no alloc when headless).
@@ -1338,11 +1345,18 @@ impl LoadKernel for RenderKernel {
                                 );
                             }
                         }
+                        // The verify read-back stalls the loop; interrupt so the
+                        // stall is not recorded as one giant frame time.
+                        ft.interrupt();
                     }
                 }
                 // Keep the preview window responsive (and showing the last frame)
-                // through idle phases of a burst/pulse shape.
-                Tick::Idle => gpu.preview_tick(stop),
+                // through idle phases of a burst/pulse shape. The idle gap must not
+                // count as a frame, so break the pacing interval across it.
+                Tick::Idle => {
+                    ft.interrupt();
+                    gpu.preview_tick(stop);
+                }
                 Tick::Stop => break,
             }
         }
@@ -1358,14 +1372,25 @@ impl LoadKernel for RenderKernel {
                 format!("{label} render: no frame verified (ran {frames} frame(s) in {secs:.1}s)"),
             );
         }
-        let fps = if secs > 0.0 {
+        let fs = ft.stats();
+        // Prefer the measured pacing average; fall back to frames/secs if the
+        // pacing recorder never captured an interval (e.g. an all-idle run).
+        let fps = if fs.avg_fps > 0.0 {
+            fs.avg_fps
+        } else if secs > 0.0 {
             frames as f64 / secs
         } else {
             0.0
         };
         let detail = format!(
-            "{label} {}x{} x{} inst, {frames} frame(s) ~{fps:.0} fps, {verifications} verified",
-            gpu.width, gpu.height, gpu.instances
+            "{label} {}x{} x{} inst, {frames} frame(s) ~{fps:.0} fps \
+             (1%low {:.0} 0.1%low {:.0} stutter {:.1}ms), {verifications} verified",
+            gpu.width,
+            gpu.height,
+            gpu.instances,
+            fs.low1pct_fps,
+            fs.low01pct_fps,
+            fs.stutter_ms
         );
         LoadResult::new(true, frames, reference.unwrap_or(0), errors, detail)
     }

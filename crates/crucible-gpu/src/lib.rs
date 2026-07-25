@@ -33,7 +33,8 @@
 //! Either failure sets `error_count > 0`, which the report rolls up to FAIL.
 
 pub(crate) mod geom;
-#[cfg(all(windows, feature = "preview"))]
+// Pure frame-time math (no GPU/preview deps): used by the normal render run for
+// its pacing summary and by the windows+preview benchmark for its score.
 pub(crate) mod frame_timer;
 pub mod link;
 #[cfg(feature = "optix")]

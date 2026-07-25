@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: MIT
+// Part of the frame-pacing API (the score + its per-percentile fields) is used
+// only by the windows+preview benchmark path; the normal render run uses the
+// rest. Both live here, so some items read as dead in a non-preview build.
+#![allow(dead_code)]
 //! Frame-pacing recorder for the `render` benchmark mode.
 //!
 //! The benchmark presents every rendered frame at full rate (vsync off) and
