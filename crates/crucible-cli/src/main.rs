@@ -977,9 +977,10 @@ fn pathtrace_kernel_from(p: &Parsed) -> Result<crucible_gpu::rt::RtKernel, Strin
             "glass" => 4,
             "velvet" => 5,
             "marble" => 6,
+            "fur" => 7,
             other => {
                 return Err(format!(
-                    "--material expects metal|matte|plastic|mirror|glass|velvet|marble, got '{other}'"
+                    "--material expects metal|matte|plastic|mirror|glass|velvet|marble|fur, got '{other}'"
                 ))
             }
         };
@@ -1031,6 +1032,7 @@ fn cmd_pathtrace(rest: &[String]) -> Result<u8, String> {
             4 => "glass",
             5 => "velvet",
             6 => "marble",
+            7 => "fur",
             _ => "metal",
         };
         let mode = if kernel.benchmark {

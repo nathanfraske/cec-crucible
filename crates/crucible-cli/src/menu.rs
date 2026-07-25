@@ -256,7 +256,7 @@ fn preview_field() -> Field {
 /// Path-trace BSDF material — `--material <name>`.
 #[cfg(feature = "rt")]
 fn material_field() -> Field {
-    let mats = ["metal", "matte", "plastic", "mirror", "glass", "velvet", "marble"];
+    let mats = ["metal", "matte", "plastic", "mirror", "glass", "velvet", "marble", "fur"];
     Field {
         label: "Material",
         opts: mats

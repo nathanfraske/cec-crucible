@@ -49,6 +49,7 @@ const MAT_MIRROR: u32 = 3u;
 const MAT_GLASS: u32 = 4u;
 const MAT_VELVET: u32 = 5u;
 const MAT_MARBLE: u32 = 6u;
+const MAT_FUR: u32 = 7u;
 
 @group(0) @binding(0) var tlas: acceleration_structure;
 @group(0) @binding(1) var<storage, read_write> outbuf: array<u32>;
@@ -312,6 +313,41 @@ fn scatter(mat: u32, p: vec3<f32>, ng: vec3<f32>, d: vec3<f32>, rng: ptr<functio
                 s.dir = cosine_hemisphere(nf, r1, r2);
                 s.weight = body;
                 s.origin = p + nf * 0.001;
+            }
+        }
+        // Fibre-fur — a Kajiya-Kay-style anisotropic fibre BSDF over a procedural
+        // tangent field: a tangent-aligned specular streak, a forward-scatter
+        // transmittance lobe (the soft rim glow light picks up passing through the
+        // coat), and a fuzzy diffuse undercoat. The extra RNG draws + the branch
+        // make it the most divergent material here — a deliberate SM stressor —
+        // while staying deterministic (a fixed three draws per hit, either branch).
+        case 7u: {
+            let jitter = vec3<f32>(randf(rng), randf(rng), randf(rng)) * 2.0 - vec3<f32>(1.0);
+            // A procedural fibre tangent flowing across the surface, jittered per
+            // shading point so neighbouring fibres diverge (the fuzz).
+            let t0 = normalize(cross(nf, vec3<f32>(0.13, 1.0, 0.07)));
+            let bz = cross(nf, t0);
+            let flow = t0 * cos(p.y * 9.0) + bz * sin(p.x * 9.0 + p.z * 7.0);
+            let tv = flow + jitter * 0.35;
+            let tangent = tv / max(length(tv), 1.0e-3);
+            let base = vec3<f32>(0.46, 0.32, 0.20); // warm animal-fur brown
+            // Kajiya-Kay anisotropic streak: brightest where the view grazes
+            // across the fibre length (sin of the tangent-view angle).
+            let tdotv = dot(tangent, wo);
+            let streak = pow(sqrt(clamp(1.0 - tdotv * tdotv, 0.0, 1.0)), 24.0);
+            let fwd = 0.35;
+            if (pick < fwd) {
+                // TT lobe — scatter roughly forward through the coat with a warm,
+                // brighter tint: fur's translucent, back-lit rim glow.
+                s.dir = normalize(d + nf * 0.2 + jitter * 0.25);
+                s.origin = p - nf * 0.001;
+                s.weight = (base + vec3<f32>(0.32, 0.24, 0.14)) * (0.5 / fwd);
+            } else {
+                // Fuzzy diffuse undercoat with the specular streak layered on top.
+                let nz = normalize(nf + jitter * 0.5);
+                s.dir = cosine_hemisphere(nz, r1, r2);
+                s.origin = p + nf * 0.001;
+                s.weight = (base + vec3<f32>(0.70, 0.64, 0.50) * streak) * (1.0 / (1.0 - fwd));
             }
         }
         // Metal (default) — glossy GGX microfacet over a copper/steel texture and

@@ -1616,7 +1616,8 @@ impl LoadKernel for RtKernel {
                                     3 => "mirror",
                                     4 => "glass",
                                     5 => "velvet",
-                                    _ => "marble",
+                                    6 => "marble",
+                                    _ => "fur",
                                 };
                                 format!(
                                     "material: {mat}\nsamples: {} x{}\ndispatch: {dispatches}",
