@@ -37,6 +37,9 @@ use args::Parsed;
 #[cfg(feature = "tui")]
 mod tui;
 
+#[cfg(feature = "tui")]
+mod menu;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Options accepted by (nearly) every command.
@@ -89,6 +92,8 @@ USAGE:
     cec-crucible <command> [options]
 
 COMMANDS:
+    menu                 Interactive launcher for every test/profile. [--features tui]
+                         (Also opens when run with no command.)
     info                 Print device id, CPU, memory and QPC info, then exit.
     drives               List fixed physical drives (NVMe/SATA), then exit.
     gpu-info             List usable GPUs, then exit.            [--features gpu]
@@ -255,8 +260,17 @@ fn run(argv: &[String]) -> Result<u8, String> {
     let command = match argv.first() {
         Some(c) => c.as_str(),
         None => {
-            print!("{USAGE}");
-            return Ok(2);
+            // Bare `cec-crucible` opens the interactive menu when built with the
+            // `tui` feature; otherwise it prints usage.
+            #[cfg(feature = "tui")]
+            {
+                return menu::run_menu();
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                print!("{USAGE}");
+                return Ok(2);
+            }
         }
     };
     let rest = &argv[1..];
@@ -265,6 +279,18 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(0)
+        }
+        "menu" => {
+            #[cfg(feature = "tui")]
+            {
+                let _ = rest;
+                menu::run_menu()
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                let _ = rest;
+                Err("the interactive menu needs a `--features tui` build".to_string())
+            }
         }
         "version" | "-V" | "--version" => {
             println!("cec-crucible {VERSION}");
