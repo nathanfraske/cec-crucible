@@ -131,6 +131,10 @@ fn dashboard(
     rates: &HashMap<String, RateEma>,
     n_markers: usize,
 ) {
+    // On-brand full-screen backdrop (CEC --bg); later widgets keep this bg since
+    // they only set fg, so the whole dashboard reads as one dark surface.
+    f.render_widget(Block::default().style(Style::default().bg(theme::BG)), f.area());
+
     let mut cores: Vec<(u32, &LaneSnap)> = lanes
         .iter()
         .filter_map(|l| l.label.strip_prefix("core ").map(|n| (n.parse().unwrap_or(0), l)))
@@ -183,7 +187,7 @@ fn draw_header(
     };
 
     let line = Line::from(vec![
-        Span::styled(" ◆ CRUCIBLE ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" ⚠ CRUCIBLE ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(format!("{title}  "), Style::default().fg(theme::TEXT)),
         Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
         Span::styled(
@@ -540,9 +544,9 @@ mod tests {
         let mut out = String::from(
             "<!doctype html><html><head><meta charset=\"utf-8\">\
              <title>cec-crucible · live dashboard</title></head>\
-             <body style=\"background:#05070c;margin:0;padding:24px;\
+             <body style=\"background:#040409;margin:0;padding:24px;\
              display:flex;justify-content:center\">\
-             <pre style=\"margin:0;padding:18px;background:#0b0e14;\
+             <pre style=\"margin:0;padding:18px;background:#070711;\
              color:#c8d0dc;font:13px/1.22 'Cascadia Code',Consolas,monospace;\
              border-radius:10px;overflow:auto;display:inline-block;\
              box-shadow:0 8px 40px rgba(0,0,0,.6)\">",

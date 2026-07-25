@@ -687,6 +687,9 @@ impl App {
     // --- Rendering ----------------------------------------------------------
 
     fn draw(&self, f: &mut Frame) {
+        // On-brand full-screen backdrop (CEC --bg); the card + text render on top
+        // and only set fg, so the whole menu reads as one dark surface.
+        f.render_widget(Block::default().style(Style::default().bg(theme::BG)), f.area());
         match self.screen {
             Screen::Menu => self.draw_menu(f),
             Screen::Setup => self.draw_setup(f),
@@ -1031,11 +1034,6 @@ fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
     }
 }
 
-/// The `v{VERSION} · CEC · cec.direct` identity string for the header.
-fn version_tag() -> String {
-    format!("v{VERSION} · CEC · cec.direct")
-}
-
 /// A single line with `left` spans flush-left and `right` spans flush-right,
 /// separated by an elastic run of spaces sized to `width`.
 fn lr_line<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<'a> {
@@ -1057,8 +1055,12 @@ fn onoff(b: bool) -> String {
 fn draw_header(f: &mut Frame, area: Rect, tag: &str) {
     let w = area.width as usize;
     let l0 = lr_line(
-        vec![Span::styled(" ◆ CRUCIBLE", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))],
-        vec![Span::styled(version_tag(), Style::default().fg(theme::DIM))],
+        vec![Span::styled(" ⚠ CRUCIBLE", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))],
+        vec![
+            Span::styled(format!("v{VERSION} · "), Style::default().fg(theme::DIM)),
+            Span::styled("CEC", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" · cec.direct", Style::default().fg(theme::DIM)),
+        ],
         w,
     );
     let l1 = lr_line(
@@ -1440,9 +1442,9 @@ mod tests {
         let mut out = format!(
             "<!doctype html><html><head><meta charset=\"utf-8\">\
              <title>{title}</title></head>\
-             <body style=\"background:#05070c;margin:0;padding:24px;\
+             <body style=\"background:#040409;margin:0;padding:24px;\
              display:flex;justify-content:center\">\
-             <pre style=\"margin:0;padding:18px;background:#0b0e14;\
+             <pre style=\"margin:0;padding:18px;background:#070711;\
              color:#c8d0dc;font:13px/1.22 'Cascadia Code',Consolas,monospace;\
              border-radius:10px;overflow:auto;display:inline-block;\
              box-shadow:0 8px 40px rgba(0,0,0,.6)\">"
