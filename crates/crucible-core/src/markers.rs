@@ -28,6 +28,13 @@ pub struct LiveLane {
     pub errors: AtomicU64,
     /// 0 = idle, 1 = working, 2 = done.
     pub phase: AtomicU8,
+    /// Latest verification checksum the kernel is reproducing (0 = none yet) — so
+    /// the UI can show the live "memory hash" the self-consistency check folds.
+    pub hash: AtomicU64,
+    /// A short multi-line "field: value" status the kernel pushes (throttled) so
+    /// the UI can show what it is *actually* doing — the memory pattern, the value
+    /// written vs expected, progress, watts. Empty until the kernel sets it.
+    pub detail: Mutex<String>,
 }
 
 pub const PHASE_IDLE: u8 = 0;
@@ -41,6 +48,8 @@ impl LiveLane {
             work: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             phase: AtomicU8::new(PHASE_IDLE),
+            hash: AtomicU64::new(0),
+            detail: Mutex::new(String::new()),
         }
     }
     #[inline]
@@ -51,6 +60,19 @@ impl LiveLane {
     pub fn set_phase(&self, p: u8) {
         self.phase.store(p, Ordering::Relaxed);
     }
+    #[inline]
+    pub fn set_hash(&self, h: u64) {
+        self.hash.store(h, Ordering::Relaxed);
+    }
+    /// Replace the live status detail (a brief lock; called at a throttled rate,
+    /// not on the hot inner loop). No-op churn when the text is unchanged.
+    pub fn set_detail(&self, s: &str) {
+        let mut g = self.detail.lock().unwrap_or_else(|e| e.into_inner());
+        if *g != *s {
+            g.clear();
+            g.push_str(s);
+        }
+    }
 }
 
 /// An immutable snapshot of one lane for the renderer.
@@ -60,6 +82,8 @@ pub struct LaneSnap {
     pub work: u64,
     pub errors: u64,
     pub phase: u8,
+    pub hash: u64,
+    pub detail: String,
 }
 
 /// The kind of transition a marker records.
@@ -177,6 +201,8 @@ impl MarkerLog {
                 work: l.work.load(Ordering::Relaxed),
                 errors: l.errors.load(Ordering::Relaxed),
                 phase: l.phase.load(Ordering::Relaxed),
+                hash: l.hash.load(Ordering::Relaxed),
+                detail: l.detail.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             })
             .collect()
     }

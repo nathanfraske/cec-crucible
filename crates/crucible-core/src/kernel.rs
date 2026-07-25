@@ -357,6 +357,31 @@ impl<'a> ShapeDriver<'a> {
         self.lane = self.markers.register_lane(label);
     }
 
+    /// Is a live UI attached to this lane? Kernels guard the (allocating) status
+    /// formatting with this so the headless/no-UI path stays zero-overhead.
+    #[inline]
+    pub fn live(&self) -> bool {
+        self.lane.is_some()
+    }
+
+    /// Publish the latest verification checksum to the live lane (no-op if no UI).
+    #[inline]
+    pub fn set_hash(&self, h: u64) {
+        if let Some(l) = &self.lane {
+            l.set_hash(h);
+        }
+    }
+
+    /// Publish a live status detail (multi-line "field: value") to the lane so the
+    /// UI can show what this kernel is doing. No-op if no UI; call it throttled,
+    /// guarded by [`live`](Self::live), never on the hot inner loop.
+    #[inline]
+    pub fn set_status(&self, s: &str) {
+        if let Some(l) = &self.lane {
+            l.set_detail(s);
+        }
+    }
+
     /// Cap on how long an off-phase nap runs, so the loop stays responsive to
     /// the stop flag even with long burst `off` periods.
     const MAX_NAP: Duration = Duration::from_millis(2);

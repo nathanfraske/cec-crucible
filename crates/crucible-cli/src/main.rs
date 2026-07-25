@@ -35,6 +35,9 @@ use crucible_gpu::{GpuDevice, GpuKernel};
 use args::Parsed;
 
 #[cfg(feature = "tui")]
+mod theme;
+
+#[cfg(feature = "tui")]
 mod tui;
 
 #[cfg(feature = "tui")]
