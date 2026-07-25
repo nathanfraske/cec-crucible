@@ -66,6 +66,8 @@ const BOUNCES: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
 const RT_ITERS: [u64; 7] = [32, 64, 128, 192, 256, 512, 1024];
 /// Memory-buffer size presets in MiB (`auto` = the CLI default, 50% of free RAM).
 const MEM_MB: [u64; 5] = [512, 1024, 2048, 4096, 8192];
+/// Storage scratch-file size presets in MiB (`default` = the CLI default, 1024).
+const STORAGE_MB: [u64; 5] = [512, 1024, 4096, 16384, 65536];
 
 // ---------------------------------------------------------------------------
 // Catalog model
@@ -111,6 +113,11 @@ enum Launch {
     Load(&'static str),
     /// A profile / campaign — argv is `[run, <profile>, <field args>…, --ui]`.
     Profile(&'static str),
+    /// A composite benchmark — argv is `[cmd, <field args>…, <--out …>]`. No
+    /// `--ui`: it prints its own per-engine + composite scores, not the live
+    /// lane dashboard, and it takes only the output-dir setting (it writes its
+    /// own benchmark CSV, so `--csv` / `--telemetry-csv` do not apply).
+    Bench(&'static str),
 }
 
 /// One selectable value for a [`Field`]: what to show, and the argv fragment it
@@ -168,6 +175,16 @@ impl Test {
             Launch::Info(cmd) => vec![cmd.to_string()],
             Launch::Load(cmd) => self.load_argv(vec![cmd.to_string()], settings),
             Launch::Profile(p) => self.load_argv(vec!["run".to_string(), p.to_string()], settings),
+            Launch::Bench(cmd) => {
+                let mut argv = vec![cmd.to_string()];
+                for f in &self.fields {
+                    argv.extend(f.args().iter().cloned());
+                }
+                // Benchmark writes its own CSV and has no live UI: only the
+                // output-dir setting applies (no --csv / --telemetry-csv / --ui).
+                argv.extend(settings.out_args());
+                argv
+            }
         }
     }
 
@@ -273,6 +290,29 @@ fn mem_size_field() -> Field {
     Field { label: "Size", opts, idx: 0 }
 }
 
+/// Storage scratch-file size — `default` (the CLI's 1024 MiB) plus `--size-mb`
+/// presets. `default` emits nothing, so an untouched launch stays byte-identical.
+fn storage_size_field() -> Field {
+    let mut opts = vec![Opt { show: "default".into(), args: vec![] }];
+    for &v in &STORAGE_MB {
+        opts.push(Opt { show: format!("{v} MB"), args: vec!["--size-mb".into(), v.to_string()] });
+    }
+    Field { label: "Size", opts, idx: 0 }
+}
+
+/// Storage target — the current dir (default) or every fixed SSD at once
+/// (`--all-drives`: solo baseline vs concurrent per drive).
+fn all_drives_field() -> Field {
+    Field {
+        label: "Target",
+        opts: vec![
+            Opt { show: "this dir".into(), args: vec![] },
+            Opt { show: "all SSDs".into(), args: vec!["--all-drives".into()] },
+        ],
+        idx: 0,
+    }
+}
+
 /// Build the catalog. Rows and whole categories are feature-gated exactly like
 /// the CLI, so the menu reflects the build.
 #[allow(clippy::vec_init_then_push)] // the GPU pushes are #[cfg]-conditional
@@ -322,7 +362,7 @@ fn catalog() -> Vec<Group> {
                 label: "Storage",
                 desc: "Uncached scratch write / read-back verify.",
                 launch: Launch::Load("storage"),
-                fields: vec![duration_field()],
+                fields: vec![duration_field(), storage_size_field(), all_drives_field()],
             },
         ],
     });
@@ -399,20 +439,39 @@ fn catalog() -> Vec<Group> {
                 num_field("Bounces", "--optix-bounces", &BOUNCES, 3, ""),
             ],
         });
+        // Composite "3DMark-class" score across the graphics engines that are
+        // built in. No live UI — it prints per-engine + composite scores.
+        #[cfg(any(feature = "rt", feature = "preview"))]
+        gpu.push(Test {
+            label: "Graphics benchmark",
+            desc: "Composite score: render + rt + pathtrace, per-engine + total.",
+            launch: Launch::Bench("benchmark"),
+            fields: vec![duration_field()],
+        });
         groups.push(Group { cat: Category::Gpu, tests: gpu });
     }
 
     // --- Profiles · Campaigns (each `run <profile> --seconds N --ui`) ---
-    let profiles = [
+    #[allow(unused_mut)] // the GPU cross-profiles are #[cfg]-conditional
+    let mut profiles: Vec<(&str, &str)> = vec![
         ("quick", "CPU + RAM + storage, ~15s."),
         ("soak", "Long steady CPU + RAM."),
         ("cross", "Concurrent cross-load, all domains."),
+        ("power", "CPU burst, dense markers for the power rig."),
+        ("storage-cross", "Multi-SSD: solo baseline vs concurrent."),
         ("worst-case", "Every domain at once."),
         ("chaos", "Independent seeded jitter storm."),
         ("game-load", "Frame-paced CPU -> GPU handoff."),
         ("core-cycle", "Rotate boost over each core."),
         ("c-states", "Idle / pulse per core."),
     ];
+    // The CPU+GPU electrical cross-profiles need a GPU build.
+    #[cfg(feature = "gpu")]
+    profiles.extend_from_slice(&[
+        ("in-phase", "CPU+GPU burst together — peak PSU/OCP."),
+        ("anti-phase", "CPU/GPU alternate — VRM/PSU chase load."),
+        ("beat", "Offset periods — sweep every phase."),
+    ]);
     groups.push(Group {
         cat: Category::Profiles,
         tests: profiles
@@ -1211,7 +1270,7 @@ mod tests {
             .flat
             .iter()
             .position(|&(g, t)| match app.groups[g].tests[t].launch {
-                Launch::Load(c) | Launch::Info(c) => c == cmd,
+                Launch::Load(c) | Launch::Info(c) | Launch::Bench(c) => c == cmd,
                 Launch::Profile(_) => false,
             })
             .expect("command present in catalog");
@@ -1317,6 +1376,23 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[cfg(any(feature = "rt", feature = "preview"))]
+    #[test]
+    fn benchmark_launch_has_no_ui() {
+        let app = App::new();
+        let (gi, ti) = app
+            .flat
+            .iter()
+            .copied()
+            .find(|&(g, t)| matches!(app.groups[g].tests[t].launch, Launch::Bench("benchmark")))
+            .expect("benchmark entry present");
+        let argv = app.groups[gi].tests[ti].build_argv(&app.settings);
+        // Carries its duration field but never --ui (it has no live dashboard).
+        let want: Vec<String> = ["benchmark", "--seconds", "30"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(argv, want);
+        assert!(!argv.contains(&"--ui".to_string()), "benchmark must not carry --ui");
     }
 
     #[test]
