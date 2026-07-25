@@ -13,12 +13,15 @@
 //! * [`report`] — the device-identified pass/fail report.
 //! * [`json`] — a tiny, dependency-free JSON writer.
 //! * [`sysinfo`] — CPU count / physical memory.
+//! * [`cpustats`] — per-core effective clock + utilization via PDH counters
+//!   (non-admin, no kernel driver).
 //!
 //! **Zero external dependencies** — std only. Platform FFI (QPC, SMBIOS,
 //! memory status) is hand-declared against `kernel32`; non-Windows targets get
 //! working fallbacks so the workspace builds and tests everywhere.
 
 pub mod clock;
+pub mod cpustats;
 pub mod device;
 pub mod json;
 pub mod kernel;
@@ -29,6 +32,7 @@ pub mod sysinfo;
 
 // Flat re-exports of the most-used types for ergonomic downstream `use`.
 pub use clock::{Clock, Timestamp};
+pub use cpustats::{CoreStat, CpuStats};
 pub use device::DeviceId;
 pub use json::Json;
 pub use kernel::{Budget, Kind, LoadKernel, LoadResult, Shape, ShapeDriver, StopFlag, Tick};
