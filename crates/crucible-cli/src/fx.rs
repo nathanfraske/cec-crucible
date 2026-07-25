@@ -45,6 +45,19 @@ struct Spark {
     verify: bool,
 }
 
+/// An ambient mote drifting in the margin OUTSIDE the UI border — the field of
+/// embers around the panel. Position is normalised (0..1 over the whole console)
+/// so it survives a resize without rescaling state.
+#[derive(Clone, Copy)]
+struct Mote {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    life: f32,
+    heat: f32,
+}
+
 /// A lightning bolt: a short jagged run of cells that flashes and dies.
 #[derive(Clone, Copy)]
 struct Bolt {
@@ -59,6 +72,7 @@ struct Bolt {
 /// once warmed.
 pub struct Fx {
     sparks: Vec<Spark>,
+    motes: Vec<Mote>,
     bolts: Vec<Bolt>,
     tick: u64,
     /// Error count at the previous update, to detect *new* errors.
@@ -69,12 +83,33 @@ pub struct Fx {
 
 /// Hard caps so a long run can never grow the FX state without bound.
 const MAX_SPARKS: usize = 64;
+const MAX_MOTES: usize = 96;
 const MAX_BOLTS: usize = 8;
+
+/// Margin reserved around the UI for the ambient spark field. Scales with the
+/// console so a small terminal keeps all its room for content.
+pub fn inset(area: Rect) -> Rect {
+    let mx = if area.width >= 120 {
+        4
+    } else if area.width >= 80 {
+        2
+    } else {
+        0
+    };
+    let my = if area.height >= 30 { 1 } else { 0 };
+    Rect {
+        x: area.x + mx,
+        y: area.y + my,
+        width: area.width.saturating_sub(mx * 2),
+        height: area.height.saturating_sub(my * 2),
+    }
+}
 
 impl Fx {
     pub fn new() -> Fx {
         Fx {
             sparks: Vec::new(),
+            motes: Vec::new(),
             bolts: Vec::new(),
             tick: 0,
             last_errors: 0,
@@ -126,6 +161,49 @@ impl Fx {
             });
         }
 
+        // --- Ambient motes: the ember field in the margin outside the UI ---
+        for m in &mut self.motes {
+            m.x += m.vx;
+            m.y += m.vy;
+            // Embers rise and slow as they cool.
+            m.vy *= 0.995;
+            m.life -= 0.008 + 0.012 * m.heat;
+        }
+        self.motes
+            .retain(|m| m.life > 0.0 && m.x > -0.02 && m.x < 1.02 && m.y > -0.02 && m.y < 1.02);
+
+        // Spawn along whichever edge band the hash picks, so the field stays
+        // concentrated in the margin rather than behind the panels.
+        let want_motes = 1 + (act * 3.0) as u32;
+        for i in 0..want_motes {
+            if self.motes.len() >= MAX_MOTES {
+                break;
+            }
+            let h = hash2(self.tick ^ 0xE1BE_45CE, i as u64);
+            if act < 0.6 && (h >> 60) % 2 == 0 {
+                continue; // sparser when the box is quiet
+            }
+            let u = ((h >> 8) % 1000) as f32 / 1000.0;
+            let band = h % 4;
+            let (x, y) = match band {
+                0 => (u, 0.02),  // top margin
+                1 => (u, 0.98),  // bottom margin
+                2 => (0.02, u),  // left margin
+                _ => (0.98, u),  // right margin
+            };
+            // Drift mostly outward/upward, with a little wander.
+            let wander = (((h >> 24) % 100) as f32 / 100.0 - 0.5) * 0.004;
+            let rise = -0.0022 - ((h >> 40) % 100) as f32 / 100.0 * 0.0025;
+            self.motes.push(Mote {
+                x,
+                y,
+                vx: wander,
+                vy: if band == 1 { rise } else { rise * 0.4 },
+                life: 1.0,
+                heat: act * (0.5 + ((h >> 50) % 100) as f32 / 200.0),
+            });
+        }
+
         // A fresh verification anywhere → a cyan ring, several fast sparks
         // launched together from one point.
         if verify_mix != self.last_verify_mix {
@@ -166,11 +244,55 @@ impl Fx {
 
     /// Paint the border FX over the outer edge of `area`. Runs last, so it sits
     /// on top of the panel borders already drawn there.
-    pub fn render(&self, f: &mut Frame, area: Rect) {
-        let per = match perimeter(area) {
+    /// Paint the FX. `outer` is the whole console; `ui` is the inset panel area
+    /// whose border the sparks chase. Motes are drawn only in the margin between
+    /// the two, so nothing is ever painted over the dashboard's content.
+    pub fn render(&self, f: &mut Frame, outer: Rect, ui: Rect) {
+        // Ambient field first — it sits behind the border sparks.
+        if outer.width > 0 && outer.height > 0 {
+            let buf = f.buffer_mut();
+            for m in &self.motes {
+                if m.life <= 0.05 {
+                    continue;
+                }
+                let x = outer.x as f32 + m.x * (outer.width.saturating_sub(1)) as f32;
+                let y = outer.y as f32 + m.y * (outer.height.saturating_sub(1)) as f32;
+                let (xi, yi) = (x.round() as i32, y.round() as i32);
+                if xi < outer.x as i32
+                    || yi < outer.y as i32
+                    || xi >= (outer.x + outer.width) as i32
+                    || yi >= (outer.y + outer.height) as i32
+                {
+                    continue;
+                }
+                // Skip anything that drifted over the UI itself.
+                let inside_ui = xi >= ui.x as i32
+                    && yi >= ui.y as i32
+                    && xi < (ui.x + ui.width) as i32
+                    && yi < (ui.y + ui.height) as i32;
+                if inside_ui {
+                    continue;
+                }
+                let glyph = if m.life > 0.72 {
+                    "✧"
+                } else if m.life > 0.4 {
+                    "·"
+                } else {
+                    "˙"
+                };
+                // Motes read dimmer than the border sparks so the panel edge
+                // stays the brightest thing on screen.
+                let cell = &mut buf[Position::new(xi as u16, yi as u16)];
+                cell.set_symbol(glyph);
+                cell.set_fg(dim_toward(heat_color(m.heat), m.life * 0.75));
+            }
+        }
+
+        let per = match perimeter(ui) {
             Some(p) if p > 8 => p,
             _ => return, // too small to animate
         };
+        let area = ui;
         let buf = f.buffer_mut();
 
         // Sparks first, then bolts on top (an error must never be hidden).

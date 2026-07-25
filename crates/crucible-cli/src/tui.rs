@@ -38,7 +38,7 @@ use crucible_core::cpustats::{aggregate, CoreStat, CpuStats};
 use crucible_core::kernel::StopFlag;
 use crucible_core::markers::{LaneSnap, MarkerLog, PHASE_DONE, PHASE_WORK};
 
-use crate::fx::Fx;
+use crate::fx::{self, Fx};
 
 use crate::theme;
 
@@ -179,6 +179,10 @@ fn dashboard(
     // they only set fg, so the whole dashboard reads as one dark surface.
     f.render_widget(Block::default().style(Style::default().bg(theme::BG)), f.area());
 
+    // The UI sits inset from the console edge; the margin is the ambient
+    // spark field's canvas (see fx::inset).
+    let ui = fx::inset(f.area());
+
     let mut cores: Vec<(u32, &LaneSnap)> = lanes
         .iter()
         .filter_map(|l| l.label.strip_prefix("core ").map(|n| (n.parse().unwrap_or(0), l)))
@@ -193,12 +197,12 @@ fn dashboard(
     // Height the core panel to the heatmap it will draw (see draw_core_grid):
     // chunky = 3 terminal rows per grid-row, dense (>48 cores) = 1.
     let core_h: u16 = if has_cores {
-        let w = (f.area().width.saturating_sub(2)).max(1) as usize;
+        let w = (ui.width.saturating_sub(2)).max(1) as usize;
         // Keep in sync with draw_core_grid: chunky = 4-wide cells over 3 rows,
         // dense (>48 cores) = 1-wide cells on a single row.
         let (cell, per_gridrow) = if cores.len() > 48 { (1usize, 1u16) } else { (4usize, 3u16) };
         let rows = cores.len().div_ceil((w / cell).max(1)).max(1) as u16;
-        (2 + rows * per_gridrow).clamp(4, f.area().height / 2)
+        (2 + rows * per_gridrow).clamp(4, (ui.height / 2).max(4))
     } else {
         0
     };
@@ -209,7 +213,7 @@ fn dashboard(
             Constraint::Length(core_h),   // core grid
             Constraint::Min(6),           // domain panels
         ])
-        .split(f.area());
+        .split(ui);
 
     draw_header(f, chunks[0], title, start, lanes, n_markers);
     if has_cores {
@@ -217,9 +221,10 @@ fn dashboard(
     }
     draw_panels(f, chunks[2], &domains, rates);
 
-    // Last: the reactive border rides on top of the panel borders it shares
-    // cells with, so sparks and lightning are never painted over.
-    fx.render(f, f.area());
+    // Last: the ambient field fills the margin outside the panel, and the border
+    // sparks ride on top of the panel borders they share cells with — so neither
+    // is ever painted over.
+    fx.render(f, f.area(), ui);
 }
 
 fn draw_header(
