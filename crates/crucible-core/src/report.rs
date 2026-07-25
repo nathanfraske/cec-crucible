@@ -200,6 +200,64 @@ impl Report {
     pub fn write_json(&self, path: &Path) -> io::Result<()> {
         std::fs::write(path, self.to_pretty_json())
     }
+
+    /// Render the report as CSV — one row per stage, with the run-level context
+    /// (device, OS, timestamp, overall verdict) repeated on every row so each row
+    /// is self-contained and the file opens cleanly in Excel / Sheets / pandas.
+    /// A header row is always emitted, even for a run with no stages.
+    pub fn to_csv(&self) -> String {
+        const HEADER: &str = "tool_version,device_short_id,host,system,board,os,arch,\
+started_unix_nanos,run_verdict,kernel,kind,mode,seconds,stage_verdict,ok,iterations,\
+checksum_hex,error_count,detail\n";
+        let mut s = String::from(HEADER);
+        let started = self
+            .started
+            .map(|t| t.unix_nanos.to_string())
+            .unwrap_or_default();
+        let run_verdict = self.verdict().as_str();
+        for st in &self.stages {
+            let row = [
+                csv_field(&self.tool_version),
+                csv_field(&self.device.short_id),
+                csv_field(&self.device.host),
+                csv_field(&self.device.system),
+                csv_field(&self.device.board),
+                csv_field(&self.os),
+                csv_field(&self.arch),
+                csv_field(&started),
+                run_verdict.to_string(),
+                csv_field(&st.kernel),
+                csv_field(st.kind.as_str()),
+                csv_field(&st.mode),
+                format!("{:.2}", st.seconds),
+                st.verdict().as_str().to_string(),
+                st.result.ok.to_string(),
+                st.result.iterations.to_string(),
+                format!("{:#018x}", st.result.checksum),
+                st.result.error_count.to_string(),
+                csv_field(&st.result.detail),
+            ]
+            .join(",");
+            s.push_str(&row);
+            s.push('\n');
+        }
+        s
+    }
+
+    pub fn write_csv(&self, path: &Path) -> io::Result<()> {
+        std::fs::write(path, self.to_csv())
+    }
+}
+
+/// Quote a CSV field per RFC 4180 iff it contains a comma, quote, or newline,
+/// doubling any embedded quotes. Detail strings can contain commas, so this
+/// keeps the column count stable.
+fn csv_field(s: &str) -> String {
+    if s.contains(|c: char| c == ',' || c == '"' || c == '\n' || c == '\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 fn opt_ts(ts: &Option<Timestamp>) -> Json {
@@ -299,6 +357,34 @@ mod tests {
             LoadResult::setup_failure("no writable path"),
         ));
         assert_eq!(r.verdict(), Verdict::Fail);
+    }
+
+    #[test]
+    fn csv_has_header_and_escapes_detail() {
+        let clock = Clock::new();
+        let mut r = Report::new("0.1.0", dev(), &clock);
+        r.add_stage(StageReport::new(
+            "mem",
+            Kind::Mem,
+            "steady",
+            1.5,
+            LoadResult::new(true, 5, 0xABCD, 2, "2 miscompares, first @ 0x40".into()),
+        ));
+        let csv = r.to_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(lines[0].starts_with("tool_version,"), "header row");
+        assert_eq!(lines.len(), 2, "header + one stage row");
+        // The detail contains a comma → must be quoted so the column count is stable.
+        assert!(csv.contains("\"2 miscompares, first @ 0x40\""), "detail quoted");
+        assert!(csv.contains(",mem,"), "kernel column");
+        assert!(csv.contains("0x000000000000abcd"), "checksum as hex");
+    }
+
+    #[test]
+    fn csv_empty_run_is_header_only() {
+        let clock = Clock::new();
+        let r = Report::new("0.1.0", dev(), &clock);
+        assert_eq!(r.to_csv().lines().count(), 1);
     }
 
     #[test]
