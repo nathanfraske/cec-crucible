@@ -115,6 +115,8 @@ COMMANDS:
     rt                   Ray-tracing-core (BVH traversal) + verify. [--features rt]
     pathtrace            Multi-bounce path tracer (deep/divergent RT+SM). [--features rt]
     optix                NVIDIA-native OptiX path tracer (RT+SM).   [--features optix]
+    benchmark            Graphics composite score (render + rt + pathtrace).
+                         Per-engine scores + geometric-mean composite. [preview,rt]
     run <profile>        See PROFILES below.
     version              Print version.
     help                 Print this help.
@@ -320,6 +322,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "rt" => cmd_rt(rest),
         "pathtrace" => cmd_pathtrace(rest),
         "optix" => cmd_optix(rest),
+        "benchmark" | "bench" => cmd_benchmark(rest),
         "run" => cmd_run(rest),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -1122,6 +1125,199 @@ fn cmd_optix(rest: &[String]) -> Result<u8, String> {
         let mut runner = Runner::new(&p)?;
         runner.single_stage(&kernel, &budget, &mode)
     }
+}
+
+/// One graphics engine's benchmark outcome, for the composite + CSV.
+struct BenchOutcome {
+    engine: &'static str,
+    score: u64,
+    valid: bool,
+    detail: String,
+}
+
+/// Pull `score=<n>` and the VALID / INVALID verdict out of a benchmark result
+/// detail line (`… score=12345 VALID …`). Returns `None` if there is no score,
+/// which the caller treats as a failed engine.
+fn parse_bench_score(detail: &str) -> Option<(u64, bool)> {
+    let after = detail.split("score=").nth(1)?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let score: u64 = digits.parse().ok()?;
+    // "VALID" is a substring of "INVALID" — check the negative first.
+    let valid = !after.contains("INVALID") && after.contains("VALID");
+    Some((score, valid))
+}
+
+/// Minimal RFC-4180 field quoting for the benchmark CSV detail column.
+fn csv_quote(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Graphics **composite benchmark** — the suite's "3DMark-class" score. Runs each
+/// available graphics engine's fixed, standardized workload (identical on every
+/// machine so scores compare), scores each on its own calibrated scale, and
+/// combines them into one composite via their geometric mean — scale-robust
+/// across the engines' different units (the SPEC-style composite). Error-gated:
+/// if any engine fails to verify, the composite is INVALID and carries no score.
+fn cmd_benchmark(rest: &[String]) -> Result<u8, String> {
+    let p = Parsed::parse(rest, COMMON_BOOLS)?;
+    let mut allowed = vec![
+        "seconds",
+        "out",
+        "no-report",
+        "json",
+        "help",
+        "device-id",
+    ];
+    allowed.extend_from_slice(GPU_OPTS);
+    p.reject_unknown(&allowed)?;
+
+    let seconds = seconds_arg(&p, 12)?;
+
+    // Assemble the graphics engines that are actually compiled in. Each runs a
+    // fixed standardized workload with the benchmark flag forced on.
+    #[allow(unused_mut)]
+    let mut stages: Vec<(Box<dyn LoadKernel>, &'static str)> = Vec::new();
+
+    // render: frame-pacing score — needs the present path (windows + preview).
+    #[cfg(all(windows, feature = "preview"))]
+    {
+        let mut r = render_kernel_from(&p)?;
+        r.benchmark = true;
+        stages.push((Box::new(r), "render"));
+    }
+    // rt + pathtrace: throughput scores — need the ray-query engine.
+    #[cfg(feature = "rt")]
+    {
+        let mut rt = rt_kernel_from(&p)?;
+        rt.benchmark = true;
+        stages.push((Box::new(rt), "rt"));
+        let mut pt = pathtrace_kernel_from(&p)?;
+        pt.benchmark = true;
+        stages.push((Box::new(pt), "pathtrace"));
+    }
+
+    if stages.is_empty() {
+        return Err("the benchmark needs a build with graphics engines: \
+                    --features preview (render) and/or rt (rt + pathtrace)"
+            .to_string());
+    }
+
+    let clock = Clock::new();
+    let device = resolve_device(&p);
+    let markers = Arc::new(MarkerLog::new(clock));
+    let stop = StopFlag::new();
+    install_ctrlc();
+    let bridge_done = Arc::new(AtomicBool::new(false));
+    let bridge = spawn_ctrlc_bridge(stop.clone(), bridge_done.clone());
+
+    let budget = Budget {
+        duration: Duration::from_secs(seconds),
+        shape: Shape::Steady,
+        target_watts: None,
+        phase_epoch: None,
+        phase_offset: Duration::ZERO,
+    };
+
+    eprintln!(
+        "cec-crucible {VERSION}  device {}  benchmark: {} engine(s), {seconds}s each",
+        device.short_id,
+        stages.len()
+    );
+
+    let mut outcomes: Vec<BenchOutcome> = Vec::new();
+    for (kernel, engine) in &stages {
+        if stop.stopped() {
+            eprintln!("stop requested — skipping remaining engines");
+            break;
+        }
+        eprintln!("  running {engine}…");
+        let res = kernel.run(&budget, &stop, &markers);
+        // Valid only if the engine emitted a score AND verified clean.
+        let (score, valid) = parse_bench_score(&res.detail)
+            .map(|(s, v)| (s, v && res.error_count == 0 && res.ok))
+            .unwrap_or((0, false));
+        println!(
+            "  [{engine:<9}] {:<7} score {score:>8}   {}",
+            if valid { "VALID" } else { "INVALID" },
+            res.detail
+        );
+        outcomes.push(BenchOutcome {
+            engine,
+            score,
+            valid,
+            detail: res.detail,
+        });
+    }
+
+    // Composite = geometric mean of the per-engine scores (via logs, so no
+    // overflow). INVALID unless every engine that ran verified clean.
+    let all_valid = !outcomes.is_empty() && outcomes.iter().all(|o| o.valid);
+    let composite = if all_valid {
+        let n = outcomes.len() as f64;
+        let logmean =
+            outcomes.iter().map(|o| (o.score as f64).max(1.0).ln()).sum::<f64>() / n;
+        logmean.exp().round() as u64
+    } else {
+        0
+    };
+
+    println!();
+    if all_valid {
+        println!(
+            "  COMPOSITE {composite}   (geometric mean of {} engine score{})",
+            outcomes.len(),
+            if outcomes.len() == 1 { "" } else { "s" }
+        );
+    } else {
+        println!("  COMPOSITE INVALID — an engine did not verify clean (no score)");
+    }
+
+    // Benchmark CSV (per-engine scores + the composite), unless suppressed.
+    if !p.has("no-report") {
+        let out_dir = match p.get("out") {
+            Some(dir) => PathBuf::from(dir),
+            None => default_out_dir(),
+        };
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            eprintln!("warning: benchmark out dir {}: {e}", out_dir.display());
+        } else {
+            let unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let path =
+                out_dir.join(format!("crucible-{}-{unix}.benchmark.csv", device.short_id));
+            let mut csv = String::from("engine,score,valid,detail\n");
+            for o in &outcomes {
+                csv.push_str(&format!(
+                    "{},{},{},{}\n",
+                    o.engine,
+                    o.score,
+                    o.valid as u8,
+                    csv_quote(&o.detail)
+                ));
+            }
+            csv.push_str(&format!(
+                "composite,{composite},{},geometric-mean\n",
+                all_valid as u8
+            ));
+            match std::fs::write(&path, csv) {
+                Ok(()) => println!("report:  {}", path.display()),
+                Err(e) => eprintln!("warning: benchmark csv {}: {e}", path.display()),
+            }
+        }
+    }
+
+    // Tear down the Ctrl-C bridge.
+    bridge_done.store(true, Ordering::SeqCst);
+    stop.stop();
+    let _ = bridge.join();
+
+    Ok(if all_valid { 0 } else { 1 })
 }
 
 /// VRAM **integrity** test — a different test from `gpu` (the wattage thrasher).
@@ -2689,5 +2885,32 @@ mod win_ctrlc {
         unsafe {
             SetConsoleCtrlHandler(Some(handler), 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bench_score_reads_score_and_verdict() {
+        assert_eq!(
+            parse_bench_score("rt bench: score=10313 VALID mray_s=4620 …"),
+            Some((10313, true))
+        );
+        // "VALID" is a substring of "INVALID" — the invalid case must win.
+        assert_eq!(
+            parse_bench_score("render bench: score=0 INVALID (blank frame)"),
+            Some((0, false))
+        );
+        // A normal (non-benchmark) detail has no score.
+        assert_eq!(parse_bench_score("256x256, 1646 dispatches, ~4141 Mray/s"), None);
+    }
+
+    #[test]
+    fn csv_quote_escapes_only_when_needed() {
+        assert_eq!(csv_quote("plain"), "plain");
+        assert_eq!(csv_quote("a,b"), "\"a,b\"");
+        assert_eq!(csv_quote("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 }
