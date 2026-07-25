@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: MIT
 //! Interactive main-menu launcher (`cec-crucible menu`), built on ratatui.
 //!
-//! A branded, three-screen flow that browses and launches every test, profile
+//! A branded, four-screen flow that browses and launches every test, profile
 //! and diagnostic the binary was compiled with:
 //!
 //! 1. **Main menu** — a centred card of category-keyed rounded panels (it
-//!    re-centres on resize and scrolls when a category overflows).
+//!    re-centres on resize and scrolls when a category overflows); `s` opens
+//!    Settings.
 //! 2. **Test setup** — the selected test's name, description, a list of
 //!    adjustable parameters (each a `‹ value ›` ring cycled with ←/→) and a big
 //!    red ▶ FIRE button.
-//! 3. **Launch** — FIRE leaves the menu UI, prints a one-line header and hands
+//! 3. **Settings** — global CSV-logging + output-directory options (each a
+//!    `‹ value ›` ring) injected into every load and profile launch, so one
+//!    place flips `--csv` / `--telemetry-csv` / `--out` for the whole session.
+//! 4. **Launch** — FIRE leaves the menu UI, prints a one-line header and hands
 //!    the built argv to the normal command dispatch ([`crate::run`]) so a menu
 //!    launch is byte-identical to the equivalent CLI run — including the live
 //!    `--ui` dashboard and the reports — then re-enters the menu.
@@ -157,20 +161,25 @@ struct Test {
 impl Test {
     /// Turn the row + its current field values into an argv for [`crate::run`].
     /// A menu launch is byte-identical to typing the same command by hand.
-    fn build_argv(&self) -> Vec<String> {
+    /// `Info` diagnostics stay a bare command; loads and profiles also carry the
+    /// global [`Settings`] (CSV / output) flags.
+    fn build_argv(&self, settings: &Settings) -> Vec<String> {
         match self.launch {
             Launch::Info(cmd) => vec![cmd.to_string()],
-            Launch::Load(cmd) => self.load_argv(vec![cmd.to_string()]),
-            Launch::Profile(p) => self.load_argv(vec!["run".to_string(), p.to_string()]),
+            Launch::Load(cmd) => self.load_argv(vec![cmd.to_string()], settings),
+            Launch::Profile(p) => self.load_argv(vec!["run".to_string(), p.to_string()], settings),
         }
     }
 
-    /// Append every field's args, then `--ui` so the load lands in the live
-    /// dashboard (`tui::render_loop`) exactly as `--ui` from the CLI would.
-    fn load_argv(&self, mut argv: Vec<String>) -> Vec<String> {
+    /// Append every field's args, then the global settings flags, then `--ui` so
+    /// the load lands in the live dashboard (`tui::render_loop`) exactly as `--ui`
+    /// from the CLI would. Settings ride in beside `--ui` (never on `Info`), so a
+    /// configured launch is still byte-identical to the hand-typed command.
+    fn load_argv(&self, mut argv: Vec<String>, settings: &Settings) -> Vec<String> {
         for f in &self.fields {
             argv.extend(f.args().iter().cloned());
         }
+        settings.append_flags(&mut argv);
         argv.push("--ui".to_string());
         argv
     }
@@ -424,10 +433,92 @@ fn catalog() -> Vec<Group> {
 // App state
 // ---------------------------------------------------------------------------
 
+/// The output-directory presets offered by the Settings screen's Output ring.
+/// `Default` injects nothing (each command writes to its own default dir);
+/// `./crucible-reports` pins a relative dir; `Home` targets a `crucible-reports`
+/// dir under the user profile — only offered when `%USERPROFILE%` resolves, so an
+/// unknown home never yields a bad `--out` path. Each entry reuses [`Opt`]: its
+/// `show` is the ring label, its `args` the `--out <DIR>` fragment it injects.
+fn out_presets() -> Vec<Opt> {
+    let mut presets = vec![
+        Opt { show: "Default".into(), args: vec![] },
+        Opt {
+            show: "./crucible-reports".into(),
+            args: vec!["--out".into(), "crucible-reports".into()],
+        },
+    ];
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let dir = std::path::Path::new(&home).join("crucible-reports");
+        presets.push(Opt {
+            show: "Home".into(),
+            args: vec!["--out".into(), dir.to_string_lossy().into_owned()],
+        });
+    }
+    presets
+}
+
+/// Rows on the Settings screen: results CSV, telemetry CSV, output directory.
+const SETTINGS_ROWS: usize = 3;
+
+/// Global CSV-logging + output settings, injected into every load and profile
+/// launch (never `Info` diagnostics). All-off by default, so an untouched menu
+/// launch stays byte-identical to the equivalent hand-typed command.
+#[derive(Default)]
+struct Settings {
+    /// `--csv`: also write a per-stage results CSV.
+    results_csv: bool,
+    /// `--telemetry-csv`: also log the time-series telemetry CSV.
+    telemetry_csv: bool,
+    /// Index into [`out_presets`] — the `--out` directory preset (0 = Default).
+    out: usize,
+}
+
+impl Settings {
+    /// Label of the selected output preset, for the Output ring.
+    fn out_label(&self) -> String {
+        out_presets()
+            .get(self.out)
+            .map(|o| o.show.clone())
+            .unwrap_or_else(|| "Default".into())
+    }
+
+    /// The `--out <DIR>` fragment for the selected preset (empty for Default).
+    fn out_args(&self) -> Vec<String> {
+        out_presets().get(self.out).map(|o| o.args.clone()).unwrap_or_default()
+    }
+
+    /// Cycle the focused row. Rows 0/1 are on/off toggles (←/→ both flip); row 2
+    /// steps the output-preset ring by `delta` (−1 / +1), wrapping.
+    fn cycle(&mut self, row: usize, delta: isize) {
+        match row {
+            0 => self.results_csv = !self.results_csv,
+            1 => self.telemetry_csv = !self.telemetry_csv,
+            _ => {
+                let n = out_presets().len() as isize;
+                self.out = (self.out as isize + delta).rem_euclid(n) as usize;
+            }
+        }
+    }
+
+    /// Append the enabled flags in a stable order (results, telemetry, out). With
+    /// everything off (the default) this pushes nothing, so a default launch is
+    /// unchanged and the byte-identical-to-CLI guarantee still holds.
+    fn append_flags(&self, argv: &mut Vec<String>) {
+        if self.results_csv {
+            argv.push("--csv".to_string());
+        }
+        if self.telemetry_csv {
+            argv.push("--telemetry-csv".to_string());
+        }
+        argv.extend(self.out_args());
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
     Menu,
     Setup,
+    Settings,
 }
 
 /// The whole interactive app: the catalog, a flat index of every selectable row
@@ -441,6 +532,10 @@ struct App {
     sel: usize,
     /// Setup screen: the focused field, or the FIRE button when `== fields.len()`.
     field_sel: usize,
+    /// Global CSV / output settings, injected into every load + profile launch.
+    settings: Settings,
+    /// Settings screen: the focused row (`0..SETTINGS_ROWS`).
+    set_sel: usize,
 }
 
 impl App {
@@ -451,7 +546,15 @@ impl App {
             .enumerate()
             .flat_map(|(gi, g)| (0..g.tests.len()).map(move |ti| (gi, ti)))
             .collect();
-        App { groups, flat, screen: Screen::Menu, sel: 0, field_sel: 0 }
+        App {
+            groups,
+            flat,
+            screen: Screen::Menu,
+            sel: 0,
+            field_sel: 0,
+            settings: Settings::default(),
+            set_sel: 0,
+        }
     }
 
     fn cur(&self) -> (usize, usize) {
@@ -461,6 +564,11 @@ impl App {
     fn enter_setup(&mut self) {
         self.screen = Screen::Setup;
         self.field_sel = 0;
+    }
+
+    fn enter_settings(&mut self) {
+        self.screen = Screen::Settings;
+        self.set_sel = 0;
     }
 
     /// Height in rows of a category panel (rounded border + one row per test).
@@ -519,6 +627,7 @@ impl App {
                     KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
                         self.enter_setup()
                     }
+                    KeyCode::Char('s') => self.enter_settings(),
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(0),
                     _ => {}
                 },
@@ -543,13 +652,25 @@ impl App {
                             }
                         }
                         KeyCode::Enter => {
-                            let argv = self.groups[g].tests[t].build_argv();
+                            let argv = self.groups[g].tests[t].build_argv(&self.settings);
                             self.fire(terminal, &argv);
                         }
                         KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
                         _ => {}
                     }
                 }
+                Screen::Settings => match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.set_sel = self.set_sel.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.set_sel = (self.set_sel + 1).min(SETTINGS_ROWS - 1)
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => self.settings.cycle(self.set_sel, -1),
+                    KeyCode::Right | KeyCode::Char('l') => self.settings.cycle(self.set_sel, 1),
+                    KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
+                    _ => {}
+                },
             }
         }
     }
@@ -569,6 +690,7 @@ impl App {
         match self.screen {
             Screen::Menu => self.draw_menu(f),
             Screen::Setup => self.draw_setup(f),
+            Screen::Settings => self.draw_settings(f),
         }
     }
 
@@ -735,9 +857,10 @@ impl App {
         self.draw_fields(f, chunks[4], test, w);
 
         // The exact command FIRE will run — proof the menu launch is a CLI run.
+        // Any Settings flags show here too, so what you see is what runs.
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!(" ▶ cec-crucible {}", test.build_argv().join(" ")),
+                format!(" ▶ cec-crucible {}", test.build_argv(&self.settings).join(" ")),
                 Style::default().fg(theme::FAINT),
             ))),
             chunks[6],
@@ -795,6 +918,101 @@ impl App {
             .collect();
         f.render_widget(Paragraph::new(lines), area);
     }
+
+    /// The Settings screen: a centred card of three `‹ value ›` rings (results
+    /// CSV / telemetry CSV / output dir) whose values inject into every launch.
+    /// Styled like the setup card — rounded border, brand header, footer hints.
+    fn draw_settings(&self, f: &mut Frame) {
+        let area = f.area();
+        // header + subtitle + spacer + rings + gap + hint + footer.
+        let inner_h = 2 + 1 + 1 + SETTINGS_ROWS as u16 + 1 + 1 + 1;
+        let card = centered_rect(SETUP_W, inner_h + 2, area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::ACCENT));
+        let inner = block.inner(card);
+        f.render_widget(block, card);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),                    // brand header (+ SETTINGS tag)
+                Constraint::Length(1),                    // subtitle
+                Constraint::Length(1),                    // spacer
+                Constraint::Length(SETTINGS_ROWS as u16), // the three rings
+                Constraint::Min(1),                       // flexible gap
+                Constraint::Length(1),                    // hint
+                Constraint::Length(1),                    // footer
+            ])
+            .split(inner);
+
+        let w = inner.width as usize;
+        draw_header(f, chunks[0], "SETTINGS");
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "   CSV logging — added to every load & profile launch",
+                Style::default().fg(theme::DIM),
+            ))),
+            chunks[1],
+        );
+
+        self.draw_settings_rows(f, chunks[3], w);
+
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "   written to the --out directory alongside the JSON report",
+                Style::default().fg(theme::FAINT),
+            ))),
+            chunks[5],
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " ←/→ change   ↑/↓ move   Esc back",
+                Style::default().fg(theme::FAINT),
+            ))),
+            chunks[6],
+        );
+    }
+
+    /// The three settings rows as `‹ value ›` rings, mirroring `draw_fields`: the
+    /// focused row shows the adjuster, the others dim their value.
+    fn draw_settings_rows(&self, f: &mut Frame, area: Rect, w: usize) {
+        let rows: [(&str, String); SETTINGS_ROWS] = [
+            ("Results CSV", onoff(self.settings.results_csv)),
+            ("Telemetry CSV", onoff(self.settings.telemetry_csv)),
+            ("Output", self.settings.out_label()),
+        ];
+        let lines: Vec<Line> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (label, value))| {
+                let focused = self.set_sel == i;
+                let label_style = if focused {
+                    Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::FAINT)
+                };
+                let left = vec![
+                    Span::styled(if focused { "  ▸ " } else { "    " }, Style::default().fg(theme::ACCENT)),
+                    Span::styled(*label, label_style),
+                ];
+                // The focused row shows the ‹ value › adjuster; others dim it.
+                let right = if focused {
+                    vec![
+                        Span::styled("‹ ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+                        Span::styled(value.clone(), Style::default().fg(theme::VALUE).add_modifier(Modifier::BOLD)),
+                        Span::styled(" › ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+                    ]
+                } else {
+                    vec![Span::styled(format!("{value}  "), Style::default().fg(theme::DIM))]
+                };
+                lr_line(left, right, w)
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), area);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -829,6 +1047,11 @@ fn lr_line<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<
     Line::from(spans)
 }
 
+/// `on` / `off` label for a boolean Settings ring.
+fn onoff(b: bool) -> String {
+    if b { "on".to_string() } else { "off".to_string() }
+}
+
 /// The two-line brand header shared by both screens: the wordmark + version on
 /// top, the tagline + a right-aligned screen tag under it.
 fn draw_header(f: &mut Frame, area: Rect, tag: &str) {
@@ -855,7 +1078,7 @@ fn draw_menu_footer(f: &mut Frame, area: Rect, more_up: bool, more_down: bool) {
     let line = Line::from(vec![
         Span::styled(arrows, Style::default().fg(theme::ACCENT)),
         Span::styled(
-            " ↑/↓ move   Enter configure   Home/End jump   q quit",
+            " ↑/↓ move   Enter configure   s settings   Home/End jump   q quit",
             Style::default().fg(theme::FAINT),
         ),
     ]);
@@ -960,8 +1183,9 @@ fn launch(argv: &[String]) {
 // Mirrors tui.rs's harness: ratatui's `TestBackend` renders a screen into an
 // in-memory `Buffer` we assert on cell-by-cell — no real terminal. The same
 // buffer is walked into a self-contained coloured-HTML snapshot (the MAIN MENU
-// to `target/tui-menu.html`, a TEST-SETUP screen to `target/tui-config.html`)
-// so the exact rendered menus can be eyeballed and shared.
+// to `target/tui-menu.html`, a TEST-SETUP screen to `target/tui-config.html`,
+// the SETTINGS screen to `target/tui-settings.html`) so the exact rendered
+// screens can be eyeballed and shared.
 
 #[cfg(test)]
 mod tests {
@@ -993,6 +1217,13 @@ mod tests {
         app.enter_setup();
         let (g, t) = app.cur();
         app.field_sel = app.groups[g].tests[t].fields.len(); // focus FIRE
+        app
+    }
+
+    /// An app parked on the Settings screen (top row focused).
+    fn settings_app() -> App {
+        let mut app = App::new();
+        app.enter_settings();
         app
     }
 
@@ -1043,9 +1274,10 @@ mod tests {
 
         let app = setup_app_on("cpu");
         let (g, t) = app.cur();
-        // Defaults: Duration 30s, Shape steady (steady emits nothing).
+        // Defaults: Duration 30s, Shape steady (steady emits nothing), and the
+        // default all-off Settings (so no CSV / --out flags leak in).
         assert_eq!(
-            app.groups[g].tests[t].build_argv(),
+            app.groups[g].tests[t].build_argv(&app.settings),
             strs(&["cpu", "--seconds", "30", "--ui"])
         );
 
@@ -1055,14 +1287,14 @@ mod tests {
         app.groups[g].tests[t].fields[0].right(); // Duration 30 -> 60
         app.groups[g].tests[t].fields[1].right(); // Shape steady -> burst
         assert_eq!(
-            app.groups[g].tests[t].build_argv(),
+            app.groups[g].tests[t].build_argv(&app.settings),
             strs(&["cpu", "--seconds", "60", "--shape", "burst", "--ui"])
         );
 
         // A diagnostic is a bare command with no duration / live UI.
         let app = setup_app_on("info");
         let (g, t) = app.cur();
-        assert_eq!(app.groups[g].tests[t].build_argv(), strs(&["info"]));
+        assert_eq!(app.groups[g].tests[t].build_argv(&app.settings), strs(&["info"]));
     }
 
     #[test]
@@ -1075,7 +1307,7 @@ mod tests {
             .copied()
             .find(|&(g, t)| matches!(app.groups[g].tests[t].launch, Launch::Profile("quick")))
             .expect("quick profile present");
-        let argv = app.groups[gi].tests[ti].build_argv();
+        let argv = app.groups[gi].tests[ti].build_argv(&app.settings);
         assert_eq!(
             argv,
             ["run", "quick", "--seconds", "30", "--ui"]
@@ -1083,6 +1315,76 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn settings_renders_key_content() {
+        // The card + its three rings must fit and keep the essentials at both sizes.
+        for (w, h) in [(100u16, 30u16), (140, 44)] {
+            let app = settings_app();
+            let text = buffer_text(&render(&app, w, h));
+            assert!(text.contains("SETTINGS"), "title missing @ {w}x{h}");
+            assert!(text.contains("Results CSV"), "results row missing @ {w}x{h}");
+            assert!(text.contains("Telemetry"), "telemetry row missing @ {w}x{h}");
+            assert!(text.contains("Output"), "output row missing @ {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn settings_inject_flags_into_loads() {
+        let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // All-off (the default): a load launch is byte-identical to a CLI run.
+        let app = setup_app_on("cpu");
+        let (g, t) = app.cur();
+        assert_eq!(
+            app.groups[g].tests[t].build_argv(&app.settings),
+            strs(&["cpu", "--seconds", "30", "--ui"])
+        );
+
+        // Both CSV flags on → injected ahead of `--ui` on a load test.
+        let mut app = setup_app_on("cpu");
+        app.settings.results_csv = true;
+        app.settings.telemetry_csv = true;
+        let (g, t) = app.cur();
+        let argv = app.groups[g].tests[t].build_argv(&app.settings);
+        assert!(argv.contains(&"--csv".to_string()), "--csv missing: {argv:?}");
+        assert!(
+            argv.contains(&"--telemetry-csv".to_string()),
+            "--telemetry-csv missing: {argv:?}"
+        );
+        assert!(argv.contains(&"--ui".to_string()), "--ui missing: {argv:?}");
+
+        // The `./crucible-reports` output preset injects `--out crucible-reports`.
+        let mut app = setup_app_on("cpu");
+        app.settings.out = 1;
+        let (g, t) = app.cur();
+        let argv = app.groups[g].tests[t].build_argv(&app.settings);
+        assert!(
+            argv.windows(2).any(|pair| pair[0] == "--out" && pair[1] == "crucible-reports"),
+            "--out preset missing: {argv:?}"
+        );
+
+        // Profiles carry the settings flags too (they route through `load_argv`).
+        let mut app = App::new();
+        app.settings.results_csv = true;
+        let (gi, ti) = app
+            .flat
+            .iter()
+            .copied()
+            .find(|&(g, t)| matches!(app.groups[g].tests[t].launch, Launch::Profile("quick")))
+            .expect("quick profile present");
+        let argv = app.groups[gi].tests[ti].build_argv(&app.settings);
+        assert_eq!(argv.first().map(String::as_str), Some("run"));
+        assert!(argv.contains(&"--csv".to_string()), "profile --csv missing: {argv:?}");
+
+        // Info diagnostics never carry settings flags, even with everything on.
+        let mut app = setup_app_on("info");
+        app.settings.results_csv = true;
+        app.settings.telemetry_csv = true;
+        app.settings.out = 1;
+        let (g, t) = app.cur();
+        assert_eq!(app.groups[g].tests[t].build_argv(&app.settings), strs(&["info"]));
     }
 
     // A visual dump, not an assertion — run on demand:
@@ -1107,6 +1409,27 @@ mod tests {
         )
         .expect("write config snapshot");
         eprintln!("wrote config snapshot -> {cfg_path}");
+    }
+
+    // A visual dump, not an assertion — run on demand:
+    //   cargo test -p crucible-cli --features tui -- --ignored emit_settings
+    #[test]
+    #[ignore = "writes target/tui-settings.html; run explicitly for a visual"]
+    fn emit_settings_html_snapshot() {
+        // A representative state: both CSVs on, the relative-dir output preset,
+        // Output focused so its ‹ value › adjuster shows.
+        let mut app = settings_app();
+        app.settings.results_csv = true;
+        app.settings.telemetry_csv = true;
+        app.settings.out = 1;
+        app.set_sel = 2;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tui-settings.html");
+        std::fs::write(
+            path,
+            buffer_to_html(&render(&app, 150, 26), "cec-crucible · settings"),
+        )
+        .expect("write settings snapshot");
+        eprintln!("wrote settings snapshot -> {path}");
     }
 
     /// Walk the buffer into a self-contained coloured-HTML `<pre>`, coalescing
