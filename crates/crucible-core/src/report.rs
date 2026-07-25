@@ -253,7 +253,7 @@ checksum_hex,error_count,detail\n";
 /// doubling any embedded quotes. Detail strings can contain commas, so this
 /// keeps the column count stable.
 fn csv_field(s: &str) -> String {
-    if s.contains(|c: char| c == ',' || c == '"' || c == '\n' || c == '\r') {
+    if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()

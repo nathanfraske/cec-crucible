@@ -86,6 +86,33 @@ pub struct LaneSnap {
     pub detail: String,
 }
 
+/// CSV header for the periodic run-telemetry log (one row per lane per sample).
+pub fn telemetry_csv_header() -> &'static str {
+    "elapsed_s,lane,work,phase,errors,hash_hex\n"
+}
+
+/// Format one telemetry sample — every lane's counters at `elapsed_s` — as CSV
+/// rows for the run-telemetry log: a time series (rate is `d(work)/dt`, i.e. the
+/// derivative of the `work` column) you can graph after a run. Lane labels are
+/// controlled ("core N", "mem", …) but a stray comma is guarded so the columns
+/// stay stable.
+pub fn telemetry_csv_rows(elapsed_s: f64, lanes: &[LaneSnap]) -> String {
+    let mut s = String::new();
+    for l in lanes {
+        let phase = match l.phase {
+            PHASE_WORK => "work",
+            PHASE_DONE => "done",
+            _ => "idle",
+        };
+        let label = l.label.replace(',', "_");
+        s.push_str(&format!(
+            "{elapsed_s:.3},{label},{},{phase},{},{:#018x}\n",
+            l.work, l.errors, l.hash
+        ));
+    }
+    s
+}
+
 /// The kind of transition a marker records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
