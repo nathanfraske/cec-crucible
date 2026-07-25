@@ -214,6 +214,9 @@ GPU OPTIONS (builds with --features gpu):
                          self-consistency — needs a `--features rt` build.
     --pt-samples <N>     Path-trace: paths per pixel per dispatch (default 16).
     --pt-bounces <N>     Path-trace: max path depth / bounces (default 8).
+    --material <name>    Path-trace surface: metal (default), matte, plastic,
+                         mirror, glass, velvet, marble. Each is a distinct (still
+                         deterministic, self-verified) BSDF workload.
                          `pathtrace` is a deterministic multi-bounce Monte-Carlo
                          path tracer — the deep, divergent RT-core + SM stress
                          beyond `rt`. `--preview` shows the live GI render.
@@ -911,6 +914,22 @@ fn pathtrace_kernel_from(p: &Parsed) -> Result<crucible_gpu::rt::RtKernel, Strin
     if let Some(v) = p.get_u64("pt-bounces")? {
         k.bounces = v.clamp(1, 64) as u32;
     }
+    if let Some(name) = p.get("material") {
+        k.material = match name {
+            "metal" => 0,
+            "matte" => 1,
+            "plastic" => 2,
+            "mirror" => 3,
+            "glass" => 4,
+            "velvet" => 5,
+            "marble" => 6,
+            other => {
+                return Err(format!(
+                    "--material expects metal|matte|plastic|mirror|glass|velvet|marble, got '{other}'"
+                ))
+            }
+        };
+    }
     k.preview = p.has("preview");
     Ok(k)
 }
@@ -939,6 +958,7 @@ fn cmd_pathtrace(rest: &[String]) -> Result<u8, String> {
             "json",
             "help",
             "preview",
+            "material",
         ];
         allowed.extend_from_slice(GPU_OPTS);
         allowed.extend_from_slice(SHAPE_OPTS);
@@ -947,9 +967,19 @@ fn cmd_pathtrace(rest: &[String]) -> Result<u8, String> {
         let seconds = seconds_arg(&p, 60)?;
         let shape = shape_from(&p)?;
         let kernel = pathtrace_kernel_from(&p)?;
+        let mat_name = match kernel.material {
+            1 => "matte",
+            2 => "plastic",
+            3 => "mirror",
+            4 => "glass",
+            5 => "velvet",
+            6 => "marble",
+            _ => "metal",
+        };
         let mode = format!(
-            "{} pathtrace {}spp x{}bounce",
+            "{} pathtrace {} {}spp x{}bounce",
             shape.mode_str(),
+            mat_name,
             kernel.samples,
             kernel.bounces
         );

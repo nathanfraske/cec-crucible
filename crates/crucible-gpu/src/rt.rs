@@ -89,6 +89,10 @@ pub struct RtKernel {
     pub samples: u32,
     /// `pathtrace` mode: max path depth (bounces).
     pub bounces: u32,
+    /// `pathtrace` mode: surface material id (0=metal, 1=matte, 2=plastic,
+    /// 3=mirror, 4=glass, 5=velvet, 6=marble). Display + checksum both use it, so
+    /// each material is a distinct (still deterministic) verified workload.
+    pub material: u32,
     /// Read back + checksum every this many dispatches.
     pub verify_every: u64,
     /// Pop a live window showing the shaded image (needs a `--features preview`,
@@ -104,6 +108,7 @@ impl Default for RtKernel {
             iters: 192,
             samples: 16,
             bounces: 8,
+            material: 0,
             verify_every: 64,
             preview: false,
         }
@@ -154,6 +159,12 @@ struct Params {
     samples: u32,
     bounces: u32,
     seed: u32,
+    material: u32,
+    // Pad to 48 bytes (a multiple of 16) so the uniform-buffer layout matches the
+    // WGSL `Params` struct's rounded size on every backend.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 
@@ -635,6 +646,10 @@ fn setup(kernel: &RtKernel) -> Result<RtContext, String> {
         samples: kernel.samples.clamp(1, 1 << 16),
         bounces: kernel.bounces.clamp(1, 64),
         seed: 0x9e37_79b9,
+        material: kernel.material.min(6),
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
     let ubuf = ctx.make_buffer(
         std::mem::size_of::<Params>() as u64,
@@ -1158,6 +1173,27 @@ struct RtPreview {
     device: wgpu::Device,
     queue: wgpu::Queue,
     window: crate::preview::PreviewWindow,
+    gpu_name: String,
+    /// One-shot guard: write at most one PNG snapshot per run (env `CRUCIBLE_SNAP`).
+    snapped: std::cell::Cell<bool>,
+}
+
+/// A snapshot of live run state, passed to the preview each presented frame so it
+/// can stamp a heads-up display over the traced image. All display-only — none of
+/// this feeds the checksum.
+#[cfg(all(windows, feature = "preview"))]
+struct HudStats<'a> {
+    title: &'a str,     // "PATH TRACE" / "RAY QUERY"
+    gpu: &'a str,       // adapter name, e.g. "NVIDIA GeForce RTX 3070"
+    load: &'a str,      // "64 SPP X8" / "X4096 TRACES"
+    rays_per_sec: f64,  // rolling estimate
+    dispatches: u64,
+    verifications: u64,
+    errors: u64,
+    elapsed: f32,
+    res_w: u32,
+    res_h: u32,
+    pulse: f32,         // 0..1 verify-pulse intensity (fades after each pass)
 }
 
 #[cfg(all(windows, feature = "preview"))]
@@ -1209,11 +1245,14 @@ impl RtPreview {
             &device, &adapter, surface, res_w, res_h, res_w, res_h,
         )
         .ok()?;
+        let gpu_name = adapter.get_info().name;
         Some(RtPreview {
             window,
             device,
             queue,
             presenter,
+            gpu_name,
+            snapped: std::cell::Cell::new(false),
         })
     }
 
@@ -1228,12 +1267,146 @@ impl RtPreview {
         self.window.pump()
     }
 
-    /// Read back the (just-shaded) colour image and present it.
-    fn present(&self, ctx: &RtContext) {
-        let pixels = ctx.readback_color();
+    /// Read back the (just-shaded) colour image, stamp the HUD over it, and present.
+    fn present(&self, ctx: &RtContext, hud: &HudStats) {
+        let mut pixels = ctx.readback_color();
+        self.draw_hud(&mut pixels, ctx.width as usize, ctx.height as usize, hud);
+        // Optional one-shot PNG snapshot (env `CRUCIBLE_SNAP=path`). Taken a few
+        // seconds in so the counters are populated and the camera has turned.
+        if !self.snapped.get() && hud.elapsed > 4.0 {
+            if let Ok(path) = std::env::var("CRUCIBLE_SNAP") {
+                match crate::preview::write_png(&path, ctx.width, ctx.height, &pixels) {
+                    Ok(()) => eprintln!("note: wrote preview snapshot -> {path}"),
+                    Err(e) => eprintln!("note: snapshot failed: {e}"),
+                }
+                self.snapped.set(true);
+            }
+        }
         self.presenter
             .present_rgba(&self.device, &self.queue, &pixels);
     }
+
+    /// Compose the heads-up display onto the RGBA8 frame: a translucent panel with
+    /// the live throughput/verification readout, plus a green border pulse each
+    /// time a self-consistency check passes. Pure pixel writes (see `preview`).
+    fn draw_hud(&self, buf: &mut [u8], w: usize, h: usize, hud: &HudStats) {
+        use crate::preview::{draw_border, draw_check, draw_text, fill_blend, text_width};
+
+        // Palette (plain sRGB bytes — the image is already gamma-encoded).
+        const WHITE: [u8; 4] = [232, 238, 245, 255];
+        const CYAN: [u8; 4] = [90, 210, 255, 255];
+        const GREEN: [u8; 4] = [120, 230, 160, 255];
+        const GPUCLR: [u8; 4] = [150, 205, 135, 255];
+        const LABEL: [u8; 4] = [128, 142, 158, 255];
+        const RED: [u8; 4] = [245, 110, 110, 255];
+
+        let s = 3usize; // scale for the main readout
+        let px = 14usize;
+        let py = 14usize;
+        let pad = 14usize;
+        let line = s * GLYPH7 + 8; // row pitch
+        let val_col = text_width("DISPATCH", s) + 20; // value column, past the widest label
+
+        // Panel geometry: title + gpu + 5 rows + footer. Width fits the widest line.
+        let rows_w = pad + val_col + text_width("00000000", s) + pad;
+        let title_w = pad + text_width("CEC-CRUCIBLE ", 2) + text_width(hud.title, 2) + pad;
+        let gpu_w = pad + text_width(hud.gpu, 2) + pad;
+        let panel_w = rows_w.max(title_w).max(gpu_w).min(w.saturating_sub(px + 4));
+        let panel_h = 26 + 20 + 8 + 5 * line + 24 + pad;
+        fill_blend(buf, w, h, px, py, panel_w, panel_h, [8, 11, 16, 170]);
+        // A thin cyan top accent so the panel reads as a device.
+        fill_blend(buf, w, h, px, py, panel_w, 3, [60, 150, 200, 200]);
+
+        let mut y = py + pad;
+        // Title: "CEC-CRUCIBLE" then the mode in cyan.
+        let ex = draw_text(buf, w, h, px + pad, y, 2, "CEC-CRUCIBLE", WHITE);
+        draw_text(buf, w, h, ex + (5 + 1) * 2, y, 2, hud.title, CYAN);
+        y += 2 * GLYPH7 + 8;
+        // GPU name, smaller.
+        draw_text(buf, w, h, px + pad, y, 2, &hud.gpu.to_ascii_uppercase(), GPUCLR);
+        y += 2 * GLYPH7 + 10;
+        // Separator.
+        fill_blend(buf, w, h, px + pad, y, panel_w - 2 * pad, 2, [70, 84, 100, 180]);
+        y += 8;
+
+        let label_x = px + pad;
+        let value_x = px + pad + val_col;
+
+        // RAYS/S — the hero figure, in green.
+        draw_text(buf, w, h, label_x, y, s, "RAYS/S", LABEL);
+        draw_text(buf, w, h, value_x, y, s, &fmt_rate(hud.rays_per_sec), GREEN);
+        y += line;
+        // DISPATCH count.
+        draw_text(buf, w, h, label_x, y, s, "DISPATCH", LABEL);
+        draw_text(buf, w, h, value_x, y, s, &hud.dispatches.to_string(), WHITE);
+        y += line;
+        // VERIFIED count, with a tick that pulses green on each fresh pass.
+        draw_text(buf, w, h, label_x, y, s, "VERIFIED", LABEL);
+        let vx = draw_text(buf, w, h, value_x, y, s, &hud.verifications.to_string(), WHITE);
+        let tick = lerp_clr([70, 150, 95, 255], GREEN, hud.pulse);
+        draw_check(buf, w, h, vx + (5 + 1) * s, y, s, tick);
+        y += line;
+        // SAMPLES / trace count.
+        draw_text(buf, w, h, label_x, y, s, "SAMPLES", LABEL);
+        draw_text(buf, w, h, value_x, y, s, hud.load, WHITE);
+        y += line;
+        // Elapsed mm:ss.
+        let t = hud.elapsed as u32;
+        draw_text(buf, w, h, label_x, y, s, "TIME", LABEL);
+        draw_text(buf, w, h, value_x, y, s, &format!("{:02}:{:02}", t / 60, t % 60), WHITE);
+        y += line + 4;
+
+        // Footer: QC status + resolution.
+        let (status, sclr) = if hud.errors == 0 {
+            ("SELF-CHECK PASS", GREEN)
+        } else {
+            ("SELF-CHECK FAIL", RED)
+        };
+        let fx = draw_text(buf, w, h, label_x, y, 2, status, sclr);
+        draw_text(
+            buf,
+            w,
+            h,
+            fx + 4 * 2,
+            y,
+            2,
+            &format!("{}X{}", hud.res_w, hud.res_h),
+            LABEL,
+        );
+
+        // Verify-pulse heartbeat: a green frame that fades over ~0.35 s.
+        if hud.pulse > 0.001 {
+            let a = (hud.pulse * 180.0) as u8;
+            draw_border(buf, w, h, 3, [70, 240, 130, a]);
+        }
+    }
+}
+
+/// Font cell height (matches `preview::GLYPH_H`), for HUD row-pitch arithmetic.
+#[cfg(all(windows, feature = "preview"))]
+const GLYPH7: usize = 7;
+
+/// Format a ray rate as a compact "20.3 G" / "480 M" / "9500" string.
+#[cfg(all(windows, feature = "preview"))]
+fn fmt_rate(r: f64) -> String {
+    if r >= 1.0e9 {
+        format!("{:.1} G", r / 1.0e9)
+    } else if r >= 1.0e6 {
+        format!("{:.0} M", r / 1.0e6)
+    } else {
+        format!("{r:.0}")
+    }
+}
+
+/// Linear blend between two sRGB colours (for the fading verify tick).
+#[cfg(all(windows, feature = "preview"))]
+fn lerp_clr(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
+    let t = t.clamp(0.0, 1.0);
+    let mut o = [0u8; 4];
+    for i in 0..4 {
+        o[i] = (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t) as u8;
+    }
+    o
 }
 
 impl LoadKernel for RtKernel {
@@ -1290,6 +1463,36 @@ impl LoadKernel for RtKernel {
         let mut verifications: u64 = 0;
         let mut errors: u64 = 0;
         let mut reference: Option<u64> = Some(reference0);
+
+        // HUD telemetry (preview only): a rolling rays/s estimate and a verify
+        // "pulse" that flashes the border/tick each time a self-consistency check
+        // passes. All display-side; none of it touches the checksum.
+        #[cfg(all(windows, feature = "preview"))]
+        let hud_rpd = (ctx.width * ctx.height) as f64
+            * match self.mode {
+                RtMode::RayQuery => self.iters.max(1) as f64,
+                RtMode::PathTrace => (self.samples.max(1) * self.bounces.max(1)) as f64,
+            };
+        #[cfg(all(windows, feature = "preview"))]
+        let hud_load = match self.mode {
+            RtMode::RayQuery => format!("X{}", self.iters),
+            RtMode::PathTrace => format!("{} X{}", self.samples, self.bounces),
+        };
+        #[cfg(all(windows, feature = "preview"))]
+        let hud_title = match self.mode {
+            RtMode::RayQuery => "RAY QUERY",
+            RtMode::PathTrace => "PATH TRACE",
+        };
+        #[cfg(all(windows, feature = "preview"))]
+        let mut rays_ema = 0.0f64;
+        #[cfg(all(windows, feature = "preview"))]
+        let mut last_present_n = 0u64;
+        #[cfg(all(windows, feature = "preview"))]
+        let mut last_present_t = Instant::now();
+        #[cfg(all(windows, feature = "preview"))]
+        let mut last_verifs = 0u64;
+        #[cfg(all(windows, feature = "preview"))]
+        let mut last_verify_at: Option<Instant> = None;
 
         loop {
             match driver.tick() {
@@ -1350,7 +1553,44 @@ impl LoadKernel for RtKernel {
                         if !pv.pump() {
                             stop.stop();
                         } else if present_now {
-                            pv.present(&ctx);
+                            let now = Instant::now();
+                            // Rolling rays/s over the interval since the last frame.
+                            let dn = dispatches - last_present_n;
+                            let dt = now.duration_since(last_present_t).as_secs_f64();
+                            if dt > 0.0 {
+                                let inst = dn as f64 * hud_rpd / dt;
+                                rays_ema = if rays_ema == 0.0 {
+                                    inst
+                                } else {
+                                    rays_ema * 0.75 + inst * 0.25
+                                };
+                            }
+                            last_present_n = dispatches;
+                            last_present_t = now;
+                            // Fresh verify since last frame → (re)start the pulse.
+                            if verifications > last_verifs {
+                                last_verifs = verifications;
+                                last_verify_at = Some(now);
+                            }
+                            let pulse = last_verify_at
+                                .map(|t| {
+                                    (1.0 - now.duration_since(t).as_secs_f32() / 0.35).max(0.0)
+                                })
+                                .unwrap_or(0.0);
+                            let hud = HudStats {
+                                title: hud_title,
+                                gpu: pv.gpu_name.as_str(),
+                                load: hud_load.as_str(),
+                                rays_per_sec: rays_ema,
+                                dispatches,
+                                verifications,
+                                errors,
+                                elapsed: start.elapsed().as_secs_f32(),
+                                res_w: ctx.width,
+                                res_h: ctx.height,
+                                pulse,
+                            };
+                            pv.present(&ctx, &hud);
                         }
                     }
                 }

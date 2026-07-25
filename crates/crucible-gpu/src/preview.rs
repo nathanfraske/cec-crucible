@@ -658,3 +658,245 @@ impl PixelPresenter {
         frame.present();
     }
 }
+
+// ---------------------------------------------------------------------------
+// HUD overlay
+// ---------------------------------------------------------------------------
+//
+// The preview image is a CPU-side RGBA8 `Vec` on its way to the swapchain (see
+// `PixelPresenter::present_rgba`), so a heads-up display is just pixel writes —
+// no font atlas, glyph pipeline, or extra bind group. A compact 5x7 bitmap font
+// is stamped straight onto the buffer before it is uploaded. The image is already
+// gamma-encoded and the swapchain is non-sRGB, so the bytes written here appear
+// on screen as-is: pick colours in plain sRGB.
+
+const GLYPH_W: usize = 5;
+const GLYPH_H: usize = 7;
+
+/// 7 rows per glyph; the low 5 bits of each row are the pixels, bit 4 leftmost.
+/// Uppercase-only (callers `to_ascii_uppercase`), digits, and the punctuation the
+/// HUD needs. Unknown characters render blank.
+#[rustfmt::skip]
+fn glyph(c: char) -> [u8; GLYPH_H] {
+    match c.to_ascii_uppercase() {
+        'A' => [0b00100,0b01010,0b10001,0b10001,0b11111,0b10001,0b10001],
+        'B' => [0b11110,0b10001,0b10001,0b11110,0b10001,0b10001,0b11110],
+        'C' => [0b01110,0b10001,0b10000,0b10000,0b10000,0b10001,0b01110],
+        'D' => [0b11100,0b10010,0b10001,0b10001,0b10001,0b10010,0b11100],
+        'E' => [0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b11111],
+        'F' => [0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b10000],
+        'G' => [0b01110,0b10001,0b10000,0b10111,0b10001,0b10001,0b01111],
+        'H' => [0b10001,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001],
+        'I' => [0b01110,0b00100,0b00100,0b00100,0b00100,0b00100,0b01110],
+        'J' => [0b00111,0b00010,0b00010,0b00010,0b00010,0b10010,0b01100],
+        'K' => [0b10001,0b10010,0b10100,0b11000,0b10100,0b10010,0b10001],
+        'L' => [0b10000,0b10000,0b10000,0b10000,0b10000,0b10000,0b11111],
+        'M' => [0b10001,0b11011,0b10101,0b10101,0b10001,0b10001,0b10001],
+        'N' => [0b10001,0b11001,0b10101,0b10101,0b10011,0b10001,0b10001],
+        'O' => [0b01110,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110],
+        'P' => [0b11110,0b10001,0b10001,0b11110,0b10000,0b10000,0b10000],
+        'Q' => [0b01110,0b10001,0b10001,0b10001,0b10101,0b10010,0b01101],
+        'R' => [0b11110,0b10001,0b10001,0b11110,0b10100,0b10010,0b10001],
+        'S' => [0b01111,0b10000,0b10000,0b01110,0b00001,0b00001,0b11110],
+        'T' => [0b11111,0b00100,0b00100,0b00100,0b00100,0b00100,0b00100],
+        'U' => [0b10001,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110],
+        'V' => [0b10001,0b10001,0b10001,0b10001,0b10001,0b01010,0b00100],
+        'W' => [0b10001,0b10001,0b10001,0b10101,0b10101,0b10101,0b01010],
+        'X' => [0b10001,0b10001,0b01010,0b00100,0b01010,0b10001,0b10001],
+        'Y' => [0b10001,0b10001,0b01010,0b00100,0b00100,0b00100,0b00100],
+        'Z' => [0b11111,0b00001,0b00010,0b00100,0b01000,0b10000,0b11111],
+        '0' => [0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110],
+        '1' => [0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110],
+        '2' => [0b01110,0b10001,0b00001,0b00110,0b01000,0b10000,0b11111],
+        '3' => [0b11111,0b00010,0b00100,0b00010,0b00001,0b10001,0b01110],
+        '4' => [0b00010,0b00110,0b01010,0b10010,0b11111,0b00010,0b00010],
+        '5' => [0b11111,0b10000,0b11110,0b00001,0b00001,0b10001,0b01110],
+        '6' => [0b00110,0b01000,0b10000,0b11110,0b10001,0b10001,0b01110],
+        '7' => [0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000],
+        '8' => [0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110],
+        '9' => [0b01110,0b10001,0b10001,0b01111,0b00001,0b00010,0b01100],
+        '-' => [0b00000,0b00000,0b00000,0b11111,0b00000,0b00000,0b00000],
+        '.' => [0b00000,0b00000,0b00000,0b00000,0b00000,0b00110,0b00110],
+        ':' => [0b00000,0b01100,0b01100,0b00000,0b01100,0b01100,0b00000],
+        '/' => [0b00001,0b00010,0b00010,0b00100,0b01000,0b01000,0b10000],
+        '%' => [0b11001,0b11010,0b00100,0b01000,0b10011,0b00101,0b00011],
+        _ => [0, 0, 0, 0, 0, 0, 0],
+    }
+}
+
+/// Write one pixel, alpha-blending when `color[3] < 255` (for translucent panels
+/// and the fading verify pulse); a straight store when opaque.
+#[inline]
+fn put_px(buf: &mut [u8], w: usize, h: usize, x: usize, y: usize, color: [u8; 4]) {
+    if x >= w || y >= h {
+        return;
+    }
+    let i = (y * w + x) * 4;
+    let a = color[3] as u32;
+    if a >= 255 {
+        buf[i] = color[0];
+        buf[i + 1] = color[1];
+        buf[i + 2] = color[2];
+        buf[i + 3] = 255;
+    } else if a > 0 {
+        for k in 0..3 {
+            let dst = buf[i + k] as u32;
+            let src = color[k] as u32;
+            buf[i + k] = ((src * a + dst * (255 - a)) / 255) as u8;
+        }
+    }
+}
+
+/// Stamp a string at (`x`,`y`), `scale` device pixels per font dot. Returns the x
+/// just past the last glyph (so callers can chain coloured runs on one line).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    scale: usize,
+    text: &str,
+    color: [u8; 4],
+) -> usize {
+    let mut cx = x;
+    for ch in text.chars() {
+        let g = glyph(ch);
+        for (row, bits) in g.iter().enumerate() {
+            for col in 0..GLYPH_W {
+                if bits & (1 << (GLYPH_W - 1 - col)) != 0 {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            put_px(buf, w, h, cx + col * scale + dx, y + row * scale + dy, color);
+                        }
+                    }
+                }
+            }
+        }
+        cx += (GLYPH_W + 1) * scale;
+    }
+    cx
+}
+
+/// Pixel width a string will occupy at `scale` (for right-aligning / panel sizing).
+pub fn text_width(text: &str, scale: usize) -> usize {
+    text.chars().count() * (GLYPH_W + 1) * scale
+}
+
+/// Fill a rectangle (clipped), alpha-blended — the translucent HUD backing panel.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_blend(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    rw: usize,
+    rh: usize,
+    color: [u8; 4],
+) {
+    for yy in y..(y + rh).min(h) {
+        for xx in x..(x + rw).min(w) {
+            put_px(buf, w, h, xx, yy, color);
+        }
+    }
+}
+
+/// A checkmark drawn procedurally (a short down-stroke then a long up-stroke),
+/// `scale` pixels per unit — the "verified" tick beside the pass count.
+pub fn draw_check(buf: &mut [u8], w: usize, h: usize, x: usize, y: usize, scale: usize, color: [u8; 4]) {
+    // Points across a ~7-wide box: dip to (2,5) then rise to (6,1).
+    const PTS: [(usize, usize); 7] = [(0, 3), (1, 4), (2, 5), (3, 4), (4, 3), (5, 2), (6, 1)];
+    for (px, py) in PTS {
+        for dy in 0..scale {
+            for dx in 0..scale {
+                put_px(buf, w, h, x + px * scale + dx, y + py * scale + dy, color);
+            }
+        }
+    }
+}
+
+/// Draw a `thickness`-pixel border around the whole image — the verify-pulse
+/// heartbeat. Alpha in `color` carries the (fading) pulse intensity.
+pub fn draw_border(buf: &mut [u8], w: usize, h: usize, thickness: usize, color: [u8; 4]) {
+    for t in 0..thickness {
+        for x in 0..w {
+            put_px(buf, w, h, x, t, color);
+            put_px(buf, w, h, x, h.saturating_sub(1 + t), color);
+        }
+        for y in 0..h {
+            put_px(buf, w, h, t, y, color);
+            put_px(buf, w, h, w.saturating_sub(1 + t), y, color);
+        }
+    }
+}
+
+/// Minimal PNG encoder (8-bit RGBA, DEFLATE "stored" blocks — no compression, no
+/// external crate). Used to snapshot a preview frame (HUD included) to disk for
+/// README stills or eyeballing the overlay. Off any hot path.
+pub fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+    fn adler32(bytes: &[u8]) -> u32 {
+        let (mut a, mut b): (u32, u32) = (1, 0);
+        for &byte in bytes {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    // Raw scanlines, each prefixed with filter byte 0 (None).
+    let (wu, hu) = (w as usize, h as usize);
+    let mut raw = Vec::with_capacity(hu * (1 + wu * 4));
+    for y in 0..hu {
+        raw.push(0u8);
+        raw.extend_from_slice(&rgba[y * wu * 4..(y + 1) * wu * 4]);
+    }
+
+    // zlib stream: header, stored DEFLATE blocks (<=65535 each), adler32 trailer.
+    let mut zlib = vec![0x78u8, 0x01];
+    let mut i = 0;
+    while i < raw.len() {
+        let n = (raw.len() - i).min(65535);
+        let last = i + n >= raw.len();
+        zlib.push(u8::from(last)); // BFINAL, BTYPE=00 (stored)
+        zlib.extend_from_slice(&(n as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(n as u16)).to_le_bytes());
+        zlib.extend_from_slice(&raw[i..i + n]);
+        i += n;
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, RGBA, deflate, filter 0, no interlace
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &zlib);
+    chunk(&mut png, b"IEND", &[]);
+
+    std::fs::File::create(path)?.write_all(&png)?;
+    Ok(())
+}
