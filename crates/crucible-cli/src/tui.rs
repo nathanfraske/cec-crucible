@@ -389,3 +389,210 @@ fn gauge_ratio(rate: f64) -> f64 {
         (rate.log10() / 10.0).clamp(0.05, 1.0)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test harness
+// ---------------------------------------------------------------------------
+//
+// ratatui's `TestBackend` renders a frame into an in-memory `Buffer` we can
+// assert on cell-by-cell — no real terminal, no escape-code grepping. The same
+// buffer is walked into a self-contained coloured-HTML snapshot (written to
+// `target/tui-dashboard.html`) so the exact rendered dashboard can be eyeballed
+// and shared. Feeds the real `dashboard()` draw fn synthetic-but-realistic lane
+// data (cores + memory/GPU/VRAM/pathtrace panels with pattern, values, hash).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crucible_core::markers::PHASE_IDLE;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Position;
+
+    fn lane(label: &str, work: u64, phase: u8, hash: u64, detail: &str) -> LaneSnap {
+        LaneSnap {
+            label: label.to_string(),
+            work,
+            errors: 0,
+            phase,
+            hash,
+            detail: detail.to_string(),
+        }
+    }
+
+    fn synth_lanes() -> Vec<LaneSnap> {
+        let mut v = Vec::new();
+        for n in 0..20u32 {
+            // A deterministic but varied per-core activity so the grid looks alive.
+            let work = (((n.wrapping_mul(37).wrapping_add(9)) % 100) as u64) * 800 + 200;
+            let phase = if n % 7 == 3 { PHASE_IDLE } else { PHASE_WORK };
+            v.push(lane(&format!("core {n}"), work, phase, 0, ""));
+        }
+        v.push(lane(
+            "mem",
+            42_000,
+            PHASE_WORK,
+            0x9e37_79b9_7f4a_7c15,
+            "pattern: moving-inv 0xaaaaaaaaaaaaaaaa\nread:   0xaaaaaaaaaaaaaaaa\nexpect: 0xaaaaaaaaaaaaaaaa  OK\nword:   1310719\nverified: 4.21 GiB",
+        ));
+        v.push(lane(
+            "gpu",
+            5_200_000,
+            PHASE_WORK,
+            0x0000_0000_12ab_34cd,
+            "watts:  218 W (92%)\nkernel: fma-thrash x4096\nbackend: vulkan",
+        ));
+        v.push(lane(
+            "vram",
+            900_000,
+            PHASE_WORK,
+            0xdead_beef_cafe_f00d,
+            "pattern: checkerboard\nregion: 0x4000..0x0400_0000\nverified: 447 GiB",
+        ));
+        v.push(lane(
+            "pathtrace",
+            41,
+            PHASE_WORK,
+            0x0000_0000_5a3c_11e9,
+            "material: glass\nsamples: 64 x8\nrays: 12.3 Gray/s",
+        ));
+        v
+    }
+
+    fn synth_rates(lanes: &[LaneSnap]) -> HashMap<String, RateEma> {
+        let now = Instant::now();
+        lanes
+            .iter()
+            .map(|l| {
+                let rate = match l.label.as_str() {
+                    "mem" => 6.5e9,
+                    "gpu" => 5.2e9,
+                    "vram" => 2.2e10,
+                    "pathtrace" => 1.2e10,
+                    _ => (l.work as f64) + 500.0,
+                };
+                (
+                    l.label.clone(),
+                    RateEma {
+                        last_work: l.work,
+                        last_t: now,
+                        rate,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn render(w: u16, h: u16) -> Buffer {
+        let lanes = synth_lanes();
+        let rates = synth_rates(&lanes);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let start = Instant::now();
+        terminal
+            .draw(|f| dashboard(f, "RTX 3070 · worst-case", start, &lanes, &rates, 20590))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buf: &Buffer) -> String {
+        let a = buf.area;
+        let mut s = String::new();
+        for y in 0..a.height {
+            for x in 0..a.width {
+                s.push_str(buf[Position::new(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn dashboard_renders_key_content() {
+        // A range of sizes: the layout must fit (no panic) and keep the essentials.
+        for (w, h) in [(100u16, 30u16), (140, 44), (200, 60)] {
+            let buf = render(w, h);
+            let text = buffer_text(&buf);
+            assert!(text.contains("CRUCIBLE"), "brand missing @ {w}x{h}");
+            assert!(text.contains("CPU"), "core grid title missing @ {w}x{h}");
+            assert!(text.contains("MEM"), "mem panel missing @ {w}x{h}");
+            assert!(text.contains("moving-inv"), "mem pattern missing @ {w}x{h}");
+            assert!(text.contains("GPU"), "gpu panel missing @ {w}x{h}");
+            assert!(text.contains("RUNNING"), "status missing @ {w}x{h}");
+        }
+    }
+
+    // A visual dump, not an assertion — run on demand:
+    //   cargo test -p crucible-cli --features tui -- --ignored emit_html_snapshot
+    #[test]
+    #[ignore = "writes target/tui-dashboard.html; run explicitly for a visual"]
+    fn emit_html_snapshot() {
+        let buf = render(150, 46);
+        let html = buffer_to_html(&buf);
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tui-dashboard.html");
+        std::fs::write(path, html).expect("write html snapshot");
+        eprintln!("wrote dashboard snapshot -> {path}");
+    }
+
+    /// Walk the buffer into a self-contained coloured-HTML `<pre>`, coalescing
+    /// runs of same colour/weight so the file stays small.
+    fn buffer_to_html(buf: &Buffer) -> String {
+        let a = buf.area;
+        let mut out = String::from(
+            "<!doctype html><html><head><meta charset=\"utf-8\">\
+             <title>cec-crucible · live dashboard</title></head>\
+             <body style=\"background:#05070c;margin:0;padding:24px;\
+             display:flex;justify-content:center\">\
+             <pre style=\"margin:0;padding:18px;background:#0b0e14;\
+             color:#c8d0dc;font:13px/1.22 'Cascadia Code',Consolas,monospace;\
+             border-radius:10px;overflow:auto;display:inline-block;\
+             box-shadow:0 8px 40px rgba(0,0,0,.6)\">",
+        );
+        for y in 0..a.height {
+            let mut run = String::new();
+            let mut run_key: Option<(String, bool)> = None;
+            let flush = |out: &mut String, run: &mut String, key: &Option<(String, bool)>| {
+                if run.is_empty() {
+                    return;
+                }
+                if let Some((hex, bold)) = key {
+                    let weight = if *bold { "font-weight:700" } else { "" };
+                    out.push_str(&format!("<span style=\"color:{hex};{weight}\">{run}</span>"));
+                }
+                run.clear();
+            };
+            for x in 0..a.width {
+                let cell = &buf[Position::new(x, y)];
+                let hex = color_hex(cell.fg);
+                let bold = cell.modifier.contains(Modifier::BOLD);
+                let key = (hex, bold);
+                if run_key.as_ref() != Some(&key) {
+                    flush(&mut out, &mut run, &run_key);
+                    run_key = Some(key);
+                }
+                match cell.symbol() {
+                    "<" => run.push_str("&lt;"),
+                    ">" => run.push_str("&gt;"),
+                    "&" => run.push_str("&amp;"),
+                    s => run.push_str(s),
+                }
+            }
+            flush(&mut out, &mut run, &run_key);
+            out.push('\n');
+        }
+        out.push_str("</pre></body></html>");
+        out
+    }
+
+    fn color_hex(c: Color) -> String {
+        match c {
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            Color::Green => "#78e696".into(),
+            Color::Red => "#f56868".into(),
+            Color::Cyan => "#60cdff".into(),
+            Color::White => "#dce4ec".into(),
+            Color::DarkGray => "#54617a".into(),
+            Color::Gray => "#8894a6".into(),
+            _ => "#c8d0dc".into(),
+        }
+    }
+}
