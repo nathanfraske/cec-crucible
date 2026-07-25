@@ -31,7 +31,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, BorderType, Borders, Gauge, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crucible_core::kernel::StopFlag;
@@ -146,7 +146,16 @@ fn dashboard(
         .collect();
 
     let has_cores = !cores.is_empty();
-    let core_h: u16 = if has_cores { 11 } else { 0 };
+    // Height the core panel to the heatmap it will draw (see draw_core_grid):
+    // chunky = 3 terminal rows per grid-row, dense (>48 cores) = 1.
+    let core_h: u16 = if has_cores {
+        let w = (f.area().width.saturating_sub(2)).max(1) as usize;
+        let (cell, per_gridrow) = if cores.len() > 48 { (1usize, 1u16) } else { (3usize, 3u16) };
+        let rows = cores.len().div_ceil((w / cell).max(1)).max(1) as u16;
+        (2 + rows * per_gridrow).clamp(4, f.area().height / 2)
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -203,8 +212,11 @@ fn draw_header(
     f.render_widget(Paragraph::new(line).block(block), area);
 }
 
-/// One bar per CPU core, height = its EMA work rate, coloured by phase — the
-/// "big grid of bars raising and lowering per core".
+/// Per-core activity as a **heatmap grid** — one fixed cell per core, coloured by
+/// its load (dim = idle → cyan→pink = busy). Reads at a glance without the jitter
+/// of variable-height bars, and it *scales*: chunky labelled cells for a normal
+/// desktop, but a single dense column per core beyond 48 threads so a
+/// Threadripper / Xeon (128+) still fits the panel by wrapping.
 fn draw_core_grid(
     f: &mut Frame,
     area: Rect,
@@ -216,29 +228,6 @@ fn draw_core_grid(
         .map(|(_, l)| rate_of(rates, &l.label))
         .fold(1.0_f64, f64::max);
 
-    let bars: Vec<Bar> = cores
-        .iter()
-        .map(|(n, l)| {
-            let r = rate_of(rates, &l.label);
-            let working = l.phase == PHASE_WORK;
-            let frac = (r / max_rate).clamp(0.0, 1.0);
-            // Value scaled 0..100 so the tallest core fills the panel.
-            let v = (frac * 100.0).round() as u64;
-            let color = if l.errors > 0 {
-                theme::BAD
-            } else if working {
-                core_heat(frac)
-            } else {
-                theme::IDLE_BAR
-            };
-            Bar::default()
-                .value(v)
-                .text_value(String::new()) // no number label; keep the grid clean
-                .label(Line::from(format!("{n}")))
-                .style(Style::default().fg(color))
-        })
-        .collect();
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -247,14 +236,58 @@ fn draw_core_grid(
             format!(" CPU · {} threads ", cores.len()),
             Style::default().fg(theme::LABEL).add_modifier(Modifier::BOLD),
         ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-    let chart = BarChart::default()
-        .block(block)
-        .data(BarGroup::default().bars(&bars))
-        .bar_width(3)
-        .bar_gap(1)
-        .max(100);
-    f.render_widget(chart, area);
+    let color_of = |l: &LaneSnap| {
+        let frac = (rate_of(rates, &l.label) / max_rate).clamp(0.0, 1.0);
+        if l.errors > 0 {
+            theme::BAD
+        } else if l.phase == PHASE_WORK && frac > 0.02 {
+            core_heat(frac)
+        } else {
+            theme::IDLE_BAR
+        }
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    if cores.len() > 48 {
+        // Dense: one column per core, no labels — a 128-thread part still fits.
+        let per_row = (inner.width as usize).max(1);
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, e) in cores.iter().enumerate() {
+            spans.push(Span::styled("█", Style::default().fg(color_of(e.1))));
+            if (i + 1) % per_row == 0 {
+                lines.push(Line::from(std::mem::take(&mut spans)));
+            }
+        }
+        if !spans.is_empty() {
+            lines.push(Line::from(spans));
+        }
+    } else {
+        // Chunky: a 2-wide block per core with its index under it.
+        let per_row = (inner.width as usize / 3).max(1);
+        let (mut blocks, mut labels): (Vec<Span>, Vec<Span>) = (Vec::new(), Vec::new());
+        for (i, e) in cores.iter().enumerate() {
+            blocks.push(Span::styled("██", Style::default().fg(color_of(e.1))));
+            blocks.push(Span::raw(" "));
+            labels.push(Span::styled(format!("{:<2}", e.0), Style::default().fg(theme::FAINT)));
+            labels.push(Span::raw(" "));
+            if (i + 1) % per_row == 0 {
+                lines.push(Line::from(std::mem::take(&mut blocks)));
+                lines.push(Line::from(std::mem::take(&mut labels)));
+                lines.push(Line::default());
+            }
+        }
+        if !blocks.is_empty() {
+            lines.push(Line::from(blocks));
+            lines.push(Line::from(labels));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Cool→hot electric heat ramp for an active core by its normalised load:
