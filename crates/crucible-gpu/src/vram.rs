@@ -37,10 +37,10 @@
 //! is inherent to GPU-side memory testing (memtest_vulkan has the same
 //! property) and is the price of not being PCIe-bound.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, StopFlag};
-use crucible_core::markers::{Event, MarkerLog};
+use crucible_core::markers::{Event, MarkerLog, PHASE_DONE, PHASE_WORK};
 
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
@@ -371,6 +371,11 @@ impl LoadKernel for VramKernel {
         let mut first_fail: Option<VramFail> = None;
         let mut io_error: Option<String> = None;
 
+        // Live-UI lane for the dashboard (None unless a UI is attached), plus a
+        // throttle so the (locking) status push is touched ~10x/s, not per chunk.
+        let lane = markers.register_lane("vram");
+        let mut last_note = Instant::now() - Duration::from_secs(1);
+
         // Seed the chain: lay down the first pattern in every chunk.
         let mut steps = battery(0xC0FF_EE01);
         for handle in &chunks {
@@ -444,6 +449,23 @@ impl LoadKernel for VramKernel {
                     let chunk_errors = vals[0] as u64;
                     words_checked += chunk_elems as u64;
 
+                    // Live status for the UI (phase/work are cheap relaxed atomics;
+                    // the detail push is throttled). All no-ops when headless.
+                    if let Some(l) = &lane {
+                        l.bump_work();
+                        l.set_phase(PHASE_WORK);
+                        if last_note.elapsed() >= Duration::from_millis(90) {
+                            last_note = Instant::now();
+                            let gib = words_checked as f64 * 4.0 / (1024.0 * 1024.0 * 1024.0);
+                            l.set_detail(&format!(
+                                "pattern: {}\nregion: chunk {}/{}\nverified: {gib:.1} GiB",
+                                cur.label,
+                                ci + 1,
+                                chunks.len()
+                            ));
+                        }
+                    }
+
                     if chunk_errors > 0 {
                         errors += chunk_errors;
                         if first_fail.is_none() {
@@ -470,6 +492,9 @@ impl LoadKernel for VramKernel {
                 }
             }
             passes += 1;
+        }
+        if let Some(l) = &lane {
+            l.set_phase(PHASE_DONE);
         }
 
         let seconds = start.elapsed().as_secs_f64();

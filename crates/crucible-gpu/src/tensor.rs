@@ -25,7 +25,7 @@
 //! must reproduce the first's checksum bit-for-bit; a mismatch is a tensor-core
 //! soft error. Liveness (non-zero output) catches a kernel that never ran.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, ShapeDriver, StopFlag, Tick};
 use crucible_core::markers::MarkerLog;
@@ -202,12 +202,20 @@ impl LoadKernel for TensorKernel {
         let mut verifications: u64 = 0;
         let mut errors: u64 = 0;
         let mut reference: Option<u64> = None;
+        // Throttle for the (locking) live-status push — touched ~10x/s, not per
+        // dispatch. Seeded in the past so the first tick publishes immediately.
+        let mut last_note = Instant::now() - Duration::from_secs(1);
 
         loop {
             match driver.tick() {
                 Tick::Work => {
                     launch();
                     dispatches += 1;
+                    // Throttled live status for the UI (no alloc when headless).
+                    if driver.live() && last_note.elapsed() >= Duration::from_millis(90) {
+                        last_note = Instant::now();
+                        driver.set_status(&format!("tiles: {tiles}\ndispatch: {dispatches}"));
+                    }
                     if dispatches.is_multiple_of(self.verify_every) {
                         if cubecl::future::block_on(client.sync()).is_err() {
                             errors += 1;
@@ -234,6 +242,8 @@ impl LoadKernel for TensorKernel {
                         };
                         let h = fnv1a(&bytes);
                         verifications += 1;
+                        // Publish the live self-consistency checksum.
+                        driver.set_hash(h);
                         match reference {
                             None => {
                                 // Liveness: a live cmma chain must produce non-zero output.

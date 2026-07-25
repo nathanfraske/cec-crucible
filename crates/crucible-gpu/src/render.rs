@@ -34,7 +34,7 @@
 //! first frame are probed under `catch_unwind`; a lost device (poll/map error) is
 //! caught and reported; a run that verified nothing reports FAIL.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, ShapeDriver, StopFlag, Tick};
 use crucible_core::markers::MarkerLog;
@@ -1025,6 +1025,9 @@ impl LoadKernel for RenderKernel {
         let mut verifications: u64 = 0;
         let mut errors: u64 = 0;
         let mut reference: Option<u64> = None;
+        // Throttle for the (locking) live-status push — touched ~10x/s, not per
+        // frame. Seeded in the past so the first tick publishes immediately.
+        let mut last_note = Instant::now() - Duration::from_secs(1);
 
         loop {
             match driver.tick() {
@@ -1041,10 +1044,28 @@ impl LoadKernel for RenderKernel {
                     }
                     frames += 1;
                     gpu.preview_tick(stop);
+
+                    // Throttled live status for the UI (no alloc when headless).
+                    if driver.live() && last_note.elapsed() >= Duration::from_millis(90) {
+                        last_note = Instant::now();
+                        let secs = start.elapsed().as_secs_f64();
+                        let fps = if secs > 0.0 {
+                            frames as f64 / secs
+                        } else {
+                            0.0
+                        };
+                        driver.set_status(&format!(
+                            "res: {}x{}\nfps: {fps:.0}",
+                            gpu.width, gpu.height
+                        ));
+                    }
+
                     if frames.is_multiple_of(self.verify_every) {
                         match gpu.checksum() {
                             Some((h, uniform)) => {
                                 verifications += 1;
+                                // Publish the live self-consistency checksum.
+                                driver.set_hash(h);
                                 match reference {
                                     None => {
                                         // Liveness: a uniform frame means nothing was drawn.

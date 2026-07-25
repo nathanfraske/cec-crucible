@@ -35,7 +35,7 @@
 //! core returning a wrong result changes the checksum and trips a FAIL. Liveness
 //! (some rays must hit) catches a kernel that never ran.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, ShapeDriver, StopFlag, Tick};
 use crucible_core::markers::MarkerLog;
@@ -1463,6 +1463,9 @@ impl LoadKernel for RtKernel {
         let mut verifications: u64 = 0;
         let mut errors: u64 = 0;
         let mut reference: Option<u64> = Some(reference0);
+        // Throttle for the (locking) live-status push — touched ~10x/s, not per
+        // dispatch. Seeded in the past so the first tick publishes immediately.
+        let mut last_note = Instant::now() - Duration::from_secs(1);
 
         // HUD telemetry (preview only): a rolling rays/s estimate and a verify
         // "pulse" that flashes the border/tick each time a self-consistency check
@@ -1525,10 +1528,38 @@ impl LoadKernel for RtKernel {
                     }
                     dispatches += 1;
 
+                    // Throttled live status for the UI (no alloc when headless).
+                    if driver.live() && last_note.elapsed() >= Duration::from_millis(90) {
+                        last_note = Instant::now();
+                        let status = match self.mode {
+                            RtMode::RayQuery => {
+                                format!("traces: x{}\ndispatch: {dispatches}", self.iters)
+                            }
+                            RtMode::PathTrace => {
+                                let mat = match self.material {
+                                    0 => "metal",
+                                    1 => "matte",
+                                    2 => "plastic",
+                                    3 => "mirror",
+                                    4 => "glass",
+                                    5 => "velvet",
+                                    _ => "marble",
+                                };
+                                format!(
+                                    "material: {mat}\nsamples: {} x{}\ndispatch: {dispatches}",
+                                    self.samples, self.bounces
+                                )
+                            }
+                        };
+                        driver.set_status(&status);
+                    }
+
                     if dispatches.is_multiple_of(self.verify_every) {
                         let bytes = ctx.readback();
                         let h = fnv1a(&bytes);
                         verifications += 1;
+                        // Publish the live self-consistency checksum.
+                        driver.set_hash(h);
                         match reference {
                             Some(r) if r != h => {
                                 errors += 1;

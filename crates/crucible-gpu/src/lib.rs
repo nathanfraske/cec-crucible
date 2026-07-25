@@ -45,7 +45,7 @@ pub mod rt;
 pub mod tensor;
 pub mod vram;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crucible_core::kernel::{
     Budget, Kind, LoadKernel, LoadResult, Shape, ShapeDriver, StopFlag, Tick,
@@ -335,6 +335,9 @@ impl LoadKernel for GpuKernel {
         let mut last_checksum: u64 = 0;
         let mut detail_extra = String::new();
         let mut device_lost = false;
+        // Throttle for the (locking) live-status push — touched ~10x/s, not per
+        // dispatch. Seeded in the past so the first tick publishes immediately.
+        let mut last_note = Instant::now() - Duration::from_secs(1);
 
         loop {
             match driver.tick() {
@@ -357,6 +360,8 @@ impl LoadKernel for GpuKernel {
                             Ok(sum) => {
                                 last_checksum = sum;
                                 verifications += 1;
+                                // Publish the live self-consistency checksum.
+                                driver.set_hash(sum);
                             }
                             Err(why) => {
                                 errors += 1;
@@ -366,6 +371,15 @@ impl LoadKernel for GpuKernel {
                                 }
                             }
                         }
+                    }
+
+                    // Throttled live status for the UI (no alloc when headless).
+                    if driver.live() && last_note.elapsed() >= Duration::from_millis(90) {
+                        last_note = Instant::now();
+                        driver.set_status(&format!(
+                            "kernel: fma-thrash x{}\ndispatch: {dispatches}",
+                            self.iters
+                        ));
                     }
                 }
                 Tick::Idle => {}
