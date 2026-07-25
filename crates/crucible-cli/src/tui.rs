@@ -34,6 +34,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph};
 use ratatui::{Frame, Terminal};
 
+use crucible_core::cpustats::{aggregate, CoreStat, CpuStats};
 use crucible_core::kernel::StopFlag;
 use crucible_core::markers::{LaneSnap, MarkerLog, PHASE_DONE, PHASE_WORK};
 
@@ -73,6 +74,13 @@ pub fn render_loop(
     let start = Instant::now();
     let mut rates: HashMap<String, RateEma> = HashMap::new();
 
+    // Per-core clock/utilization via PDH (None on non-Windows or if PDH fails —
+    // the grid then falls back to lane-rate heat). Sampled ~4×/s, not every
+    // redraw: the counters are rate-based and need spacing between collects.
+    let mut cpu = CpuStats::new();
+    let mut cpu_stats: Vec<CoreStat> = Vec::new();
+    let mut last_cpu = Instant::now() - Duration::from_secs(1);
+
     while !ui_stop.load(Ordering::Relaxed) {
         // Drain input — quit keys end the *run* (raw mode swallows console Ctrl-C).
         while event::poll(Duration::from_millis(0)).unwrap_or(false) {
@@ -89,8 +97,18 @@ pub fn render_loop(
 
         let lanes = markers.live_snapshot();
         update_rates(&mut rates, &lanes);
+        if let Some(c) = cpu.as_mut() {
+            let now = Instant::now();
+            if now.duration_since(last_cpu) >= Duration::from_millis(250) {
+                last_cpu = now;
+                let s = c.sample();
+                if !s.is_empty() {
+                    cpu_stats = s;
+                }
+            }
+        }
         let n_markers = markers.len();
-        let _ = terminal.draw(|f| dashboard(f, &title, start, &lanes, &rates, n_markers));
+        let _ = terminal.draw(|f| dashboard(f, &title, start, &lanes, &rates, &cpu_stats, n_markers));
         std::thread::sleep(Duration::from_millis(60));
     }
 
@@ -129,6 +147,7 @@ fn dashboard(
     start: Instant,
     lanes: &[LaneSnap],
     rates: &HashMap<String, RateEma>,
+    cpu: &[CoreStat],
     n_markers: usize,
 ) {
     // On-brand full-screen backdrop (CEC --bg); later widgets keep this bg since
@@ -150,7 +169,9 @@ fn dashboard(
     // chunky = 3 terminal rows per grid-row, dense (>48 cores) = 1.
     let core_h: u16 = if has_cores {
         let w = (f.area().width.saturating_sub(2)).max(1) as usize;
-        let (cell, per_gridrow) = if cores.len() > 48 { (1usize, 1u16) } else { (3usize, 3u16) };
+        // Keep in sync with draw_core_grid: chunky = 4-wide cells over 3 rows,
+        // dense (>48 cores) = 1-wide cells on a single row.
+        let (cell, per_gridrow) = if cores.len() > 48 { (1usize, 1u16) } else { (4usize, 3u16) };
         let rows = cores.len().div_ceil((w / cell).max(1)).max(1) as u16;
         (2 + rows * per_gridrow).clamp(4, f.area().height / 2)
     } else {
@@ -167,7 +188,7 @@ fn dashboard(
 
     draw_header(f, chunks[0], title, start, lanes, n_markers);
     if has_cores {
-        draw_core_grid(f, chunks[1], &cores, rates);
+        draw_core_grid(f, chunks[1], &cores, rates, cpu);
     }
     draw_panels(f, chunks[2], &domains, rates);
 }
@@ -222,18 +243,40 @@ fn draw_core_grid(
     area: Rect,
     cores: &[(u32, &LaneSnap)],
     rates: &HashMap<String, RateEma>,
+    cpu: &[CoreStat],
 ) {
     let max_rate = cores
         .iter()
         .map(|(_, l)| rate_of(rates, &l.label))
         .fold(1.0_f64, f64::max);
 
+    // Real per-core telemetry (PDH: effective clock + utilization), keyed by
+    // core index. Empty on non-Windows / PDH failure — the grid then falls back
+    // to lane work-rate for heat and the core index for the label.
+    let by_core: HashMap<u32, &CoreStat> = cpu.iter().map(|c| (c.core, c)).collect();
+
+    // The title carries the whole-chip aggregate so even the dense 128-thread
+    // view has hard numbers (avg / min–max effective clock, avg util), not just
+    // a colour field.
+    let title = if let Some((avg, min, max, util)) = aggregate(cpu) {
+        format!(
+            " CPU · {} threads · {:.2} GHz avg  {:.1}–{:.1}  · {:.0}% util ",
+            cores.len(),
+            avg as f64 / 1000.0,
+            min as f64 / 1000.0,
+            max as f64 / 1000.0,
+            util
+        )
+    } else {
+        format!(" CPU · {} threads ", cores.len())
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::BORDER))
         .title(Span::styled(
-            format!(" CPU · {} threads ", cores.len()),
+            title,
             Style::default().fg(theme::LABEL).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -242,24 +285,46 @@ fn draw_core_grid(
         return;
     }
 
-    let color_of = |l: &LaneSnap| {
-        let frac = (rate_of(rates, &l.label) / max_rate).clamp(0.0, 1.0);
+    // Heat prefers real utilization; without PDH it uses the lane's work-rate.
+    // A verify error always wins (red), whatever the clock is doing.
+    let heat_of = |core: u32, l: &LaneSnap| -> Color {
         if l.errors > 0 {
-            theme::BAD
-        } else if l.phase == PHASE_WORK && frac > 0.02 {
-            core_heat(frac)
+            return theme::BAD;
+        }
+        let frac = match by_core.get(&core) {
+            // Real utilization is authoritative when we have it.
+            Some(cs) => cs.util_pct as f64 / 100.0,
+            // Fallback: lane work-rate, but only while the lane is actually
+            // working — a finished core shouldn't glow on a stale EMA.
+            None if l.phase == PHASE_WORK => rate_of(rates, &l.label) / max_rate,
+            None => 0.0,
+        };
+        if frac > 0.02 {
+            core_heat(frac.clamp(0.0, 1.0))
         } else {
             theme::IDLE_BAR
+        }
+    };
+    // Per-core label: the effective clock in GHz when PDH is live (the number
+    // the user asked to see), or the plain core index when it isn't.
+    let label_of = |core: u32| -> (String, Color) {
+        match by_core.get(&core) {
+            Some(cs) => (
+                format!("{:<4}", format!("{:.1}", cs.effective_mhz as f64 / 1000.0)),
+                theme::VALUE,
+            ),
+            None => (format!("{core:<4}"), theme::FAINT),
         }
     };
 
     let mut lines: Vec<Line> = Vec::new();
     if cores.len() > 48 {
         // Dense: one column per core, no labels — a 128-thread part still fits.
+        // Colour is utilization, and the aggregate clock lives in the title.
         let per_row = (inner.width as usize).max(1);
         let mut spans: Vec<Span> = Vec::new();
         for (i, e) in cores.iter().enumerate() {
-            spans.push(Span::styled("█", Style::default().fg(color_of(e.1))));
+            spans.push(Span::styled("█", Style::default().fg(heat_of(e.0, e.1))));
             if (i + 1) % per_row == 0 {
                 lines.push(Line::from(std::mem::take(&mut spans)));
             }
@@ -268,14 +333,15 @@ fn draw_core_grid(
             lines.push(Line::from(spans));
         }
     } else {
-        // Chunky: a 2-wide block per core with its index under it.
-        let per_row = (inner.width as usize / 3).max(1);
+        // Chunky: a 4-wide cell — a heat block (utilization) over the core's
+        // effective clock in GHz, so each core reads as "how hot + how fast".
+        let per_row = (inner.width as usize / 4).max(1);
         let (mut blocks, mut labels): (Vec<Span>, Vec<Span>) = (Vec::new(), Vec::new());
         for (i, e) in cores.iter().enumerate() {
-            blocks.push(Span::styled("██", Style::default().fg(color_of(e.1))));
-            blocks.push(Span::raw(" "));
-            labels.push(Span::styled(format!("{:<2}", e.0), Style::default().fg(theme::FAINT)));
-            labels.push(Span::raw(" "));
+            blocks.push(Span::styled("██", Style::default().fg(heat_of(e.0, e.1))));
+            blocks.push(Span::raw("  "));
+            let (txt, col) = label_of(e.0);
+            labels.push(Span::styled(txt, Style::default().fg(col)));
             if (i + 1) % per_row == 0 {
                 lines.push(Line::from(std::mem::take(&mut blocks)));
                 lines.push(Line::from(std::mem::take(&mut labels)));
@@ -544,13 +610,34 @@ mod tests {
             .collect()
     }
 
+    /// Synthetic PDH telemetry aligned to `synth_lanes`' 20 cores: busy cores
+    /// boost high at ~90% util, the parked one (n % 7 == 3) idles low.
+    fn synth_cpu() -> Vec<CoreStat> {
+        (0..20u32)
+            .map(|n| {
+                let idle = n % 7 == 3;
+                let (effective_mhz, util_pct) = if idle {
+                    (1200 + (n % 5) * 90, 3.0 + (n % 4) as f32 * 1.5)
+                } else {
+                    (4600 + (n * 37) % 520, (88.0 + (n % 11) as f32).min(100.0))
+                };
+                CoreStat {
+                    core: n,
+                    effective_mhz,
+                    util_pct,
+                }
+            })
+            .collect()
+    }
+
     fn render(w: u16, h: u16) -> Buffer {
         let lanes = synth_lanes();
         let rates = synth_rates(&lanes);
+        let cpu = synth_cpu();
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let start = Instant::now();
         terminal
-            .draw(|f| dashboard(f, "RTX 3070 · worst-case", start, &lanes, &rates, 20590))
+            .draw(|f| dashboard(f, "RTX 3070 · worst-case", start, &lanes, &rates, &cpu, 20590))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -579,6 +666,11 @@ mod tests {
             assert!(text.contains("moving-inv"), "mem pattern missing @ {w}x{h}");
             assert!(text.contains("GPU"), "gpu panel missing @ {w}x{h}");
             assert!(text.contains("RUNNING"), "status missing @ {w}x{h}");
+            // Per-core telemetry: the aggregate clock in the title and at least
+            // one boosting per-core effective clock (4.6xx GHz) from synth_cpu.
+            assert!(text.contains("GHz avg"), "cpu clock aggregate missing @ {w}x{h}");
+            assert!(text.contains("% util"), "cpu util aggregate missing @ {w}x{h}");
+            assert!(text.contains("4.6"), "per-core effective clock missing @ {w}x{h}");
         }
     }
 
