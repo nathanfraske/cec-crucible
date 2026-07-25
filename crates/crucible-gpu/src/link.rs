@@ -31,10 +31,10 @@
 //! first transfer are probed under `catch_unwind`; a lost device (poll/map
 //! error) is caught and reported; and a run that moved nothing reports FAIL.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, StopFlag};
-use crucible_core::markers::{Event, MarkerLog};
+use crucible_core::markers::{Event, MarkerLog, PHASE_DONE, PHASE_WORK};
 
 use cubecl::future::block_on;
 
@@ -358,6 +358,10 @@ impl LoadKernel for LinkKernel {
         let mut first_fail: Option<usize> = None;
         let mut device_lost = false;
 
+        // Live-UI lane (None unless a UI is attached); fed verbosely each iteration.
+        let lane = markers.register_lane("pcie");
+        let mut last_note = Instant::now() - Duration::from_secs(1);
+
         while !stop.stopped() && Instant::now() < deadline {
             if matches!(self.dir, LinkDir::Up | LinkDir::Both) {
                 let t = Instant::now();
@@ -395,6 +399,38 @@ impl LoadKernel for LinkKernel {
                 }
             }
             transfers += 1;
+
+            // Verbose live readout (throttled to ~90 ms; a no-op when headless).
+            if let Some(l) = &lane {
+                l.set_phase(PHASE_WORK);
+                l.bump_work();
+                let now = Instant::now();
+                if now.duration_since(last_note) >= Duration::from_millis(90) {
+                    last_note = now;
+                    let up = gbps(bytes_up, secs_up);
+                    let down = gbps(bytes_down, secs_down);
+                    let moved = (bytes_up + bytes_down) as f64 / (1024.0 * 1024.0 * 1024.0);
+                    let dir = match self.dir {
+                        LinkDir::Up => "H2D (upload)",
+                        LinkDir::Down => "D2H (readback)",
+                        LinkDir::Both => "H2D+D2H (full-duplex)",
+                    };
+                    l.set_hash(want_hash);
+                    l.set_detail(&format!(
+                        "dir: {dir}\n\
+                         H2D: {up:.2} GB/s\n\
+                         D2H: {down:.2} GB/s\n\
+                         moved: {moved:.2} GiB\n\
+                         verified: {verifies}\n\
+                         errors: {errors}"
+                    ));
+                }
+            }
+        }
+
+        if let Some(l) = &lane {
+            l.set_hash(want_hash);
+            l.set_phase(PHASE_DONE);
         }
 
         let up = gbps(bytes_up, secs_up);
@@ -531,6 +567,11 @@ impl LinkKernel {
         let third = budget.duration / 3;
         let mut lost = false;
 
+        // Live-UI lane (None unless a UI is attached); fed verbosely each phase.
+        let lane = markers.register_lane("pcie");
+        let cuda_hash = fnv1a(pattern);
+        let mut last_note = Instant::now() - Duration::from_secs(1);
+
         // Phase 1 — H2D solo.
         let (mut h2d_bytes, mut h2d_secs) = (0u64, 0.0f64);
         let end = Instant::now() + third;
@@ -542,6 +583,24 @@ impl LinkKernel {
             }
             h2d_secs += t.elapsed().as_secs_f64();
             h2d_bytes += bytes as u64;
+            if let Some(l) = &lane {
+                l.set_phase(PHASE_WORK);
+                l.bump_work();
+                let now = Instant::now();
+                if now.duration_since(last_note) >= Duration::from_millis(90) {
+                    last_note = now;
+                    let r = gbps(h2d_bytes, h2d_secs);
+                    let moved = h2d_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    l.set_hash(cuda_hash);
+                    l.set_detail(&format!(
+                        "phase: 1/3 H2D solo (upload)\n\
+                         H2D: {r:.2} GB/s\n\
+                         host-RAM: {host_gbps:.1} GB/s\n\
+                         moved: {moved:.2} GiB\n\
+                         path: CUDA dual-stream (pinned)"
+                    ));
+                }
+            }
         }
 
         // Phase 2 — D2H solo.
@@ -559,6 +618,24 @@ impl LinkKernel {
             }
             d2h_secs += t.elapsed().as_secs_f64();
             d2h_bytes += bytes as u64;
+            if let Some(l) = &lane {
+                l.set_phase(PHASE_WORK);
+                l.bump_work();
+                let now = Instant::now();
+                if now.duration_since(last_note) >= Duration::from_millis(90) {
+                    last_note = now;
+                    let r = gbps(d2h_bytes, d2h_secs);
+                    let moved = d2h_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    l.set_hash(cuda_hash);
+                    l.set_detail(&format!(
+                        "phase: 2/3 D2H solo (readback)\n\
+                         D2H: {r:.2} GB/s\n\
+                         host-RAM: {host_gbps:.1} GB/s\n\
+                         moved: {moved:.2} GiB\n\
+                         path: CUDA dual-stream (pinned)"
+                    ));
+                }
+            }
         }
 
         // Phase 3 — full-duplex: both directions enqueued before syncing, on
@@ -578,6 +655,32 @@ impl LinkKernel {
             }
             dup_secs += t.elapsed().as_secs_f64();
             dup_bytes += 2 * bytes as u64;
+            if let Some(l) = &lane {
+                l.set_phase(PHASE_WORK);
+                l.bump_work();
+                let now = Instant::now();
+                if now.duration_since(last_note) >= Duration::from_millis(90) {
+                    last_note = now;
+                    let r = gbps(dup_bytes, dup_secs);
+                    let solo = gbps(h2d_bytes, h2d_secs).max(gbps(d2h_bytes, d2h_secs));
+                    let overlap = if solo > 0.0 { r / solo } else { 0.0 };
+                    let moved = dup_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    l.set_hash(cuda_hash);
+                    l.set_detail(&format!(
+                        "phase: 3/3 full-duplex (both engines)\n\
+                         duplex: {r:.2} GB/s\n\
+                         vs solo: {overlap:.2}x\n\
+                         host-RAM: {host_gbps:.1} GB/s\n\
+                         moved: {moved:.2} GiB\n\
+                         path: CUDA dual-stream (pinned)"
+                    ));
+                }
+            }
+        }
+
+        if let Some(l) = &lane {
+            l.set_hash(cuda_hash);
+            l.set_phase(PHASE_DONE);
         }
 
         // Integrity: the read-back must equal the pattern we seeded.

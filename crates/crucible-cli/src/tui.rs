@@ -501,6 +501,20 @@ mod tests {
             0x0000_0000_5a3c_11e9,
             "material: glass\nsamples: 64 x8\nrays: 12.3 Gray/s",
         ));
+        v.push(lane(
+            "storage",
+            188_000,
+            PHASE_WORK,
+            0x7b1d_44c2_9f30_a8e1,
+            "mode: unbuffered (FILE_FLAG_NO_BUFFERING)\nphase: VERIFY\nrate: 181 MB/s\npass: 3\nverified: 22.5 GiB\ndir: D:\\crucible-scratch",
+        ));
+        v.push(lane(
+            "pcie",
+            6_400,
+            PHASE_WORK,
+            0x0000_0000_c0ff_ee11,
+            "dir: H2D+D2H (full-duplex)\nH2D: 12.84 GB/s\nD2H: 12.61 GB/s\nmoved: 74.30 GiB\nverified: 3200\nerrors: 0",
+        ));
         v
     }
 
@@ -514,6 +528,8 @@ mod tests {
                     "gpu" => 5.2e9,
                     "vram" => 2.2e10,
                     "pathtrace" => 1.2e10,
+                    "storage" => 1.81e8,
+                    "pcie" => 2.545e10,
                     _ => (l.work as f64) + 500.0,
                 };
                 (
