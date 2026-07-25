@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::clock::{Clock, Timestamp};
+use crate::cpustats::CoreStat;
 use crate::json::Json;
 
 /// Live per-lane activity for an in-process UI (`--ui`) or a harness readout.
@@ -87,8 +88,15 @@ pub struct LaneSnap {
 }
 
 /// CSV header for the periodic run-telemetry log (one row per lane per sample).
+/// The trailing `eff_mhz,util_pct` carry PDH per-core telemetry: populated on
+/// `core N` rows (and standalone `cpu N` rows), blank on other lanes.
 pub fn telemetry_csv_header() -> &'static str {
-    "elapsed_s,lane,work,phase,errors,hash_hex\n"
+    "elapsed_s,lane,work,phase,errors,hash_hex,eff_mhz,util_pct\n"
+}
+
+/// Parse the core index out of a `"core N"` lane label.
+fn core_index(label: &str) -> Option<u32> {
+    label.strip_prefix("core ").and_then(|n| n.trim().parse().ok())
 }
 
 /// Format one telemetry sample — every lane's counters at `elapsed_s` — as CSV
@@ -96,7 +104,16 @@ pub fn telemetry_csv_header() -> &'static str {
 /// derivative of the `work` column) you can graph after a run. Lane labels are
 /// controlled ("core N", "mem", …) but a stray comma is guarded so the columns
 /// stay stable.
-pub fn telemetry_csv_rows(elapsed_s: f64, lanes: &[LaneSnap]) -> String {
+///
+/// `cpu` is the current PDH per-core snapshot (empty when unavailable). A core's
+/// effective clock + utilization are attached to its matching `core N` load
+/// lane; cores with telemetry but no load lane this sample (e.g. during a
+/// GPU-only test) get a standalone `cpu N` row so the whole chip is still logged.
+pub fn telemetry_csv_rows(elapsed_s: f64, lanes: &[LaneSnap], cpu: &[CoreStat]) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    let by_core: BTreeMap<u32, &CoreStat> = cpu.iter().map(|c| (c.core, c)).collect();
+    let mut charted: BTreeSet<u32> = BTreeSet::new();
+
     let mut s = String::new();
     for l in lanes {
         let phase = match l.phase {
@@ -105,10 +122,30 @@ pub fn telemetry_csv_rows(elapsed_s: f64, lanes: &[LaneSnap]) -> String {
             _ => "idle",
         };
         let label = l.label.replace(',', "_");
+        // Attach per-core telemetry to this core's load lane, if we have it.
+        let ci = core_index(&l.label);
+        if let Some(i) = ci {
+            charted.insert(i);
+        }
+        let (mhz, util) = match ci.and_then(|i| by_core.get(&i)) {
+            Some(cs) => (cs.effective_mhz.to_string(), format!("{:.1}", cs.util_pct)),
+            None => (String::new(), String::new()),
+        };
         s.push_str(&format!(
-            "{elapsed_s:.3},{label},{},{phase},{},{:#018x}\n",
+            "{elapsed_s:.3},{label},{},{phase},{},{:#018x},{mhz},{util}\n",
             l.work, l.errors, l.hash
         ));
+    }
+
+    // Cores that have telemetry but no load lane this sample — still log them so
+    // throttling/boost is captured even during a pure GPU/storage test.
+    for (core, cs) in &by_core {
+        if !charted.contains(core) {
+            s.push_str(&format!(
+                "{elapsed_s:.3},cpu {core},0,idle,0,{:#018x},{},{:.1}\n",
+                0u64, cs.effective_mhz, cs.util_pct
+            ));
+        }
     }
     s
 }
@@ -329,5 +366,46 @@ mod tests {
         // Sequence numbers must be unique 0..800.
         let jsonl = log.to_jsonl();
         assert_eq!(jsonl.lines().count(), 800);
+    }
+
+    fn snap(label: &str, work: u64, phase: u8) -> LaneSnap {
+        LaneSnap {
+            label: label.to_string(),
+            work,
+            errors: 0,
+            phase,
+            hash: 0,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn telemetry_csv_attaches_and_backfills_cpu() {
+        let lanes = vec![snap("core 0", 100, PHASE_WORK), snap("mem", 42, PHASE_WORK)];
+        let cpu = vec![
+            CoreStat { core: 0, effective_mhz: 4800, util_pct: 99.5 },
+            CoreStat { core: 1, effective_mhz: 1200, util_pct: 3.0 },
+        ];
+        let out = telemetry_csv_rows(1.5, &lanes, &cpu);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "core 0 + mem + backfilled cpu 1");
+
+        // The core lane carries its own effective clock + utilization.
+        let core0 = lines.iter().find(|l| l.contains(",core 0,")).unwrap();
+        assert!(core0.ends_with(",4800,99.5"), "core0: {core0}");
+        // A non-core lane leaves the cpu columns blank.
+        let mem = lines.iter().find(|l| l.contains(",mem,")).unwrap();
+        assert!(mem.ends_with(",,"), "mem: {mem}");
+        // A core with telemetry but no load lane is backfilled as `cpu N`.
+        let cpu1 = lines.iter().find(|l| l.contains(",cpu 1,")).unwrap();
+        assert!(cpu1.ends_with(",1200,3.0"), "cpu1: {cpu1}");
+        assert!(cpu1.contains(",idle,"));
+    }
+
+    #[test]
+    fn telemetry_csv_blank_cpu_columns_without_pdh() {
+        let out = telemetry_csv_rows(0.0, &[snap("core 0", 1, PHASE_WORK)], &[]);
+        assert_eq!(out.lines().count(), 1, "no PDH -> no backfill rows");
+        assert!(out.lines().next().unwrap().ends_with(",,"), "blank cpu columns");
     }
 }

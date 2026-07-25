@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crucible_core::cpustats::{CoreStat, CpuStats};
 use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, Shape, StopFlag};
 use crucible_core::markers::{telemetry_csv_header, telemetry_csv_rows, Event, MarkerLog};
 use crucible_core::report::{Report, StageReport, Verdict};
@@ -2581,11 +2582,22 @@ fn telemetry_loop(path: &Path, markers: Arc<MarkerLog>, stop: Arc<AtomicBool>, s
     if w.write_all(telemetry_csv_header().as_bytes()).is_err() {
         return;
     }
+    // PDH per-core clock/util, sampled in lockstep with each 250ms row. None on
+    // non-Windows or PDH failure, in which case the eff_mhz/util_pct columns
+    // simply stay blank. The 250ms sleep also spaces the PDH rate counters.
+    let mut cpu = CpuStats::new();
+    let mut cpu_stats: Vec<CoreStat> = Vec::new();
     loop {
         let done = stop.load(Ordering::SeqCst);
         let el = start.elapsed().as_secs_f64();
+        if let Some(c) = cpu.as_mut() {
+            let s = c.sample();
+            if !s.is_empty() {
+                cpu_stats = s;
+            }
+        }
         if w
-            .write_all(telemetry_csv_rows(el, &markers.live_snapshot()).as_bytes())
+            .write_all(telemetry_csv_rows(el, &markers.live_snapshot(), &cpu_stats).as_bytes())
             .is_err()
         {
             return;
