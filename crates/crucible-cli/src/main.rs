@@ -35,6 +35,8 @@ use crucible_gpu::{GpuDevice, GpuKernel};
 
 use args::Parsed;
 
+mod mix;
+
 #[cfg(feature = "tui")]
 mod theme;
 
@@ -71,6 +73,7 @@ const COMMON_BOOLS: &[&str] = &[
     "telemetry-csv",
     "benchmark",
     "presentmon",
+    "dry-run",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -340,6 +343,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "pathtrace" => cmd_pathtrace(rest),
         "optix" => cmd_optix(rest),
         "benchmark" | "bench" => cmd_benchmark(rest),
+        "mix" => mix::cmd_mix(rest),
         "run" => cmd_run(rest),
         other => Err(format!("unknown command '{other}'")),
     }
