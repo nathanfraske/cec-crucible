@@ -290,14 +290,19 @@ fn draw_core_grid(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Cool→hot electric heat ramp for an active core by its normalised load:
-/// cyan (light) → CEC pink (hot). Keeps the grid on-brand (no green/amber).
+/// Thermal heatmap ramp for a core by its normalised load: a neutral slate at
+/// idle → amber → harsh red when hot. Reads as "how loaded" the way a thermal
+/// gradient does, which is what makes a load heatmap legible at a glance.
 fn core_heat(frac: f64) -> Color {
     let f = frac.clamp(0.0, 1.0);
-    let r = (65.0 + f * 172.0) as u8; //  65 -> 237
-    let g = (217.0 - f * 182.0) as u8; // 217 -> 35
-    let b = (248.0 - f * 96.0) as u8; // 248 -> 152
-    Color::Rgb(r, g, b)
+    // neutral (78,84,104) → amber (242,166,24) → red (238,11,42)
+    let (a, b, t) = if f < 0.5 {
+        ([78.0, 84.0, 104.0], [242.0, 166.0, 24.0], f * 2.0)
+    } else {
+        ([242.0, 166.0, 24.0], [238.0, 11.0, 42.0], (f - 0.5) * 2.0)
+    };
+    let lerp = |i: usize| (a[i] + (b[i] - a[i]) * t) as u8;
+    Color::Rgb(lerp(0), lerp(1), lerp(2))
 }
 
 /// Domain lanes as a wrapping grid of rounded panels (≤3 per row).

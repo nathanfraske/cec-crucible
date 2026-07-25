@@ -33,7 +33,7 @@ pub const HASH: Color = Color::Rgb(140, 103, 242); // --violet, verification has
 pub const GOOD: Color = Color::Rgb(65, 217, 248); // active / pass — cyan, brand-cohesive
 pub const WARN: Color = Color::Rgb(242, 166, 24); // --warn amber
 pub const BAD: Color = Color::Rgb(238, 11, 42); // --g-red
-pub const IDLE_BAR: Color = Color::Rgb(48, 48, 73); // idle bar / gauge (= border)
+pub const IDLE_BAR: Color = Color::Rgb(78, 84, 104); // neutral slate = heatmap cold end
 
 // Category accents (site: --g-cpu / --g-mem / --g-gpu / --violet).
 pub const CAT_DIAG: Color = Color::Rgb(65, 217, 248); // cyan (--vpop-cyan)
