@@ -66,8 +66,9 @@ impl Parsed {
     /// Reject any option key not in `allowed` (typo protection).
     pub fn reject_unknown(&self, allowed: &[&str]) -> Result<(), String> {
         for k in self.values.keys().chain(self.bools.iter()) {
-            // `--ui` (opt-in live terminal UI) is accepted by every command.
-            if k == "ui" {
+            // A few flags are accepted by every command: `--ui` (live terminal UI)
+            // and the CSV logging opt-ins.
+            if matches!(k.as_str(), "ui" | "csv" | "telemetry-csv") {
                 continue;
             }
             if !allowed.contains(&k.as_str()) {

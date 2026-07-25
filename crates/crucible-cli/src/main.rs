@@ -11,7 +11,7 @@
 
 mod args;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, Shape, StopFlag};
-use crucible_core::markers::{Event, MarkerLog};
+use crucible_core::markers::{telemetry_csv_header, telemetry_csv_rows, Event, MarkerLog};
 use crucible_core::report::{Report, StageReport, Verdict};
 use crucible_core::{sysinfo, Clock, DeviceId};
 
@@ -59,6 +59,8 @@ const COMMON_BOOLS: &[&str] = &[
     "per-core",
     "ui",
     "preview",
+    "csv",
+    "telemetry-csv",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -137,8 +139,11 @@ PROFILES:
 COMMON OPTIONS:
     --seconds <N>        Run duration in seconds.
     --device-id <ID>     Machine id from the harness (else auto-detected).
-    --out <DIR>          Output directory for report + markers.
+    --out <DIR>          Output directory for report + markers (+ CSVs).
     --no-report          Do not write report/marker files.
+    --csv                Also write a per-stage results CSV (Excel/Sheets-ready).
+    --telemetry-csv      Also log a time-series telemetry CSV (per lane, ~4/s)
+                         for graphing a run afterward. Both land in --out.
     --json               Emit the report as JSON on stdout (pipe-friendly).
     --ui                 Live terminal dashboard (per-core + per-domain activity).
                          Needs a build with `--features tui`; q / Ctrl-C to stop.
@@ -1734,6 +1739,12 @@ struct Runner {
     ui: bool,
     ui_stop: Option<Arc<AtomicBool>>,
     ui_handle: Option<JoinHandle<()>>,
+    /// Write a per-stage results CSV alongside the JSON report.
+    csv: bool,
+    /// Log a periodic time-series telemetry CSV for the whole run.
+    telemetry: bool,
+    telemetry_stop: Option<Arc<AtomicBool>>,
+    telemetry_handle: Option<JoinHandle<()>>,
 }
 
 impl Runner {
@@ -1781,6 +1792,10 @@ impl Runner {
             ui: p.has("ui"),
             ui_stop: None,
             ui_handle: None,
+            csv: p.has("csv"),
+            telemetry: p.has("telemetry-csv"),
+            telemetry_stop: None,
+            telemetry_handle: None,
         })
     }
 
@@ -2137,6 +2152,35 @@ impl Runner {
             #[cfg(not(feature = "tui"))]
             eprintln!("note: --ui needs a build with `--features tui`; continuing without it");
         }
+
+        // Time-series telemetry logger: sample every lane ~4×/s into a CSV for
+        // post-run graphing. Needs an output dir (skipped under --no-report). Uses
+        // the same live lanes as the UI, so it costs nothing when not requested.
+        if self.telemetry {
+            match self.out_dir.clone() {
+                Some(dir) => {
+                    // The out dir is otherwise created lazily in finish(); the
+                    // logger writes from the start of the run, so ensure it now.
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        eprintln!("warning: telemetry out dir {}: {e}", dir.display());
+                    } else {
+                        self.markers.enable_live();
+                        let path = dir.join(format!("crucible-{}.telemetry.csv", self.stamp));
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let stop_c = Arc::clone(&stop);
+                        let markers = Arc::clone(&self.markers);
+                        let start = Instant::now();
+                        self.telemetry_handle = Some(std::thread::spawn(move || {
+                            telemetry_loop(&path, markers, stop_c, start)
+                        }));
+                        self.telemetry_stop = Some(stop);
+                    }
+                }
+                None => eprintln!(
+                    "note: --telemetry-csv needs an output dir; ignored with --no-report"
+                ),
+            }
+        }
     }
 
     fn run_one(&mut self, kernel: &dyn LoadKernel, budget: &Budget, mode: &str) {
@@ -2171,6 +2215,13 @@ impl Runner {
         if let Some(h) = self.ui_handle.take() {
             let _ = h.join();
         }
+        // Stop + join the telemetry logger so its file is flushed and complete.
+        if let Some(stop) = self.telemetry_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(h) = self.telemetry_handle.take() {
+            let _ = h.join();
+        }
 
         let ts = self.markers.stamp(Event::RunStop, "run", "", "");
         self.report.ended = Some(ts);
@@ -2185,6 +2236,8 @@ impl Runner {
         // Write outputs.
         let mut report_path: Option<PathBuf> = None;
         let mut markers_path: Option<PathBuf> = None;
+        let mut csv_path: Option<PathBuf> = None;
+        let mut telemetry_path: Option<PathBuf> = None;
         if let Some(dir) = self.out_dir.clone() {
             match std::fs::create_dir_all(&dir) {
                 Ok(()) => {
@@ -2201,6 +2254,21 @@ impl Runner {
                         eprintln!("warning: could not write markers to {}: {e}", mp.display());
                     } else {
                         markers_path = Some(mp);
+                    }
+                    if self.csv {
+                        let cp = dir.join(format!("crucible-{}.report.csv", self.stamp));
+                        match self.report.write_csv(&cp) {
+                            Ok(()) => csv_path = Some(cp),
+                            Err(e) => {
+                                eprintln!("warning: could not write csv to {}: {e}", cp.display())
+                            }
+                        }
+                    }
+                    // The telemetry file was streamed by its logger thread; just
+                    // surface its path in the summary.
+                    if self.telemetry {
+                        telemetry_path =
+                            Some(dir.join(format!("crucible-{}.telemetry.csv", self.stamp)));
                     }
                 }
                 Err(e) => eprintln!("warning: could not create out dir {}: {e}", dir.display()),
@@ -2224,6 +2292,12 @@ impl Runner {
             }
             if let Some(mp) = &markers_path {
                 println!("markers: {}", mp.display());
+            }
+            if let Some(cp) = &csv_path {
+                println!("csv:     {}", cp.display());
+            }
+            if let Some(tp) = &telemetry_path {
+                println!("telem:   {}", tp.display());
             }
         }
 
@@ -2481,6 +2555,40 @@ fn print_stage(name: &str, mode: &str, secs: f64, result: &LoadResult) {
 
 /// Default output directory: the harness's collection dir if it already exists,
 /// otherwise the current directory (never silently create ProgramData paths).
+/// The telemetry-CSV logger thread body: write the header, then append one
+/// sample (every live lane) roughly 4×/s until stopped, capturing one final
+/// sample after the stop so the end state (phases DONE) is recorded. Best-effort
+/// — a write error just ends logging, never the run.
+fn telemetry_loop(path: &Path, markers: Arc<MarkerLog>, stop: Arc<AtomicBool>, start: Instant) {
+    use std::io::Write;
+    let file = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("warning: telemetry csv {}: {e}", path.display());
+            return;
+        }
+    };
+    let mut w = std::io::BufWriter::new(file);
+    if w.write_all(telemetry_csv_header().as_bytes()).is_err() {
+        return;
+    }
+    loop {
+        let done = stop.load(Ordering::SeqCst);
+        let el = start.elapsed().as_secs_f64();
+        if w
+            .write_all(telemetry_csv_rows(el, &markers.live_snapshot()).as_bytes())
+            .is_err()
+        {
+            return;
+        }
+        if done {
+            break; // the final sample (post-stop) has been written
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = w.flush();
+}
+
 fn default_out_dir() -> PathBuf {
     #[cfg(windows)]
     {
