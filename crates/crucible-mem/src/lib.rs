@@ -26,10 +26,11 @@
 //! On the first miscompare the failing virtual address, word index, expected
 //! and observed values, and pattern are captured; the run is a FAIL.
 
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crucible_core::kernel::{Budget, Kind, LoadKernel, LoadResult, StopFlag};
-use crucible_core::markers::{Event, MarkerLog};
+use crucible_core::markers::{Event, LiveLane, MarkerLog, PHASE_DONE, PHASE_WORK};
 use crucible_core::sysinfo;
 
 /// Fraction of *available* physical memory to test when no explicit size given.
@@ -137,6 +138,10 @@ impl LoadKernel for MemKernel {
         let deadline = Instant::now() + budget.duration;
         let start = Instant::now();
 
+        // One live lane for the UI, driven by thread 0 (a representative chunk) so
+        // the panel does not thrash from all threads writing it. `None` when no UI.
+        let lane = markers.register_lane("mem");
+
         // Disjoint mutable chunks, one per thread — no aliasing, no locks.
         let chunk_len = total_words.div_ceil(threads).max(1);
         let (outs, panics): (Vec<ThreadMemOut>, u64) = std::thread::scope(|scope| {
@@ -145,7 +150,8 @@ impl LoadKernel for MemKernel {
                 .enumerate()
                 .map(|(idx, chunk)| {
                     let base = idx * chunk_len;
-                    scope.spawn(move || run_battery(base, chunk, stop, deadline))
+                    let tlane = if idx == 0 { lane.clone() } else { None };
+                    scope.spawn(move || run_battery(base, chunk, stop, deadline, tlane))
                 })
                 .collect();
             // A panicked worker must not silently vanish into a zeroed result.
@@ -246,8 +252,14 @@ fn splitmix64(state: &mut u64) -> u64 {
 
 /// Runs the pattern battery over one chunk until stop/deadline. `base` is the
 /// chunk's absolute word offset within the whole buffer (for own-address).
-fn run_battery(base: usize, buf: &mut [u64], stop: &StopFlag, deadline: Instant) -> ThreadMemOut {
-    let mut scan = Scan::new(base, stop, deadline);
+fn run_battery(
+    base: usize,
+    buf: &mut [u64],
+    stop: &StopFlag,
+    deadline: Instant,
+    lane: Option<Arc<LiveLane>>,
+) -> ThreadMemOut {
+    let mut scan = Scan::new(base, stop, deadline, lane);
 
     let mut cycles = 0u64;
     'outer: loop {
@@ -290,6 +302,9 @@ fn run_battery(base: usize, buf: &mut [u64], stop: &StopFlag, deadline: Instant)
         cycles += 1;
     }
 
+    if let Some(l) = &scan.lane {
+        l.set_phase(PHASE_DONE);
+    }
     ThreadMemOut {
         cycles,
         errors: scan.errors,
@@ -307,10 +322,20 @@ struct Scan<'a> {
     checksum: u64,
     bytes: u64,
     first: Option<Fail>,
+    /// Live-UI lane (only the reporting thread has one; `None` otherwise or when
+    /// no UI is attached). Fed from `interrupted()` so every pattern ticks it.
+    lane: Option<Arc<LiveLane>>,
+    /// Throttle for the (locking) status-detail push.
+    last_note: Instant,
 }
 
 impl<'a> Scan<'a> {
-    fn new(base: usize, stop: &'a StopFlag, deadline: Instant) -> Scan<'a> {
+    fn new(
+        base: usize,
+        stop: &'a StopFlag,
+        deadline: Instant,
+        lane: Option<Arc<LiveLane>>,
+    ) -> Scan<'a> {
         Scan {
             base,
             stop,
@@ -319,12 +344,38 @@ impl<'a> Scan<'a> {
             checksum: 0,
             bytes: 0,
             first: None,
+            lane,
+            last_note: Instant::now() - Duration::from_secs(1),
         }
     }
 
     #[inline]
     fn interrupted(&self) -> bool {
+        // The per-block hook every pattern calls — so the live rate stays smooth
+        // across all of them, not just the ones that publish detail.
+        if let Some(l) = &self.lane {
+            l.bump_work();
+            l.set_phase(PHASE_WORK);
+        }
         self.stop.stopped() || Instant::now() >= self.deadline
+    }
+
+    /// Publish the current pattern + read/expected sample to the live UI, throttled
+    /// so the mutex is touched ~10×/s, not per block. No-op without a lane.
+    fn progress(&mut self, pattern: &str, word: usize, got: u64, expected: u64) {
+        let Some(lane) = &self.lane else { return };
+        let now = Instant::now();
+        if now.duration_since(self.last_note) < Duration::from_millis(90) {
+            return;
+        }
+        self.last_note = now;
+        lane.set_hash(self.checksum);
+        let gib = self.bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let status = if got == expected { "OK" } else { "MISMATCH" };
+        lane.set_detail(&format!(
+            "pattern: {pattern}\nread:   {got:#018x}\nexpect: {expected:#018x}  {status}\nword:   {}\nverified: {gib:.2} GiB",
+            self.base + word,
+        ));
     }
 
     #[inline]
@@ -369,6 +420,7 @@ impl<'a> Scan<'a> {
                 }
             }
             self.bytes += ((end - i) as u64) * 8;
+            self.progress("own-address", end - 1, buf[end - 1], (self.base + end - 1) as u64);
             if self.interrupted() {
                 return false;
             }
@@ -382,6 +434,7 @@ impl<'a> Scan<'a> {
     fn moving_inversions(&mut self, buf: &mut [u64], p: u64) -> bool {
         let n = buf.len();
         let np = !p;
+        let name = format!("moving-inv {p:#018x}");
 
         // Fill p.
         let mut i = 0;
@@ -399,14 +452,17 @@ impl<'a> Scan<'a> {
         i = 0;
         while i < n {
             let end = (i + CHECK_STRIDE).min(n);
+            let mut last = p;
             for j in i..end {
                 let got = buf[j];
+                last = got;
                 if got != p {
                     self.record(buf, j, p, got, "moving-inv");
                 }
                 buf[j] = np;
             }
             self.bytes += ((end - i) as u64) * 8;
+            self.progress(&name, end - 1, last, p);
             if self.interrupted() {
                 return false;
             }
