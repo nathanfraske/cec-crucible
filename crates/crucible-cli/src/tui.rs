@@ -257,12 +257,14 @@ fn draw_core_grid(
     f.render_widget(chart, area);
 }
 
-/// Green→amber heat ramp for an active core by its normalised load.
+/// Cool→hot electric heat ramp for an active core by its normalised load:
+/// cyan (light) → CEC pink (hot). Keeps the grid on-brand (no green/amber).
 fn core_heat(frac: f64) -> Color {
     let f = frac.clamp(0.0, 1.0);
-    let r = (80.0 + f * 175.0) as u8;
-    let g = (200.0 - f * 40.0) as u8;
-    Color::Rgb(r, g, 90)
+    let r = (65.0 + f * 172.0) as u8; //  65 -> 237
+    let g = (217.0 - f * 182.0) as u8; // 217 -> 35
+    let b = (248.0 - f * 96.0) as u8; // 248 -> 152
+    Color::Rgb(r, g, b)
 }
 
 /// Domain lanes as a wrapping grid of rounded panels (≤3 per row).
