@@ -42,6 +42,9 @@ mod theme;
 mod tui;
 
 #[cfg(feature = "tui")]
+mod fx;
+
+#[cfg(feature = "tui")]
 mod menu;
 
 // Opt-in PresentMon driver — Windows + presenting (gpu) only. No bundling.

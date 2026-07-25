@@ -38,6 +38,8 @@ use crucible_core::cpustats::{aggregate, CoreStat, CpuStats};
 use crucible_core::kernel::StopFlag;
 use crucible_core::markers::{LaneSnap, MarkerLog, PHASE_DONE, PHASE_WORK};
 
+use crate::fx::Fx;
+
 use crate::theme;
 
 /// EMA-smoothed work rate for one lane, so the bars/values move smoothly and the
@@ -81,6 +83,9 @@ pub fn render_loop(
     let mut cpu_stats: Vec<CoreStat> = Vec::new();
     let mut last_cpu = Instant::now() - Duration::from_secs(1);
 
+    // Reactive border FX, advanced once per redraw.
+    let mut fx = Fx::new();
+
     while !ui_stop.load(Ordering::Relaxed) {
         // Drain input — quit keys end the *run* (raw mode swallows console Ctrl-C).
         while event::poll(Duration::from_millis(0)).unwrap_or(false) {
@@ -107,8 +112,23 @@ pub fn render_loop(
                 }
             }
         }
+        // Feed the border: how busy we are, whether anything failed, and whether
+        // a fresh self-consistency checksum landed since the last frame.
+        let working = lanes.iter().filter(|l| l.phase == PHASE_WORK).count();
+        let activity = if lanes.is_empty() {
+            0.0
+        } else {
+            working as f32 / lanes.len() as f32
+        };
+        let errors: u64 = lanes.iter().map(|l| l.errors).sum();
+        let verify_mix = lanes
+            .iter()
+            .fold(0u64, |acc, l| acc.rotate_left(7) ^ l.hash);
+        fx.update(activity, errors, verify_mix);
+
         let n_markers = markers.len();
-        let _ = terminal.draw(|f| dashboard(f, &title, start, &lanes, &rates, &cpu_stats, n_markers));
+        let _ = terminal
+            .draw(|f| dashboard(f, &title, start, &lanes, &rates, &cpu_stats, n_markers, &fx));
         std::thread::sleep(Duration::from_millis(60));
     }
 
@@ -141,6 +161,10 @@ fn rate_of(rates: &HashMap<String, RateEma>, label: &str) -> f64 {
 }
 
 /// Split cores from domain lanes and lay out header / core-grid / panels.
+// The draw fn legitimately needs the whole frame's state (lanes, rates, cpu
+// telemetry, marker count, border FX); bundling it into a struct would only move
+// the arguments, not reduce them.
+#[allow(clippy::too_many_arguments)]
 fn dashboard(
     f: &mut Frame,
     title: &str,
@@ -149,6 +173,7 @@ fn dashboard(
     rates: &HashMap<String, RateEma>,
     cpu: &[CoreStat],
     n_markers: usize,
+    fx: &Fx,
 ) {
     // On-brand full-screen backdrop (CEC --bg); later widgets keep this bg since
     // they only set fg, so the whole dashboard reads as one dark surface.
@@ -191,6 +216,10 @@ fn dashboard(
         draw_core_grid(f, chunks[1], &cores, rates, cpu);
     }
     draw_panels(f, chunks[2], &domains, rates);
+
+    // Last: the reactive border rides on top of the panel borders it shares
+    // cells with, so sparks and lightning are never painted over.
+    fx.render(f, f.area());
 }
 
 fn draw_header(
@@ -634,10 +663,18 @@ mod tests {
         let lanes = synth_lanes();
         let rates = synth_rates(&lanes);
         let cpu = synth_cpu();
+        // Warm the border FX so the snapshot shows a live edge: a busy run, with
+        // a verification having just landed. Deterministic (stateless hashing).
+        let mut fx = Fx::new();
+        for i in 0..40 {
+            fx.update(0.85, 0, 0x9e37_79b9_7f4a_7c15 ^ (i / 12));
+        }
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let start = Instant::now();
         terminal
-            .draw(|f| dashboard(f, "RTX 3070 · worst-case", start, &lanes, &rates, &cpu, 20590))
+            .draw(|f| {
+                dashboard(f, "RTX 3070 · worst-case", start, &lanes, &rates, &cpu, 20590, &fx)
+            })
             .unwrap();
         terminal.backend().buffer().clone()
     }

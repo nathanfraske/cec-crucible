@@ -106,6 +106,9 @@ impl Category {
 }
 
 /// How a row launches. The built argv is handed verbatim to [`crate::run`].
+// `Bench` is only constructed in a build with a graphics engine (rt / preview),
+// so a plain `--features tui` build sees it as unused.
+#[allow(dead_code)]
 enum Launch {
     /// A diagnostic that just prints — argv is `[cmd]`, no duration / live UI.
     Info(&'static str),
