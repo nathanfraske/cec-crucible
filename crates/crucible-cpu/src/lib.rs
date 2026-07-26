@@ -16,6 +16,13 @@
 //!
 //! Pin one core to isolate a suspect (CoreCycler-style) or all cores for a
 //! full-package burn.
+//!
+//! The FMA load above is deliberately register-resident, which means it puts
+//! *zero* traffic on the L3, the ring/mesh and the Infinity Fabric. [`uncore`]
+//! covers that blind spot with a cross-core producer/consumer verification load;
+//! the two are complementary and both live here because both are CPU-domain.
+
+pub mod uncore;
 
 use std::time::Instant;
 
@@ -365,7 +372,7 @@ unsafe fn fma_chunk_avx2(iters: u64) -> ChunkOut {
 /// Pin the calling thread to a single logical core. Returns whether pinning
 /// succeeded (best-effort; a failure does not abort the load).
 #[cfg(windows)]
-fn pin_current_thread(core: usize) -> bool {
+pub(crate) fn pin_current_thread(core: usize) -> bool {
     // Single-group affinity mask supports cores 0..63; wider topologies need
     // processor-group APIs (a Phase 2 telemetry concern), so bail out cleanly.
     if core >= 64 {
@@ -384,7 +391,7 @@ fn pin_current_thread(core: usize) -> bool {
 }
 
 #[cfg(not(windows))]
-fn pin_current_thread(_core: usize) -> bool {
+pub(crate) fn pin_current_thread(_core: usize) -> bool {
     // No dependency-free portable affinity API; run unpinned elsewhere.
     false
 }

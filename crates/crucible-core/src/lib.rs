@@ -23,6 +23,7 @@
 pub mod clock;
 pub mod cpustats;
 pub mod device;
+pub mod eventlog;
 pub mod json;
 pub mod kernel;
 pub mod markers;

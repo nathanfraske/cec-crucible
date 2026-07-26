@@ -3,14 +3,19 @@
 //!
 //! A stress pass that does not crash but produced a wrong result is still a
 //! FAIL — so the verdict rolls up per-kernel error counts, not just liveness.
-//! (WHEA corrected-error gating is owned by the PowerShell harness around the
-//! whole window; kernels here report their own compute/verify errors.)
+//! The report also carries the Windows event-log detector plane (see
+//! [`crate::eventlog`]): WHEA machine-checks, display TDRs, bugchecks and disk
+//! resets inside the run window. A logged hardware error FAILS the run even when
+//! every checksum matched — a *corrected* machine-check means the hardware fixed
+//! something silently, which is exactly the fault class our own verification can
+//! never observe.
 
 use std::io;
 use std::path::Path;
 
 use crate::clock::{Clock, Timestamp};
 use crate::device::DeviceId;
+use crate::eventlog::EventScan;
 use crate::json::Json;
 use crate::kernel::{Kind, LoadResult};
 
@@ -101,6 +106,11 @@ pub struct Report {
     pub aborted: bool,
     pub markers_file: Option<String>,
     pub notes: Vec<String>,
+    /// Windows event-log detector plane (WHEA / TDR / bugcheck / disk resets)
+    /// bracketed to this run's window. `None` when the scan was not attempted.
+    /// This is the only plane that sees faults the hardware already corrected —
+    /// no checksum can, by definition.
+    pub events: Option<EventScan>,
 }
 
 impl Report {
@@ -120,6 +130,7 @@ impl Report {
             aborted: false,
             markers_file: None,
             notes: Vec::new(),
+            events: None,
         }
     }
 
@@ -134,7 +145,16 @@ impl Report {
     /// Roll up the overall verdict: any failed stage ⇒ FAIL; else an aborted
     /// run ⇒ PARTIAL; else PASS.
     pub fn verdict(&self) -> Verdict {
-        if self.stages.iter().any(|s| !s.result.passed()) {
+        // A hardware error the OS logged is a failure even when every checksum
+        // matched — a CORRECTED machine-check means the hardware silently fixed
+        // something, which is precisely the fault class our own verification can
+        // never see. Ignoring it would be the worst kind of false pass.
+        let logged_hw_fault = self
+            .events
+            .as_ref()
+            .map(|e| e.fail_count() > 0)
+            .unwrap_or(false);
+        if self.stages.iter().any(|s| !s.result.passed()) || logged_hw_fault {
             Verdict::Fail
         } else if self.aborted {
             Verdict::Partial
@@ -182,6 +202,13 @@ impl Report {
 
         let notes: Vec<Json> = self.notes.iter().map(|n| Json::str(n.as_str())).collect();
         root.push("notes", Json::Array(notes));
+
+        // The event-log detector plane. Always emitted when a scan was run, so a
+        // report states plainly whether the plane was live — "no events found"
+        // and "we could not read the log" must never look the same.
+        if let Some(ev) = &self.events {
+            root.push("event_log", ev.to_json());
+        }
         root
     }
 
@@ -287,6 +314,60 @@ fn round2(x: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::eventlog::{EventRecord, EventScan, Severity};
+
+    fn scan_with(sev: Severity) -> EventScan {
+        EventScan {
+            available: true,
+            unavailable_reason: String::new(),
+            events: vec![EventRecord {
+                time: "2026-07-24T20:15:38Z".into(),
+                provider: "Microsoft-Windows-WHEA-Logger".into(),
+                event_id: 19,
+                level: 3,
+                data: String::new(),
+                severity: sev,
+                meaning: "test",
+            }],
+        }
+    }
+
+    #[test]
+    fn a_logged_hardware_fault_fails_a_run_with_no_stage_errors() {
+        let mut r = Report::new("t", DeviceId::detect(), &Clock::new());
+        assert_eq!(r.verdict(), Verdict::Pass, "clean baseline");
+        r.events = Some(scan_with(Severity::Fail));
+        assert_eq!(
+            r.verdict(),
+            Verdict::Fail,
+            "a WHEA machine-check must fail the run even though every checksum matched"
+        );
+        assert_eq!(r.error_count(), 0, "it is not a STAGE error; the event plane is separate");
+    }
+
+    #[test]
+    fn a_warning_event_does_not_fail_the_run() {
+        let mut r = Report::new("t", DeviceId::detect(), &Clock::new());
+        r.events = Some(scan_with(Severity::Warn));
+        assert_eq!(r.verdict(), Verdict::Pass);
+    }
+
+    #[test]
+    fn an_unavailable_scan_does_not_silently_pass_as_clean() {
+        let mut r = Report::new("t", DeviceId::detect(), &Clock::new());
+        r.events = Some(EventScan {
+            available: false,
+            unavailable_reason: "EvtQuery failed".into(),
+            events: Vec::new(),
+        });
+        // It cannot fail the run (we saw nothing), but the report must record
+        // that the plane was down so a reader can tell it apart from clean.
+        assert_eq!(r.verdict(), Verdict::Pass);
+        assert!(!r.events.as_ref().unwrap().available);
+        assert!(r.to_pretty_json().contains("unavailable_reason"));
+    }
+
     use super::*;
 
     fn dev() -> DeviceId {

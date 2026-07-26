@@ -41,6 +41,19 @@ pub fn locate(explicit: Option<&str>) -> Option<PathBuf> {
             return Some(pb);
         }
     }
+    // Next to our own executable. This is what makes the shipped bundle
+    // portable: unzip the release (or install it) and PresentMon is simply
+    // there, with no PATH entry, no install step and no configuration.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in ["PresentMon.exe", "presentmon.exe"] {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         for name in ["PresentMon.exe", "presentmon.exe"] {
@@ -318,10 +331,21 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn locate_none_when_absent() {
-        // A path that does not exist yields None from the explicit branch (and we
-        // don't assume anything about the host PATH).
-        assert!(locate(Some("Z:/definitely/not/here/PresentMon.exe")).is_none());
+    fn a_bogus_explicit_path_is_never_returned() {
+        // Deliberately does NOT assert `None`: this machine may legitimately have
+        // PresentMon on PATH, in which case falling back to it is correct. The
+        // real invariant is that a path we were handed but could not find is
+        // never passed on as if it existed. (An earlier version asserted `None`
+        // and only passed because PresentMon happened not to be installed.)
+        let bogus = "Z:/definitely/not/here/PresentMon.exe";
+        if let Some(found) = locate(Some(bogus)) {
+            assert_ne!(
+                found.to_string_lossy(),
+                bogus,
+                "a non-existent explicit path must never be returned"
+            );
+            assert!(found.is_file(), "any returned path must actually exist");
+        }
     }
 
     #[test]

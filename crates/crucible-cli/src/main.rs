@@ -74,6 +74,8 @@ const COMMON_BOOLS: &[&str] = &[
     "benchmark",
     "presentmon",
     "dry-run",
+    "no-eventlog",
+    "no-priority",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -117,6 +119,7 @@ COMMANDS:
     gpu-info             List usable GPUs, then exit.            [--features gpu]
     cpu                  Run the CPU FMA/AVX burn kernel.
     mem                  Run the RAM pattern kernel.
+    uncore               Cross-core coherence / Infinity-Fabric verify (FCLK, L3, ring).
     storage              Run the storage scratch-file kernel.
     gpu                  Run the GPU thrasher kernel (watts).    [--features gpu]
     vram                 Run the VRAM integrity test.            [--features gpu]
@@ -339,6 +342,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "gpu-info" => cmd_gpu_info(rest),
         "cpu" => cmd_cpu(rest),
         "mem" => cmd_mem(rest),
+        "uncore" => cmd_uncore(rest),
         "storage" => cmd_storage(rest),
         "gpu" => cmd_gpu(rest),
         "vram" => cmd_vram(rest),
@@ -526,6 +530,42 @@ fn cmd_mem(rest: &[String]) -> Result<u8, String> {
 
     let mut runner = Runner::new(&p)?;
     runner.single_stage(&kernel, &budget, "steady")
+}
+
+/// **`uncore`** — cross-core coherence / interconnect verification.
+///
+/// Every other CPU test in this suite is register-resident: it generates no
+/// memory traffic and no cross-core traffic, so the L3, the ring/mesh and (on
+/// AMD) the Infinity Fabric sit idle throughout. Marginal FCLK / SoC voltage is
+/// one of the most common causes of "passes every stress test, crashes in
+/// games", and it is invisible to a test that never sends a byte between cores.
+///
+/// This walks core pairs with a single-producer/single-consumer ring and checks
+/// that every record arrives exactly once, in order, intact. A failure names the
+/// **core pair**, which is the diagnosis: cross-CCD points at FCLK / SoC voltage,
+/// same-CCD points at the L3 / ring.
+fn cmd_uncore(rest: &[String]) -> Result<u8, String> {
+    let p = Parsed::parse(rest, COMMON_BOOLS)?;
+    p.reject_unknown(&[
+        "seconds", "device-id", "out", "no-report", "json", "help", "ring-slots", "dwell",
+        "cores",
+    ])?;
+
+    let seconds = seconds_arg(&p, 60)?;
+    let mut k = crucible_cpu::uncore::UncoreKernel::new();
+    if let Some(v) = p.get_u64("ring-slots")? {
+        k.ring_slots = v as usize;
+    }
+    if let Some(v) = p.get_u64("dwell")? {
+        k.dwell = Duration::from_secs(v.clamp(1, 3600));
+    }
+    if let Some(v) = p.get_u64("cores")? {
+        k.cores = Some(v as usize);
+    }
+    let mode = format!("coherence sweep ({} slots)", k.resolved_slots());
+    let budget = budget_with(Duration::from_secs(seconds), Shape::Steady);
+    let mut runner = Runner::new(&p)?;
+    runner.single_stage_budget(&k, &budget, &mode)
 }
 
 fn cmd_storage(rest: &[String]) -> Result<u8, String> {
@@ -1428,6 +1468,98 @@ fn cmd_benchmark(rest: &[String]) -> Result<u8, String> {
     Ok(if all_valid { 0 } else { 1 })
 }
 
+/// **`rt-recovery`** — sustained ray-tracing load, a brief idle, then load again.
+///
+/// This profile exists because of a specific field failure. On a client machine
+/// (X870E, 32 threads), every `pathtrace` run started within ~5–8 s of a
+/// 30 s ray-tracing load died immediately — one dispatch, zero verifications,
+/// preview window gone, process taken with it. Every run started after ≥30 s of
+/// idle completed normally. It did **not** track workload weight: the heaviest
+/// configuration survived after a long idle, the lightest died after a short one.
+/// What predicted the crash was purely *how recently the GPU had been under
+/// sustained RT load*.
+///
+/// So the variable under test here is the **idle gap**, not the load. Each cycle
+/// runs the path tracer, then idles for `--gap`, and the profile reports which
+/// cycle (if any) failed to verify. A machine that survives cycle 1 and dies on
+/// cycle 2 has reproduced the field fault.
+///
+/// Pair it with `--preview` to include the present path (the field crashes all
+/// involved a live preview window) and watch the event log line in the summary:
+/// a TDR here is the smoking gun.
+#[cfg(feature = "rt")]
+fn run_gpu_recovery(runner: &mut Runner, p: &Parsed) -> Result<u8, String> {
+    let seconds = seconds_arg(p, 30)?;
+    let gap = p.get_u64("gap")?.unwrap_or(6).clamp(0, 600);
+    let cycles = p.get_u64("cycles")?.unwrap_or(6).clamp(1, 100) as u32;
+    // Which engine to cycle. The field unit crashed on BOTH `pathtrace --preview`
+    // and `render --preview`, which is what points the finger at the shared
+    // presentation path rather than at ray tracing specifically.
+    let engine = p.get("engine").unwrap_or("pathtrace").to_string();
+
+    runner.note(&format!(
+        "gpu-recovery [{engine}]: {cycles} x ({seconds}s sustained GPU load + {gap}s idle). The idle gap is \
+         the variable — a GPU that fails only when re-loaded shortly after a sustained RT run \
+         reproduces the field fault seen on device c782fe60."
+    ));
+    if gap >= 30 {
+        runner.note(
+            "gap >= 30s: the field unit RECOVERED at this spacing. Use --gap 5 to reproduce.",
+        );
+    }
+
+    let kernel: Box<dyn LoadKernel> = match engine.as_str() {
+        "pathtrace" => Box::new(pathtrace_kernel_from(p)?),
+        "rt" => Box::new(rt_kernel_from(p)?),
+        #[cfg(feature = "gpu")]
+        "render" => Box::new(render_kernel_from(p)?),
+        other => {
+            return Err(format!(
+                "--engine expects pathtrace|rt|render, got '{other}'"
+            ))
+        }
+    };
+    let budget = budget_with(Duration::from_secs(seconds), Shape::Steady);
+
+    runner.begin();
+    let mut failed_cycle: Option<u32> = None;
+    for c in 1..=cycles {
+        if runner.stop.stopped() {
+            runner.note("stop requested — ending the cycle sweep early");
+            break;
+        }
+        let mode = format!("cycle {c}/{cycles} (gap {gap}s)");
+        runner.run_one(kernel.as_ref(), &budget, &mode);
+        // The most recent stage tells us whether this cycle verified anything.
+        if let Some(last) = runner.report.stages.last() {
+            if !last.result.passed() && failed_cycle.is_none() {
+                failed_cycle = Some(c);
+                runner.note(&format!(
+                    "REPRODUCED on cycle {c}: the GPU failed after only {gap}s of idle \
+                     following a {seconds}s ray-tracing load. Check the event-log line \
+                     below for a TDR (display driver reset)."
+                ));
+            }
+        }
+        if c < cycles && gap > 0 && !runner.stop.stopped() {
+            eprintln!("  idling {gap}s before the next cycle…");
+            std::thread::sleep(Duration::from_secs(gap));
+        }
+    }
+    if failed_cycle.is_none() {
+        runner.note(&format!(
+            "survived all {cycles} cycles at a {gap}s gap — this configuration did not \
+             reproduce the fault (absence of a repro is not proof of health)"
+        ));
+    }
+    runner.finish()
+}
+
+#[cfg(not(feature = "rt"))]
+fn run_gpu_recovery(_runner: &mut Runner, _p: &Parsed) -> Result<u8, String> {
+    Err("the gpu-recovery profile needs a build with `--features rt`".to_string())
+}
+
 /// VRAM **integrity** test — a different test from `gpu` (the wattage thrasher).
 /// This one hunts bad video memory; watts are irrelevant to it.
 fn cmd_vram(rest: &[String]) -> Result<u8, String> {
@@ -1505,6 +1637,10 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         // core-cycle / c-states rotation, game-load cadence.
         "dwell",
         "passes",
+        // gpu-recovery: idle gap between sustained GPU loads, and which engine.
+        "gap",
+        "cycles",
+        "engine",
         "fps",
         "bound",
         "handoff-ms",
@@ -1617,10 +1753,13 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         // Single-core rotations: max-boost weak-core hunt / C-state idle test.
         "core-cycle" => run_core_cycle(&mut runner, &p),
         "c-states" => run_c_states(&mut runner, &p),
+        // Sustained ray-tracing load, brief idle, load again — the pattern that
+        // killed a field unit twice.
+        "gpu-recovery" | "rt-recovery" => run_gpu_recovery(&mut runner, &p),
         other => Err(format!(
             "unknown profile '{other}' (expected: quick | soak | cross | power | \
              storage-cross | in-phase | anti-phase | beat | worst-case | chaos | \
-             game-load | core-cycle | c-states)"
+             game-load | core-cycle | c-states | gpu-recovery)"
         )),
     }
 }
@@ -2073,6 +2212,10 @@ struct Runner {
     telemetry: bool,
     telemetry_stop: Option<Arc<AtomicBool>>,
     telemetry_handle: Option<JoinHandle<()>>,
+    /// Scan the Windows event log across the run window (default on).
+    eventlog: bool,
+    /// When the run began, so the scan window matches it.
+    run_started: Instant,
 }
 
 impl Runner {
@@ -2102,6 +2245,16 @@ impl Runner {
         // Register the console-control handler and start the bridge that trips
         // the run's StopFlag when Ctrl-C is seen, so a soak ends with a report
         // rather than a hard kill.
+        // A stress run saturates every core; at NORMAL our own coordination work
+        // (dashboard, telemetry sampler, the shape drivers that flip burst edges)
+        // competes with the workers we just spawned. That shows up as a laggy UI
+        // and, worse, late load edges. --priority high goes further; the default
+        // deliberately stops at ABOVE_NORMAL so we do not starve the desktop or
+        // the drivers we are measuring.
+        if !p.has("no-priority") {
+            crucible_core::sysinfo::raise_process_priority(p.get("priority") == Some("high"));
+        }
+
         install_ctrlc();
         let bridge_done = Arc::new(AtomicBool::new(false));
         let bridge = spawn_ctrlc_bridge(stop.clone(), bridge_done.clone());
@@ -2124,6 +2277,8 @@ impl Runner {
             telemetry: p.has("telemetry-csv"),
             telemetry_stop: None,
             telemetry_handle: None,
+            eventlog: !p.has("no-eventlog"),
+            run_started: Instant::now(),
         })
     }
 
@@ -2555,6 +2710,17 @@ impl Runner {
         self.report.ended = Some(ts);
         self.report.aborted = self.stop.stopped();
 
+        // Scan the Windows event log across this run's window. On by default:
+        // WHEA machine-checks and display TDRs are the only evidence of faults
+        // the hardware already handled, which no checksum of ours can ever see.
+        // A small margin is added so an event logged moments after the last
+        // kernel stopped is still attributed to the load that caused it.
+        if self.eventlog {
+            let window_ms =
+                (self.run_started.elapsed().as_millis() as u64).saturating_add(5_000);
+            self.report.events = Some(crucible_core::eventlog::scan_system_log(window_ms));
+        }
+
         // Retire the Ctrl-C bridge thread now that the run is over.
         self.bridge_done.store(true, Ordering::SeqCst);
         if let Some(h) = self.bridge.take() {
@@ -2609,6 +2775,35 @@ impl Runner {
             // Machine-readable: report JSON is the sole stdout content.
             println!("{}", self.report.to_pretty_json());
         } else {
+            // Event-log findings come BEFORE the verdict line: a WHEA or TDR is
+            // usually the most important thing on the screen, and it explains a
+            // FAIL that no stage error accounts for.
+            if let Some(ev) = &self.report.events {
+                if !ev.available {
+                    println!(
+                        "event log: UNAVAILABLE ({}) — WHEA/TDR coverage was NOT active this run",
+                        ev.unavailable_reason
+                    );
+                } else if ev.events.is_empty() {
+                    println!("event log: clean (no WHEA / TDR / bugcheck / disk resets in window)");
+                } else {
+                    println!(
+                        "event log: {} hardware fault(s), {} warning(s) in the run window:",
+                        ev.fail_count(),
+                        ev.warn_count()
+                    );
+                    for e in &ev.events {
+                        println!(
+                            "  [{}] {} id={}  {}",
+                            e.severity.as_str().to_uppercase(),
+                            e.provider,
+                            e.event_id,
+                            e.meaning
+                        );
+                        println!("        at {}", e.time);
+                    }
+                }
+            }
             println!(
                 "verdict: {}   errors: {}   markers: {}",
                 verdict.as_str(),
@@ -2889,6 +3084,9 @@ fn print_stage(name: &str, mode: &str, secs: f64, result: &LoadResult) {
 /// — a write error just ends logging, never the run.
 fn telemetry_loop(path: &Path, markers: Arc<MarkerLog>, stop: Arc<AtomicBool>, start: Instant) {
     use std::io::Write;
+    // Sampling on a fixed cadence only means something if we actually get
+    // scheduled on that cadence; under a saturating run we otherwise drift.
+    crucible_core::sysinfo::raise_current_thread_priority();
     let file = match std::fs::File::create(path) {
         Ok(f) => f,
         Err(e) => {

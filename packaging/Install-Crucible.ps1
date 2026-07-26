@@ -96,11 +96,20 @@ Write-Step "Installing to $InstallDir"
 if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null }
 
 Copy-Item $srcExe (Join-Path $InstallDir $ExeName) -Force
-foreach ($extra in @('README.md', 'LICENSE', 'RELEASE-NOTES.md')) {
+foreach ($extra in @('README.md', 'LICENSE', 'RELEASE-NOTES.md', 'THIRD-PARTY-NOTICES.md')) {
     $p = Join-Path $PSScriptRoot $extra
     if (Test-Path $p) { Copy-Item $p $InstallDir -Force }
 }
 Write-Ok "copied $ExeName"
+
+# PresentMon ships alongside so --presentmon works with no extra setup. It is
+# Intel's MIT-licensed tool, unmodified; see THIRD-PARTY-NOTICES.md. Optional —
+# everything else works without it.
+$pm = Join-Path $PSScriptRoot 'PresentMon.exe'
+if (Test-Path $pm) {
+    Copy-Item $pm (Join-Path $InstallDir 'PresentMon.exe') -Force
+    Write-Ok "copied PresentMon.exe (enables --presentmon)"
+}
 
 $destExe = Join-Path $InstallDir $ExeName
 

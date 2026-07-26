@@ -68,7 +68,7 @@ impl Parsed {
         for k in self.values.keys().chain(self.bools.iter()) {
             // A few flags are accepted by every command: `--ui` (live terminal UI)
             // and the CSV logging opt-ins.
-            if matches!(k.as_str(), "ui" | "csv" | "telemetry-csv") {
+            if matches!(k.as_str(), "ui" | "csv" | "telemetry-csv" | "no-eventlog" | "no-priority" | "priority") {
                 continue;
             }
             if !allowed.contains(&k.as_str()) {

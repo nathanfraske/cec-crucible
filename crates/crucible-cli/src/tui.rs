@@ -58,6 +58,10 @@ pub fn render_loop(
     run_stop: StopFlag,
     title: String,
 ) {
+    // The dashboard redraws while every core is pinned by the run it is
+    // watching. Without this the UI visibly stutters under a full cross-load.
+    crucible_core::sysinfo::raise_current_thread_priority();
+
     let mut stdout = std::io::stdout();
     if enable_raw_mode().is_err() {
         return;

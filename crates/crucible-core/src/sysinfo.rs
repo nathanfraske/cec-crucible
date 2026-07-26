@@ -96,3 +96,65 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Process / thread scheduling priority
+// ---------------------------------------------------------------------------
+
+/// Raise this process above the normal scheduling class.
+///
+/// A stress run deliberately saturates every core, and at `NORMAL` the tool's
+/// own coordination work — the live dashboard, the telemetry sampler, the shape
+/// drivers that decide when a burst turns on — competes on equal terms with the
+/// 32 worker threads it just launched. The result is a UI that stutters and,
+/// worse, load edges that land late because the thread that was supposed to
+/// flip them did not get scheduled. Both were observed in the field.
+///
+/// `ABOVE_NORMAL` is deliberate: `HIGH` (and certainly `REALTIME`) can starve
+/// the desktop and the very drivers we are measuring, which would distort the
+/// measurement and could hang the box. Returns whether the class was raised.
+pub fn raise_process_priority(high: bool) -> bool {
+    #[cfg(windows)]
+    {
+        const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+        const HIGH_PRIORITY_CLASS: u32 = 0x0000_0080;
+        // SAFETY: both are documented, argument-free/pseudo-handle Win32 calls.
+        unsafe {
+            let class = if high {
+                HIGH_PRIORITY_CLASS
+            } else {
+                ABOVE_NORMAL_PRIORITY_CLASS
+            };
+            SetPriorityClass(GetCurrentProcess(), class) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = high;
+        false
+    }
+}
+
+/// Raise the CALLING thread's priority — used for the live-UI and telemetry
+/// threads so they stay responsive while every core is pinned.
+pub fn raise_current_thread_priority() -> bool {
+    #[cfg(windows)]
+    {
+        const THREAD_PRIORITY_ABOVE_NORMAL: i32 = 1;
+        // SAFETY: pseudo-handle + documented constant.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn SetPriorityClass(handle: isize, class: u32) -> i32;
+    fn GetCurrentThread() -> isize;
+    fn SetThreadPriority(handle: isize, priority: i32) -> i32;
+}
