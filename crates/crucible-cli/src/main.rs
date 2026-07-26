@@ -56,6 +56,11 @@ mod presentmon;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Options accepted by (nearly) every command.
+/// How far back to look for hardware faults left by a PREVIOUS run that died
+/// before it could scan its own window. Ten minutes comfortably covers a
+/// crash-then-relaunch cycle without dredging up unrelated history.
+const PRIOR_EVENT_WINDOW_MS: u64 = 10 * 60 * 1000;
+
 const COMMON_BOOLS: &[&str] = &[
     "json",
     "no-report",
@@ -2593,6 +2598,29 @@ impl Runner {
         // Start the ETW capture here, not at the call site, so every command
         // (and the menu's Settings toggle) gets it uniformly and its stats are
         // available while the report is still being assembled.
+        // Scan BACKWARDS before the run starts. A hard crash (the process being
+        // killed outright) never reaches finish(), so its window is never
+        // scanned — which is precisely why a field capture of four hard crashes
+        // contained no TDR evidence. Looking back at startup means the NEXT run
+        // surfaces what the last one died from.
+        if self.eventlog {
+            let prior = crucible_core::eventlog::scan_system_log(PRIOR_EVENT_WINDOW_MS);
+            if prior.fail_count() > 0 {
+                eprintln!(
+                    "note: {} hardware fault(s) already in the log from the {} minutes BEFORE                      this run — if the previous run crashed, this is what it left behind:",
+                    prior.fail_count(),
+                    PRIOR_EVENT_WINDOW_MS / 60_000
+                );
+                for e in prior.failing() {
+                    eprintln!("      [{}] {} id={}  {}", e.time, e.provider, e.event_id, e.meaning);
+                    self.report.note(format!(
+                        "PRIOR (before this run): {} id={} at {} — {}",
+                        e.provider, e.event_id, e.time, e.meaning
+                    ));
+                }
+            }
+        }
+
         #[cfg(all(windows, feature = "gpu"))]
         if self.pm_enabled {
             self.pm = start_presentmon_capture(
