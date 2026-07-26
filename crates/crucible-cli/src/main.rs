@@ -128,6 +128,12 @@ COMMANDS:
     optix                NVIDIA-native OptiX path tracer (RT+SM).   [--features optix]
     benchmark            Graphics composite score (render + rt + pathtrace).
                          Per-engine scores + geometric-mean composite. [preview,rt]
+    mix [opts] -- <test> [opts] [-- <test> [opts]]…
+                         Compose an arbitrary run: any tests, each with its own
+                         parameters, all at once. Per-test --seconds / --at <DUR>
+                         (phase offset) / --as <name>; --dry-run to preview.
+                         e.g. mix --seconds 60 -- cpu --shape burst
+                                  -- gpu --shape burst --at 20ms -- mem --mb 4096
     run <profile>        See PROFILES below.
     version              Print version.
     help                 Print this help.

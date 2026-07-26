@@ -14,3 +14,7 @@ crucible-*.report.json
 crucible-*.markers.jsonl
 crucible-scratch-*.tmp
 spikes/*/*.spv
+
+# Release packaging build artifacts (the zip is attached to the GitHub release)
+packaging/stage/
+packaging/*.zip

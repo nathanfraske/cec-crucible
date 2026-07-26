@@ -1,0 +1,13 @@
+# Statically link the MSVC C runtime on Windows.
+#
+# Without this the binary imports VCRUNTIME140.dll, which is part of the Visual
+# C++ Redistributable and is NOT present on a clean Windows image — precisely the
+# freshly-built machine this suite is meant to run on. A tech would copy the exe
+# to a new build and get "VCRUNTIME140.dll was not found".
+#
+# With it, every remaining import is a Windows system DLL (kernel32, user32,
+# gdi32, advapi32, setupapi, oleaut32, bcryptprimitives, pdh, opengl32, ntdll),
+# so the exe is genuinely portable: copy it anywhere and run it. Vulkan, CUDA and
+# NVML are loaded dynamically at runtime and degrade gracefully when absent.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
