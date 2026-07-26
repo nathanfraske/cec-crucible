@@ -1729,6 +1729,29 @@ impl LoadKernel for RtKernel {
         } else {
             0.0
         };
+        // Nothing was ever read back and checked — refuse to report a confident
+        // pass. This is the case where the run ends almost immediately: the
+        // preview window died (closing it trips the stop flag), the device was
+        // yanked, or the budget was cut short before the first verification
+        // interval. Reporting PASS there is a FALSE PASS, which is the worst
+        // outcome a QC gate can produce. `render` has always guarded this; the
+        // RT engines did not, and a field capture caught exactly that — two runs
+        // that managed one dispatch, verified nothing, and still said PASS.
+        if verifications == 0 {
+            return LoadResult::new(
+                false,
+                dispatches,
+                0,
+                0,
+                format!(
+                    "{label} {kname}: NOT VERIFIED — ran {dispatches} dispatch(es) in \
+                     {secs:.1}s but never completed a verification. The run ended before \
+                     the first check (preview window closed, device lost, or stopped \
+                     early); no conclusion can be drawn."
+                ),
+            );
+        }
+
         let detail = format!(
             "{label} {backend} {}x{} {load_desc}, {dispatches} dispatch(es), \
              {verifications} verified, ~{mrays:.0} Mray/s",
