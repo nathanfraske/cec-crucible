@@ -1712,6 +1712,11 @@ impl LoadKernel for RtKernel {
             }
         }
 
+        // Everything below returns, at which point the preview device and the
+        // Vulkan context are dropped. That teardown is where a driver fault
+        // would kill us with no report, so name it for the crash watchdog.
+        crucible_core::crashguard::phase(format!("teardown:{kname}"));
+
         let secs = start.elapsed().as_secs_f64();
         let n_rays = ctx.width * ctx.height;
         // Rays cast per pixel per dispatch: `iters` (ray-query) or ~samples*bounces

@@ -1616,6 +1616,11 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         "gap",
         "cycles",
         "engine",
+        "preview",
+        "material",
+        "pt-samples",
+        "pt-bounces",
+        "rt-iters",
         "fps",
         "bound",
         "handoff-ms",
@@ -2595,6 +2600,23 @@ impl Runner {
     }
 
     fn begin(&mut self) {
+        // Arm the crash watchdog before anything can die. The breadcrumb lands
+        // beside the report so a crash record is filed where the report would
+        // have been.
+        if let Some(dir) = &self.out_dir {
+            let _ = std::fs::create_dir_all(dir);
+            // Sweep for corpses BEFORE arming — otherwise we immediately find
+            // our own freshly written breadcrumb and report this run as a crash.
+            for corpse in crucible_core::crashguard::resolve(dir) {
+                eprintln!("note: {corpse}");
+                self.report.note(corpse);
+            }
+            crucible_core::crashguard::arm(
+                dir.join(format!("crucible-{}", self.stamp)),
+                self.stamp.clone(),
+            );
+        }
+
         // Start the ETW capture here, not at the call site, so every command
         // (and the menu's Settings toggle) gets it uniformly and its stats are
         // available while the report is still being assembled.
@@ -2693,6 +2715,9 @@ impl Runner {
     }
 
     fn run_one(&mut self, kernel: &dyn LoadKernel, budget: &Budget, mode: &str) {
+        // The breadcrumb narrows a hard crash to a stage. Kernels that own GPU
+        // resources narrow it further by marking their own teardown.
+        crucible_core::crashguard::phase(format!("running:{}", kernel.name()));
         self.markers
             .stamp(Event::StageStart, kernel.name(), mode, "");
         eprintln!(
@@ -2776,6 +2801,8 @@ impl Runner {
             self.report.events = Some(crucible_core::eventlog::scan_system_log(window_ms));
         }
 
+        crucible_core::crashguard::phase("writing report");
+
         // Retire the Ctrl-C bridge thread now that the run is over.
         self.bridge_done.store(true, Ordering::SeqCst);
         if let Some(h) = self.bridge.take() {
@@ -2828,6 +2855,7 @@ impl Runner {
 
         if self.json {
             // Machine-readable: report JSON is the sole stdout content.
+            crucible_core::crashguard::finished();
             println!("{}", self.report.to_pretty_json());
         } else {
             // Event-log findings come BEFORE the verdict line: a WHEA or TDR is
@@ -2859,6 +2887,9 @@ impl Runner {
                     }
                 }
             }
+            // The run reached its end under its own power — clear the
+            // breadcrumb so the NEXT run does not report this one as a crash.
+            crucible_core::crashguard::finished();
             println!(
                 "verdict: {}   errors: {}   markers: {}",
                 verdict.as_str(),

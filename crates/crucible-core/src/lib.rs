@@ -22,6 +22,7 @@
 
 pub mod clock;
 pub mod cpustats;
+pub mod crashguard;
 pub mod device;
 pub mod eventlog;
 pub mod json;

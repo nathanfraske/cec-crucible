@@ -29,6 +29,7 @@
 #![allow(clippy::upper_case_acronyms)]
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::mem::MaybeUninit;
 use std::num::NonZeroIsize;
 use std::time::{Duration, Instant};
@@ -106,6 +107,8 @@ const PM_REMOVE: u32 = 0x0001;
 const WM_DESTROY: u32 = 0x0002;
 const WM_CLOSE: u32 = 0x0010;
 const WM_QUIT: u32 = 0x0012;
+/// `GWLP_USERDATA` — per-window storage for our closed flag.
+const GWLP_USERDATA: i32 = -21;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -143,13 +146,23 @@ extern "system" {
     fn TranslateMessage(msg: *const MSG) -> i32;
     fn DispatchMessageW(msg: *const MSG) -> isize;
     fn LoadCursorW(instance: isize, cursor_name: *const u16) -> isize;
-    fn PostQuitMessage(exit_code: i32);
+    fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
+    fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
     fn AdjustWindowRect(rect: *mut RECT, style: u32, menu: i32) -> i32;
 }
 
 /// The window procedure. Closing the window (WM_CLOSE) tears it down; WM_DESTROY
-/// posts WM_QUIT, which the pump loop below detects. No per-window state is
-/// needed, so this stays a plain function.
+/// flags **this window** as closed.
+///
+/// It deliberately does NOT call `PostQuitMessage`. That posts `WM_QUIT` to the
+/// THREAD's queue, not to the window — so once one preview had been destroyed,
+/// the next preview opened on the same thread would find that stale `WM_QUIT`
+/// waiting on its very first pump, conclude the user had closed it, and stop the
+/// run after a single dispatch. That is a real bug this suite shipped: it made a
+/// perfectly healthy machine look like it was crashing whenever two preview
+/// tests ran in one process, and the resulting reports blamed the hardware.
+/// Closure is per-window state now, so one window's teardown cannot end another
+/// window's run.
 unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
         WM_CLOSE => {
@@ -157,7 +170,14 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wp: usize, lp: isize) 
             0
         }
         WM_DESTROY => {
-            unsafe { PostQuitMessage(0) };
+            // SAFETY: the pointer was stored by `open` and outlives the window
+            // (PreviewWindow owns the Box and drops it after DestroyWindow).
+            unsafe {
+                let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AtomicBool;
+                if !p.is_null() {
+                    (*p).store(true, Ordering::SeqCst);
+                }
+            }
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
@@ -174,6 +194,9 @@ pub struct PreviewWindow {
     hwnd: isize,
     hinstance: isize,
     closed: Cell<bool>,
+    /// Set by this window's own WM_DESTROY. Boxed so the address is stable for
+    /// the window's whole life; freed only after `DestroyWindow` has returned.
+    closed_flag: Box<AtomicBool>,
 }
 
 impl PreviewWindow {
@@ -232,10 +255,23 @@ impl PreviewWindow {
                 return Err("CreateWindowExW failed".to_string());
             }
             ShowWindow(hwnd, SW_SHOW);
+
+            // Attach this window's own closed-flag before anything can pump it.
+            let closed_flag = Box::new(AtomicBool::new(false));
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, closed_flag.as_ref() as *const _ as isize);
+
+            // Defensive: swallow any stale WM_QUIT already sitting in this
+            // thread's queue (posted by an older build, or by anything else on
+            // the thread). Without this a leftover quit would end the new run
+            // before it started — the exact failure this window used to cause.
+            let mut stale = MaybeUninit::<MSG>::zeroed();
+            while PeekMessageW(stale.as_mut_ptr(), 0, WM_QUIT, WM_QUIT, PM_REMOVE) != 0 {}
+
             Ok(PreviewWindow {
                 hwnd,
                 hinstance,
                 closed: Cell::new(false),
+                closed_flag,
             })
         }
     }
@@ -248,14 +284,21 @@ impl PreviewWindow {
         }
         unsafe {
             let mut msg = MaybeUninit::<MSG>::zeroed();
+            // Dispatch everything; closure is decided by THIS window's flag, set
+            // from its own WM_DESTROY. A WM_QUIT is explicitly NOT treated as
+            // "our window closed" — it is a thread-wide message that another
+            // window's teardown could have left behind.
             while PeekMessageW(msg.as_mut_ptr(), 0, 0, 0, PM_REMOVE) != 0 {
-                if (*msg.as_ptr()).message == WM_QUIT {
-                    self.closed.set(true);
-                    return false;
+                if (*msg.as_ptr()).message != WM_QUIT {
+                    TranslateMessage(msg.as_ptr());
+                    DispatchMessageW(msg.as_ptr());
                 }
-                TranslateMessage(msg.as_ptr());
-                DispatchMessageW(msg.as_ptr());
             }
+        }
+        // Re-check after dispatching: WM_DESTROY may have just run.
+        if self.closed_flag.load(Ordering::SeqCst) {
+            self.closed.set(true);
+            return false;
         }
         true
     }
