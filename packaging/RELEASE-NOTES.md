@@ -1,17 +1,34 @@
-# cec-crucible v0.0.2 — Alpha 2 (Windows x64)
+# cec-crucible v0.0.3 — Alpha 3 (Windows x64)
 
 PC-build stress, validation and benchmark suite.
 **Mission: if something is ever going to fail, make it fail in the shop.**
 
-This release is driven almost entirely by one field capture. A client machine
-crashing in games produced data that (a) exposed a **false PASS in this tool**,
-and (b) showed a fault pattern we had no detector for. Both are fixed here.
+## Read this first if you used Alpha 1 or 2
+
+**A bug in this tool made healthy machines look like they were crashing.** If you
+have reports where a GPU test ended after a fraction of a second with one
+dispatch and no verifications, that was us, not the hardware under test.
+
+`WM_DESTROY` called `PostQuitMessage`, which posts `WM_QUIT` to the *thread's*
+message queue rather than to the window. Once one preview window had been
+destroyed, the leftover quit message sat there until the next preview opened on
+that thread — whose first message pump found it, concluded the operator had
+closed the window, and stopped the run immediately.
+
+The signature: any preview test (`render`, `rt`, `pathtrace`) that ran *after
+another preview test in the same process* would die at once. A fresh process
+always worked. In one field capture that was 3 crashes out of 3 opportunities,
+with zero false positives — and it produced reports that read as hardware faults.
+
+Fixed: window closure is now per-window state, so one window's teardown cannot
+end another window's run. **Re-test anything you diagnosed off Alpha 1/2 GPU
+crash data.**
 
 ---
 
 ## Install
 
-1. Download `cec-crucible-0.0.2-win-x64.zip` and extract it.
+1. Download `cec-crucible-0.0.3-win-x64.zip` and extract it.
 2. Double-click **`INSTALL.cmd`**.
 
 Per-user, **no admin required**. Installs to `%LOCALAPPDATA%\Programs\cec-crucible`,
@@ -26,7 +43,7 @@ now bundled** so `--presentmon` works with no setup.
 
 ---
 
-## What's new in Alpha 2
+## What's new in Alpha 3
 
 ### The report now carries WHEA and driver-level events — by default
 
@@ -58,25 +75,39 @@ and verifies every record arrives exactly once, in order, intact. A fault names
 the **core pair** — cross-CCD points at FCLK / SoC voltage, same-CCD at the L3 or
 ring. That distinction is the diagnosis.
 
-### `run gpu-recovery` — reproduces a real field failure
+### `run gpu-recovery` — load / idle / load cycling
 
-On the client machine, every ray-tracing run started within ~5–8 s of a sustained
-GPU load died instantly; every run started after ≥30 s of idle was fine. It did
-**not** track workload weight — the heaviest configuration survived after a long
-idle, the lightest died after a short one. What predicted the crash was purely
-*how recently the GPU had been loaded*.
-
-So this profile makes the **idle gap** the variable:
+Cycles a GPU engine with a configurable idle gap between runs, reporting which
+cycle (if any) failed to verify:
 
 ```
 cec-crucible run gpu-recovery --seconds 30 --gap 5 --cycles 6 --preview
 cec-crucible run gpu-recovery --engine render --gap 5      # the present path
 ```
 
-It reports which cycle failed, and the event-log line will show a TDR if the
-display driver reset. `--engine render|rt|pathtrace` because the client saw the
-crash on **both** render and pathtrace previews — which points at the shared
-presentation path rather than at ray tracing.
+`--engine render|rt|pathtrace`. It was built to chase what looked like a
+GPU recovery-time fault in the field; that turned out to be the `WM_QUIT` bug
+described at the top of these notes, so treat the idle gap as one variable among
+several rather than as a known failure mode. The profile is still the right shape
+for exercising repeated device create/destroy cycles, which is a genuinely
+under-tested path.
+
+### Crash watchdog — a crash now leaves evidence
+
+Four hard crashes in a field capture left nothing but a telemetry file that
+stopped mid-write: no report, no verdict, no indication of what the tool had been
+doing. For a QC tool that is the worst possible moment to learn nothing.
+
+Every run now keeps a **breadcrumb** on disk, rewritten at each phase, and
+installs an **unhandled structured-exception filter** plus a panic hook. An
+access violation raised inside a GPU driver (which `catch_unwind` cannot catch)
+now writes a `*.crash.json` naming the exception, the faulting address, and the
+phase it died in. GPU kernels mark their own teardown, so a driver fault there is
+attributable rather than silent.
+
+Even an uncatchable `TerminateProcess` leaves the breadcrumb, and the next run
+reports it: *"a previous run did not finish — last seen in running:cpu"*.
+Verified against a real forced kill.
 
 ### Fixed: a false PASS on crashed ray-tracing runs
 
@@ -97,6 +128,22 @@ runs at `ABOVE_NORMAL`, and the dashboard and telemetry threads are raised too s
 sampling keeps its cadence. `--priority high` goes further; `--no-priority` opts
 out. (Deliberately not `HIGH` by default: starving the desktop and the drivers
 we are measuring would distort the measurement.)
+
+### Fill-the-hardware modes
+
+`--mb max` on the memory test and `--vram-mb max` on the VRAM test size
+themselves to the machine instead of taking a default slice.
+
+`max` on VRAM needed a real answer, not a big number: **WDDM over-commits.** An
+allocation past the end of dedicated VRAM succeeds and silently spills into
+shared system memory, so the allocator never refuses — the failure arrives later,
+during the fill, as a *device loss* that takes the run down. Measured on an RTX
+3070 (8 GiB): 7168 MiB fills clean, 8192 MiB loses the device. So `max` now reads
+the adapter's dedicated VRAM from DXGI and takes 85% of it, leaving the desktop
+and compositor their working set. On that same 8 GiB card it fills 6784 MiB and
+passes. `--mb max` takes 90% of *available* RAM for the same reason.
+
+`uncore` is also now in the interactive menu, under COMPUTE.
 
 ### Also
 

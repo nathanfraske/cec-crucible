@@ -290,7 +290,23 @@ fn mem_size_field() -> Field {
     for &v in &MEM_MB {
         opts.push(Opt { show: format!("{v} MB"), args: vec!["--mb".into(), v.to_string()] });
     }
+    // Fill memory — the case that reaches the far end of the address space.
+    opts.push(Opt { show: "MAX".into(), args: vec!["--mb".into(), "max".into()] });
     Field { label: "Size", opts, idx: 0 }
+}
+
+/// VRAM span for the integrity test — `default`, fixed presets, or fill the card.
+#[cfg(feature = "gpu")]
+fn vram_size_field() -> Field {
+    let mut opts = vec![Opt { show: "default".into(), args: vec![] }];
+    for &v in &[512u64, 1024, 2048, 4096, 8192] {
+        opts.push(Opt {
+            show: format!("{v} MB"),
+            args: vec!["--vram-mb".into(), v.to_string()],
+        });
+    }
+    opts.push(Opt { show: "MAX".into(), args: vec!["--vram-mb".into(), "max".into()] });
+    Field { label: "VRAM span", opts, idx: 0 }
 }
 
 /// Storage scratch-file size — `default` (the CLI's 1024 MiB) plus `--size-mb`
@@ -362,6 +378,12 @@ fn catalog() -> Vec<Group> {
                 fields: vec![duration_field(), mem_size_field()],
             },
             Test {
+                label: "Uncore / fabric",
+                desc: "Cross-core coherence verify — FCLK / Infinity Fabric / L3.",
+                launch: Launch::Load("uncore"),
+                fields: vec![duration_field()],
+            },
+            Test {
                 label: "Storage",
                 desc: "Uncached scratch write / read-back verify.",
                 launch: Launch::Load("storage"),
@@ -384,7 +406,7 @@ fn catalog() -> Vec<Group> {
             label: "VRAM integrity",
             desc: "Moving-inversion pattern over VRAM.",
             launch: Launch::Load("vram"),
-            fields: vec![duration_field()],
+            fields: vec![duration_field(), vram_size_field()],
         });
         gpu.push(Test {
             label: "PCIe link",

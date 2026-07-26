@@ -47,6 +47,7 @@ pub mod rt;
 #[cfg(feature = "tensor")]
 pub mod tensor;
 pub mod vram;
+pub mod vramsize;
 
 use std::time::{Duration, Instant};
 

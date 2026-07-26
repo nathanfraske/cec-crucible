@@ -201,7 +201,7 @@ TRANSIENT / LIGHT-LOAD OPTIONS (jitter & pulse shapes; chaos/game-load/rotation)
     --handoff-ms <MS>    game-load GPU-start delay after CPU submit (default: cpu-on).
 
 MEM OPTIONS:
-    --mb <N>             Buffer size in MiB (default: 50% of free RAM).
+    --mb <N|max>         Buffer size in MiB (default: 50% of free RAM).
 
 STORAGE OPTIONS:
     --path <DIR>         Target directory for the scratch file (default: .).
@@ -712,7 +712,26 @@ fn vram_kernel_from(p: &Parsed) -> Result<crucible_gpu::vram::VramKernel, String
         }
     };
     let mut k = crucible_gpu::vram::VramKernel::new(device);
-    if let Some(v) = p.get_u64("vram-mb")? {
+    // `--vram-mb max` fills the card. The kernel already allocates chunk by
+    // chunk and stops cleanly when the driver refuses one, testing whatever it
+    // secured — so "max" is simply asking for more than exists and letting that
+    // machinery find the ceiling. This is also the only mode that exercises the
+    // near-full-VRAM behaviour a game hits in its worst moments.
+    if matches!(p.get("vram-mb"), Some(v) if v.eq_ignore_ascii_case("max")) {
+        let idx = match device {
+            GpuDevice::Discrete(i) | GpuDevice::Integrated(i) => i as u32,
+            GpuDevice::Default => 0,
+        };
+        match crucible_gpu::vramsize::max_testable_vram_mb(idx) {
+            Some(mb) => k.vram_mb = mb,
+            None => {
+                return Err(
+                    "--vram-mb max needs the adapter's dedicated VRAM size, which could not                      be read (no DXGI, or a shared-memory adapter). Give an explicit size,                      e.g. --vram-mb 6144."
+                        .to_string(),
+                )
+            }
+        }
+    } else if let Some(v) = p.get_u64("vram-mb")? {
         k.vram_mb = v.clamp(16, 65536) as usize;
     }
     if let Some(v) = p.get_u64("vram-chunk-mb")? {
@@ -3079,7 +3098,19 @@ fn cores_label(sel: CoreSel) -> String {
     }
 }
 
+/// Fraction of AVAILABLE RAM used by `--mb max`. Deliberately not 1.0: the OS,
+/// the GPU driver's pinned allocations and this process all need headroom, and a
+/// run that triggers the OOM killer tests nothing. 90% is the most we can take
+/// and still reliably finish.
+const MEM_MAX_FRACTION: f64 = 0.90;
+
 fn mem_size_from(p: &Parsed, default_mb: Option<u64>) -> Result<MemSize, String> {
+    // `--mb max` fills memory rather than taking the default half — the case
+    // that actually exercises the far end of the address space and forces the
+    // allocator into regions a smaller buffer never touches.
+    if matches!(p.get("mb"), Some(v) if v.eq_ignore_ascii_case("max")) {
+        return Ok(MemSize::Fraction(MEM_MAX_FRACTION));
+    }
     match p.get_u64("mb")? {
         // saturating_mul so an absurd --mb can't overflow/panic (the kernel
         // caps to available RAM via try_reserve anyway).
