@@ -870,14 +870,7 @@ fn cmd_render(rest: &[String]) -> Result<u8, String> {
             phase_offset: Duration::ZERO,
         };
         let mut runner = Runner::new(&p)?;
-        // Optional PresentMon ETW capture wrapping the presenting run. Windows
-        // only; a no-op unless --presentmon is set and PresentMon is installed.
-        #[cfg(windows)]
-        let pm = start_presentmon(&p, seconds);
-        let out = runner.single_stage(&kernel, &budget, &mode);
-        #[cfg(windows)]
-        finish_presentmon(pm);
-        out
+        runner.single_stage(&kernel, &budget, &mode)
     }
 }
 
@@ -885,40 +878,37 @@ fn cmd_render(rest: &[String]) -> Result<u8, String> {
 /// beside the usual reports. Returns None (with a `note:`) if --presentmon is
 /// unset, PresentMon isn't found, or it fails to start — never fails the run.
 #[cfg(all(windows, feature = "gpu"))]
-fn start_presentmon(p: &Parsed, seconds: u64) -> Option<presentmon::Capture> {
-    if !p.has("presentmon") {
-        return None;
-    }
-    let exe = match presentmon::locate(p.get("presentmon-path")) {
+fn start_presentmon_capture(
+    explicit: Option<&str>,
+    seconds: u64,
+    out_dir: Option<&Path>,
+    device_short_id: &str,
+) -> Option<presentmon::Capture> {
+    let exe = match presentmon::locate(explicit) {
         Some(e) => e,
         None => {
             eprintln!(
-                "note: --presentmon set but PresentMon.exe not found — pass \
-                 --presentmon-path, set CRUCIBLE_PRESENTMON, or put it on PATH \
-                 (get it from github.com/GameTechDev/PresentMon). Continuing without \
-                 ETW capture."
+                "note: --presentmon set but PresentMon.exe not found. It normally ships                  next to cec-crucible; pass --presentmon-path, set CRUCIBLE_PRESENTMON,                  or put it on PATH. Continuing without ETW capture."
             );
             return None;
         }
     };
-    let dir = match p.get("out") {
-        Some(d) => PathBuf::from(d),
-        None => default_out_dir(),
+    let dir = match out_dir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::temp_dir(),
     };
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
-    let device = resolve_device(p);
     let unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let csv = dir.join(format!("crucible-{}-{unix}.presentmon.csv", device.short_id));
+    let csv = dir.join(format!("crucible-{device_short_id}-{unix}.presentmon.csv"));
     match presentmon::Capture::start(&exe, csv, seconds) {
         Ok(c) => {
             eprintln!(
-                "presentmon: ETW capture via {} (approve the UAC prompt if one appears — \
-                 the ETW session needs elevation)",
+                "presentmon: ETW capture via {} (approve the UAC prompt if one appears —                  the ETW session needs elevation)",
                 exe.display()
             );
             Some(c)
@@ -930,26 +920,6 @@ fn start_presentmon(p: &Parsed, seconds: u64) -> Option<presentmon::Capture> {
     }
 }
 
-/// Wait for a PresentMon capture to flush + report its CSV (with a one-line
-/// displayed-frame summary). A missing CSV almost always means the ETW session
-/// needed elevation.
-#[cfg(all(windows, feature = "gpu"))]
-fn finish_presentmon(pm: Option<presentmon::Capture>) {
-    if let Some(c) = pm {
-        match c.finish() {
-            Some(csv) => {
-                if let Some(s) = presentmon::summarize(&csv) {
-                    println!("  {}", s.line());
-                }
-                eprintln!("presentmon: {}", csv.display());
-            }
-            None => eprintln!(
-                "note: PresentMon produced no CSV — the ETW session needs elevation \
-                 (approve the UAC prompt, or run cec-crucible from an admin shell)."
-            ),
-        }
-    }
-}
 
 #[cfg(feature = "tensor")]
 fn tensor_kernel_from(p: &Parsed) -> Result<crucible_gpu::tensor::TensorKernel, String> {
@@ -2214,6 +2184,17 @@ struct Runner {
     telemetry_handle: Option<JoinHandle<()>>,
     /// Scan the Windows event log across the run window (default on).
     eventlog: bool,
+    /// Live ETW capture, owned by the Runner so its stats land in the report
+    /// BEFORE the report is written (a capture finished by the caller
+    /// afterwards would always be too late).
+    #[cfg(all(windows, feature = "gpu"))]
+    pm: Option<presentmon::Capture>,
+    /// Duration handed to the capture's `--timed` window.
+    pm_seconds: u64,
+    /// `--presentmon` was requested.
+    pm_enabled: bool,
+    /// Explicit `--presentmon-path`, if given.
+    pm_path: Option<String>,
     /// When the run began, so the scan window matches it.
     run_started: Instant,
 }
@@ -2278,6 +2259,11 @@ impl Runner {
             telemetry_stop: None,
             telemetry_handle: None,
             eventlog: !p.has("no-eventlog"),
+            #[cfg(all(windows, feature = "gpu"))]
+            pm: None,
+            pm_seconds: p.get_u64("seconds").ok().flatten().unwrap_or(60),
+            pm_enabled: p.has("presentmon"),
+            pm_path: p.get("presentmon-path").map(|s| s.to_string()),
             run_started: Instant::now(),
         })
     }
@@ -2604,6 +2590,18 @@ impl Runner {
     }
 
     fn begin(&mut self) {
+        // Start the ETW capture here, not at the call site, so every command
+        // (and the menu's Settings toggle) gets it uniformly and its stats are
+        // available while the report is still being assembled.
+        #[cfg(all(windows, feature = "gpu"))]
+        if self.pm_enabled {
+            self.pm = start_presentmon_capture(
+                self.pm_path.as_deref(),
+                self.pm_seconds,
+                self.out_dir.as_deref(),
+                &self.device.short_id,
+            );
+        }
         eprintln!(
             "cec-crucible {VERSION}  device {} ({})  qpc {:.1} MHz{}",
             self.device.short_id,
@@ -2715,6 +2713,35 @@ impl Runner {
         // the hardware already handled, which no checksum of ours can ever see.
         // A small margin is added so an event logged moments after the last
         // kernel stopped is still attributed to the load that caused it.
+        // Close the ETW capture and fold its summary into the report BEFORE the
+        // report is written, so the present-pipeline numbers land in the JSON
+        // and the results CSV rather than only in a side file.
+        #[cfg(all(windows, feature = "gpu"))]
+        if let Some(c) = self.pm.take() {
+            match c.finish() {
+                Some(csv) => {
+                    if let Some(st) = presentmon::summarize(&csv) {
+                        println!("  {}", st.line());
+                        self.report.present = Some(crucible_core::report::PresentSummary {
+                            frames: st.frames,
+                            avg_fps: st.avg_fps,
+                            low1pct_fps: st.low1pct_fps,
+                            stutter_ms: st.stutter_ms,
+                            gpu_busy_ms: st.gpu_busy_ms,
+                            cpu_busy_ms: st.cpu_busy_ms,
+                            cpu_wait_ms: st.cpu_wait_ms,
+                            display_latency_ms: st.display_latency_ms,
+                            dropped: st.dropped,
+                        });
+                    }
+                    eprintln!("presentmon: {}", csv.display());
+                }
+                None => eprintln!(
+                    "note: PresentMon produced no CSV — the ETW session needs elevation                      (approve the UAC prompt, or run cec-crucible from an admin shell)."
+                ),
+            }
+        }
+
         if self.eventlog {
             let window_ms =
                 (self.run_started.elapsed().as_millis() as u64).saturating_add(5_000);

@@ -520,7 +520,7 @@ fn out_presets() -> Vec<Opt> {
 }
 
 /// Rows on the Settings screen: results CSV, telemetry CSV, output directory.
-const SETTINGS_ROWS: usize = 3;
+const SETTINGS_ROWS: usize = 5;
 
 /// Global CSV-logging + output settings, injected into every load and profile
 /// launch (never `Info` diagnostics). All-off by default, so an untouched menu
@@ -533,6 +533,13 @@ struct Settings {
     telemetry_csv: bool,
     /// Index into [`out_presets`] — the `--out` directory preset (0 = Default).
     out: usize,
+    /// `--presentmon`: capture ETW frame data on presenting runs. Harmless on
+    /// tests that do not present, so it can ride along with every launch.
+    presentmon: bool,
+    /// Scheduling priority ring: 0 = above normal (default), 1 = high,
+    /// 2 = normal (opt out). A stress run saturates every core, so the tool's
+    /// own coordination work needs headroom or burst edges land late.
+    priority: usize,
 }
 
 impl Settings {
@@ -542,6 +549,15 @@ impl Settings {
             .get(self.out)
             .map(|o| o.show.clone())
             .unwrap_or_else(|| "Default".into())
+    }
+
+    /// Label for the Priority ring.
+    fn priority_label(&self) -> &'static str {
+        match self.priority {
+            1 => "high",
+            2 => "normal (off)",
+            _ => "above normal",
+        }
     }
 
     /// The `--out <DIR>` fragment for the selected preset (empty for Default).
@@ -555,10 +571,12 @@ impl Settings {
         match row {
             0 => self.results_csv = !self.results_csv,
             1 => self.telemetry_csv = !self.telemetry_csv,
-            _ => {
+            2 => {
                 let n = out_presets().len() as isize;
                 self.out = (self.out as isize + delta).rem_euclid(n) as usize;
             }
+            3 => self.presentmon = !self.presentmon,
+            _ => self.priority = (self.priority as isize + delta).rem_euclid(3) as usize,
         }
     }
 
@@ -571,6 +589,19 @@ impl Settings {
         }
         if self.telemetry_csv {
             argv.push("--telemetry-csv".to_string());
+        }
+        if self.presentmon {
+            argv.push("--presentmon".to_string());
+        }
+        match self.priority {
+            1 => {
+                argv.push("--priority".to_string());
+                argv.push("high".to_string());
+            }
+            2 => argv.push("--no-priority".to_string()),
+            // 0 is the built-in default; emit nothing so an untouched launch
+            // stays byte-identical to the hand-typed command.
+            _ => {}
         }
         argv.extend(self.out_args());
     }
@@ -1048,6 +1079,8 @@ impl App {
             ("Results CSV", onoff(self.settings.results_csv)),
             ("Telemetry CSV", onoff(self.settings.telemetry_csv)),
             ("Output", self.settings.out_label()),
+            ("PresentMon", onoff(self.settings.presentmon)),
+            ("Priority", self.settings.priority_label().to_string()),
         ];
         let lines: Vec<Line> = rows
             .iter()

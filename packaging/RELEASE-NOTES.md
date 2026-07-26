@@ -1,83 +1,108 @@
-# cec-crucible v0.0.1 — Alpha 1 (Windows x64)
+# cec-crucible v0.0.2 — Alpha 2 (Windows x64)
 
 PC-build stress, validation and benchmark suite.
 **Mission: if something is ever going to fail, make it fail in the shop.**
 
-> **Alpha.** Validated on one bench (i9-10850K + RTX 3070 + UHD 630, Windows 11).
-> Treat findings as real but treat *absence* of findings as unproven on hardware
-> that differs from that. Known gaps are listed at the bottom — they are listed
-> because they are known, not because they are excused.
+This release is driven almost entirely by one field capture. A client machine
+crashing in games produced data that (a) exposed a **false PASS in this tool**,
+and (b) showed a fault pattern we had no detector for. Both are fixed here.
 
 ---
 
 ## Install
 
-1. Download `cec-crucible-0.0.1-win-x64.zip` and extract it.
+1. Download `cec-crucible-0.0.2-win-x64.zip` and extract it.
 2. Double-click **`INSTALL.cmd`**.
 
-Per-user, **no admin required**. It installs to
-`%LOCALAPPDATA%\Programs\cec-crucible`, adds that to your user PATH, and creates
-Start Menu + Desktop shortcuts.
+Per-user, **no admin required**. Installs to `%LOCALAPPDATA%\Programs\cec-crucible`,
+adds it to your user PATH, and creates Start Menu + Desktop shortcuts.
 
-**To launch the interactive TUI:** double-click the **CEC Crucible** shortcut, or
-open a *new* terminal and run `cec-crucible` with no arguments.
+**Launch the TUI:** double-click the **CEC Crucible** shortcut, or open a *new*
+terminal and run `cec-crucible` with no arguments.
 
-Uninstall:
-```
-powershell -ExecutionPolicy Bypass -File Install-Crucible.ps1 -Uninstall
-```
-
-### Portability
-
-The executable is fully self-contained — every import is a Windows system DLL.
-There is **no** Visual C++ Redistributable dependency (the CRT is statically
-linked), so it runs on a freshly imaged machine. Vulkan, CUDA and NVML are loaded
-from the GPU driver at runtime and degrade gracefully when absent.
-
-Requirements: Windows 10/11 x64. A GPU driver is needed for the GPU tests; the
-CPU/RAM/storage tests need nothing.
+The main executable is self-contained (statically linked CRT — no Visual C++
+Redistributable needed, so it runs on a freshly imaged machine). **PresentMon is
+now bundled** so `--presentmon` works with no setup.
 
 ---
 
-## What's in it
+## What's new in Alpha 2
 
-**Interactive TUI** — branded launcher for every test and profile, per-test config
-screens, and a live dashboard: per-core heatmap with effective clock and
-utilization (driverless, via PDH), per-domain panels showing live patterns, values
-and verification checksums, and a reactive border that sparks with activity,
-pulses cyan on each verification and cracks red lightning on a miscompare.
+### The report now carries WHEA and driver-level events — by default
 
-**Tests** — CPU (AVX2/FMA, recompute-verified) · RAM (moving-inversion, walking
-ones/zeros, checkerboard, March C−, modulo-20) · storage (uncached
-write/read-verify, multi-SSD cross-load) · GPU thrasher (watts) · VRAM integrity ·
-PCIe transfer+verify (incl. CUDA full-duplex) · raster render · tensor cores ·
-ray tracing · path tracer (8 materials incl. fibre fur) · OptiX.
-
-**Composable runs** — `mix` composes an arbitrary run from any tests with any
-parameters, concurrently, with per-test duration and phase offset:
+Every run scans the Windows System log across its own window and reports WHEA
+machine-checks, display TDRs, bugchecks and disk resets:
 
 ```
-cec-crucible mix --seconds 120 -- cpu --shape burst --burst-on 20 --burst-off 20 \
-                                -- gpu --shape burst --burst-on 20 --burst-off 20 --at 20ms \
-                                -- mem --mb 4096
+event log: 1 hardware fault(s), 0 warning(s) in the run window:
+  [FAIL] Microsoft-Windows-WHEA-Logger id=19  corrected bus/interconnect error —
+         on AMD typically Infinity Fabric ECC (suspect FCLK / SoC voltage)
 ```
 
-**Profiles** — quick · soak · cross · power · storage-cross · worst-case · chaos ·
-game-load · core-cycle · c-states · in-phase · anti-phase · beat.
+**This is the only plane that can see a fault the hardware already corrected.**
+A corrected machine-check is invisible to every checksum we compute — the data
+came back right *because* the hardware fixed it. A machine quietly correcting
+errors is not stable, and now a logged hardware fault **fails the run** even when
+every checksum matched. A scan that could not run is reported as *unavailable*,
+never as clean. Opt out with `--no-eventlog`.
 
-**Benchmark** — `cec-crucible benchmark` scores each graphics engine on a
-calibrated scale and combines them via geometric mean. Error-gated: any
-miscompare invalidates the score. Reference RTX 3070 ≈ 20,000 composite.
+### `uncore` — cross-core / Infinity-Fabric verification
 
-**Reports** — device-ID'd JSON + JSONL markers (QPC-timestamped, for correlation
-with an external power rig), optional per-stage results CSV and ~4 Hz time-series
-telemetry CSV including per-core clock and utilization. Optional `--presentmon`
-ETW capture for true displayed-frame pacing (GPU busy, CPU busy/wait, display
-latency, dropped frames).
+Closes the largest hole in the suite. Every other CPU test here is
+register-resident, which means the L3, the ring/mesh and the Infinity Fabric were
+**idle in every run this tool has ever done**. Marginal FCLK / SoC voltage is one
+of the most common causes of "passes every stress test, crashes in games".
 
-**Every test verifies its output.** Timings alone are never trusted — a dead
-kernel once reported 1.65 TFLOP/s while the GPU sat idle, and that lesson is
-baked into the design.
+`cec-crucible uncore` walks core pairs with single-producer/single-consumer rings
+and verifies every record arrives exactly once, in order, intact. A fault names
+the **core pair** — cross-CCD points at FCLK / SoC voltage, same-CCD at the L3 or
+ring. That distinction is the diagnosis.
+
+### `run gpu-recovery` — reproduces a real field failure
+
+On the client machine, every ray-tracing run started within ~5–8 s of a sustained
+GPU load died instantly; every run started after ≥30 s of idle was fine. It did
+**not** track workload weight — the heaviest configuration survived after a long
+idle, the lightest died after a short one. What predicted the crash was purely
+*how recently the GPU had been loaded*.
+
+So this profile makes the **idle gap** the variable:
+
+```
+cec-crucible run gpu-recovery --seconds 30 --gap 5 --cycles 6 --preview
+cec-crucible run gpu-recovery --engine render --gap 5      # the present path
+```
+
+It reports which cycle failed, and the event-log line will show a TDR if the
+display driver reset. `--engine render|rt|pathtrace` because the client saw the
+crash on **both** render and pathtrace previews — which points at the shared
+presentation path rather than at ray tracing.
+
+### Fixed: a false PASS on crashed ray-tracing runs
+
+The field capture contained two runs that managed **one dispatch, zero
+verifications**, and reported `PASS, ok=true, errors=0`. Closing the preview
+window trips the stop flag, so the kernel exited before its first verification
+and fell through to the success path. `render` had guarded this since it was
+written; the RT engines never did.
+
+A false PASS is the worst outcome a QC gate can produce. `rt` and `pathtrace` now
+return **NOT VERIFIED — no conclusion can be drawn**.
+
+### Priority escalation
+
+At normal priority the tool's own coordination work competes with the workers it
+just spawned — a laggy UI, and worse, burst edges landing late. The process now
+runs at `ABOVE_NORMAL`, and the dashboard and telemetry threads are raised too so
+sampling keeps its cadence. `--priority high` goes further; `--no-priority` opts
+out. (Deliberately not `HIGH` by default: starving the desktop and the drivers
+we are measuring would distort the measurement.)
+
+### Also
+
+* **PresentMon bundled** (Intel, MIT, unmodified — see `THIRD-PARTY-NOTICES.md`),
+  found next to the executable, so `--presentmon` works out of the box.
+* `mix` is now documented in `--help` (it shipped working but undocumented).
 
 ---
 
@@ -87,31 +112,31 @@ baked into the design.
 cec-crucible                        # interactive TUI
 cec-crucible info                   # system + device identity
 cec-crucible run quick              # ~15s CPU/RAM/storage QC
+cec-crucible uncore                 # interconnect / FCLK verification
+cec-crucible run gpu-recovery       # GPU load/idle/load recovery test
 cec-crucible benchmark              # graphics composite score
 cec-crucible run worst-case --ui    # everything at once, live dashboard
-cec-crucible help                   # everything else
 ```
 
 ---
 
-## Known gaps in this alpha
+## Known gaps
 
-* **Single-bench validation.** AMD GPUs and Intel Arc are untested — no hardware.
-  Per-vendor behaviour is not claimed.
-* **Six defects are documented but not yet fixed** (see `docs/game-realism.md` §1),
-  the notable ones being that burst shapes overshoot their commanded duty cycle by
-  up to one work chunk, and that GPU transient errors between verification
-  intervals can be overwritten before they are seen.
-* **The uncore is not exercised** — no cross-core coherence traffic, so
-  FCLK/Infinity-Fabric instability is not currently detected.
-* **No network test.** No display/scanout, cable or EDID validation.
-* **`--presentmon` needs an installed PresentMon 2.x** and elevation for the ETW
-  session; it is opt-in and never fails a run when absent.
+* **Single-bench validation.** AMD GPUs and Intel Arc untested — no hardware.
+* **The PCIe test may not cross PCIe on systems with Resizable BAR.** A field
+  capture reported `H2D ~370 GB/s`, which is physically impossible (PCIe Gen5 ×16
+  is ~64 GB/s) — the staging buffer is likely landing in device-local memory,
+  making the "upload" a VRAM→VRAM copy. Treat H2D figures as unproven until this
+  is fixed; D2H looks correct.
+* Five defects documented in `docs/game-realism.md` §1 remain unfixed — notably
+  burst shapes overshooting their commanded duty cycle, and shape fidelity never
+  being verified against the marker log.
+* No network test; no display/scanout, cable or EDID validation.
 * Not code-signed, so SmartScreen will warn on first run.
-* The benchmark score is calibrated against one RTX 3070; treat cross-machine
-  comparisons as provisional until a fleet baseline exists.
+* Benchmark scores are calibrated against one RTX 3070 — treat cross-machine
+  comparisons as provisional.
 
-Full roadmap and design docs are in `docs/` in the repository.
+Full roadmap and design docs are in `docs/`.
 
 ---
 

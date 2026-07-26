@@ -89,6 +89,23 @@ impl StageReport {
     }
 }
 
+/// Present-pipeline summary from an ETW capture (PresentMon), when one ran.
+/// Carried in the report so the *displayed* frame behaviour — which the app
+/// cannot self-measure — lands in the JSON and the results CSV alongside
+/// everything else, instead of only in a side file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PresentSummary {
+    pub frames: u64,
+    pub avg_fps: f64,
+    pub low1pct_fps: f64,
+    pub stutter_ms: f64,
+    pub gpu_busy_ms: f64,
+    pub cpu_busy_ms: f64,
+    pub cpu_wait_ms: f64,
+    pub display_latency_ms: f64,
+    pub dropped: u64,
+}
+
 /// A complete, device-identified run report.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -111,6 +128,8 @@ pub struct Report {
     /// This is the only plane that sees faults the hardware already corrected —
     /// no checksum can, by definition.
     pub events: Option<EventScan>,
+    /// ETW present-pipeline summary (`--presentmon`), when a capture succeeded.
+    pub present: Option<PresentSummary>,
 }
 
 impl Report {
@@ -131,6 +150,7 @@ impl Report {
             markers_file: None,
             notes: Vec::new(),
             events: None,
+            present: None,
         }
     }
 
@@ -209,6 +229,19 @@ impl Report {
         if let Some(ev) = &self.events {
             root.push("event_log", ev.to_json());
         }
+        if let Some(pm) = &self.present {
+            let mut j = Json::object();
+            j.push("frames", pm.frames)
+                .push("avg_fps", round2(pm.avg_fps))
+                .push("low1pct_fps", round2(pm.low1pct_fps))
+                .push("stutter_ms", round2(pm.stutter_ms))
+                .push("gpu_busy_ms", round2(pm.gpu_busy_ms))
+                .push("cpu_busy_ms", round2(pm.cpu_busy_ms))
+                .push("cpu_wait_ms", round2(pm.cpu_wait_ms))
+                .push("display_latency_ms", round2(pm.display_latency_ms))
+                .push("dropped", pm.dropped);
+            root.push("present", j);
+        }
         root
     }
 
@@ -235,7 +268,9 @@ impl Report {
     pub fn to_csv(&self) -> String {
         const HEADER: &str = "tool_version,device_short_id,host,system,board,os,arch,\
 started_unix_nanos,run_verdict,kernel,kind,mode,seconds,stage_verdict,ok,iterations,\
-checksum_hex,error_count,detail\n";
+checksum_hex,error_count,detail,\
+whea_faults,event_warnings,pm_frames,pm_avg_fps,pm_1pct_low_fps,pm_stutter_ms,\
+pm_gpu_busy_ms,pm_cpu_busy_ms,pm_cpu_wait_ms,pm_display_latency_ms,pm_dropped\n";
         let mut s = String::from(HEADER);
         let started = self
             .started
@@ -263,6 +298,19 @@ checksum_hex,error_count,detail\n";
                 format!("{:#018x}", st.result.checksum),
                 st.result.error_count.to_string(),
                 csv_field(&st.result.detail),
+                // Run-level context repeated per row, same as device/verdict
+                // above, so each row stays self-contained.
+                self.events.as_ref().map(|e| e.fail_count().to_string()).unwrap_or_default(),
+                self.events.as_ref().map(|e| e.warn_count().to_string()).unwrap_or_default(),
+                pm_col(&self.present, |p| p.frames.to_string()),
+                pm_col(&self.present, |p| format!("{:.1}", p.avg_fps)),
+                pm_col(&self.present, |p| format!("{:.1}", p.low1pct_fps)),
+                pm_col(&self.present, |p| format!("{:.2}", p.stutter_ms)),
+                pm_col(&self.present, |p| format!("{:.2}", p.gpu_busy_ms)),
+                pm_col(&self.present, |p| format!("{:.2}", p.cpu_busy_ms)),
+                pm_col(&self.present, |p| format!("{:.2}", p.cpu_wait_ms)),
+                pm_col(&self.present, |p| format!("{:.2}", p.display_latency_ms)),
+                pm_col(&self.present, |p| p.dropped.to_string()),
             ]
             .join(",");
             s.push_str(&row);
@@ -279,6 +327,13 @@ checksum_hex,error_count,detail\n";
 /// Quote a CSV field per RFC 4180 iff it contains a comma, quote, or newline,
 /// doubling any embedded quotes. Detail strings can contain commas, so this
 /// keeps the column count stable.
+/// A PresentMon column: the formatted value, or empty when no capture ran.
+/// Empty is deliberate — a blank cell reads as "not measured", whereas a 0
+/// would read as "measured, and it was zero".
+fn pm_col(p: &Option<PresentSummary>, f: impl Fn(&PresentSummary) -> String) -> String {
+    p.as_ref().map(f).unwrap_or_default()
+}
+
 fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -331,6 +386,33 @@ mod tests {
                 meaning: "test",
             }],
         }
+    }
+
+    #[test]
+    fn csv_header_and_row_have_the_same_field_count() {
+        // This caught a real bug: the PresentMon/event columns were appended to
+        // every data row while the header const still listed the old 19, so the
+        // file did not parse. Any future column MUST be added in both places.
+        let mut r = Report::new("t", DeviceId::detect(), &Clock::new());
+        r.add_stage(StageReport::new(
+            "cpu",
+            Kind::Cpu,
+            "steady",
+            1.0,
+            LoadResult::clean(1, 2, "ok"),
+        ));
+        let csv = r.to_csv();
+        let mut lines = csv.lines();
+        let header = lines.next().expect("header");
+        let row = lines.next().expect("one data row");
+        assert_eq!(
+            header.split(',').count(),
+            row.split(',').count(),
+            "header/row column mismatch
+header: {header}
+row:    {row}"
+        );
+        assert!(header.contains("pm_avg_fps") && header.contains("whea_faults"));
     }
 
     #[test]
