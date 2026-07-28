@@ -541,8 +541,19 @@ fn out_presets() -> Vec<Opt> {
     presets
 }
 
-/// Rows on the Settings screen: results CSV, telemetry CSV, output directory.
-const SETTINGS_ROWS: usize = 5;
+/// Rows on the Settings screen: results CSV, telemetry CSV, output directory,
+/// PresentMon, priority, ETW.
+const SETTINGS_ROWS: usize = 6;
+
+/// ETW profile sets offered on the Settings ring, from cheapest to broadest.
+/// Index 0 is off. Anything beyond triage costs real disk, so the labels say so.
+const ETW_RINGS: &[(&str, &str)] = &[
+    ("off", ""),
+    ("triage", "GeneralProfile"),
+    ("cpu+gpu", "CPU,GPU"),
+    ("power+thermal", "Power,Thermal"),
+    ("everything (big)", "GeneralProfile,CPU,GPU,Power,Thermal,DiskIO"),
+];
 
 /// Global CSV-logging + output settings, injected into every load and profile
 /// launch (never `Info` diagnostics). All-off by default, so an untouched menu
@@ -562,6 +573,10 @@ struct Settings {
     /// 2 = normal (opt out). A stress run saturates every core, so the tool's
     /// own coordination work needs headroom or burst edges land late.
     priority: usize,
+    /// Index into [`ETW_RINGS`] — the OS-level Windows Performance Recorder
+    /// capture. 0 = off, which is the default: it needs elevation and writes
+    /// hundreds of megabytes, so it is never something you get by accident.
+    etw: usize,
 }
 
 impl Settings {
@@ -571,6 +586,11 @@ impl Settings {
             .get(self.out)
             .map(|o| o.show.clone())
             .unwrap_or_else(|| "Default".into())
+    }
+
+    /// Label for the ETW ring.
+    fn etw_label(&self) -> &'static str {
+        ETW_RINGS.get(self.etw).map(|r| r.0).unwrap_or("off")
     }
 
     /// Label for the Priority ring.
@@ -598,7 +618,11 @@ impl Settings {
                 self.out = (self.out as isize + delta).rem_euclid(n) as usize;
             }
             3 => self.presentmon = !self.presentmon,
-            _ => self.priority = (self.priority as isize + delta).rem_euclid(3) as usize,
+            4 => self.priority = (self.priority as isize + delta).rem_euclid(3) as usize,
+            _ => {
+                let n = ETW_RINGS.len() as isize;
+                self.etw = (self.etw as isize + delta).rem_euclid(n) as usize;
+            }
         }
     }
 
@@ -624,6 +648,12 @@ impl Settings {
             // 0 is the built-in default; emit nothing so an untouched launch
             // stays byte-identical to the hand-typed command.
             _ => {}
+        }
+        if let Some((_, profiles)) = ETW_RINGS.get(self.etw) {
+            if !profiles.is_empty() {
+                argv.push("--etw-profiles".to_string());
+                argv.push(profiles.to_string());
+            }
         }
         argv.extend(self.out_args());
     }
@@ -1103,6 +1133,7 @@ impl App {
             ("Output", self.settings.out_label()),
             ("PresentMon", onoff(self.settings.presentmon)),
             ("Priority", self.settings.priority_label().to_string()),
+            ("ETW trace", self.settings.etw_label().to_string()),
         ];
         let lines: Vec<Line> = rows
             .iter()

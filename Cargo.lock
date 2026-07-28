@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-cli"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "crossterm",
  "crucible-core",
@@ -508,18 +508,18 @@ dependencies = [
 
 [[package]]
 name = "crucible-core"
-version = "0.0.3"
+version = "0.0.4"
 
 [[package]]
 name = "crucible-cpu"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "crucible-core",
 ]
 
 [[package]]
 name = "crucible-gpu"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "ash",
  "crucible-core",
@@ -535,14 +535,14 @@ dependencies = [
 
 [[package]]
 name = "crucible-mem"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "crucible-core",
 ]
 
 [[package]]
 name = "crucible-storage"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "crucible-core",
 ]

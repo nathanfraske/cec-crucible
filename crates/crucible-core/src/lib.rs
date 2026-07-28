@@ -25,6 +25,7 @@ pub mod cpustats;
 pub mod crashguard;
 pub mod device;
 pub mod eventlog;
+pub mod gputel;
 pub mod json;
 pub mod kernel;
 pub mod markers;

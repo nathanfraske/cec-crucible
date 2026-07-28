@@ -1,34 +1,11 @@
-# cec-crucible v0.0.3 — Alpha 3 (Windows x64)
+# cec-crucible v0.0.4 — Alpha 4 (Windows x64)
 
 PC-build stress, validation and benchmark suite.
 **Mission: if something is ever going to fail, make it fail in the shop.**
 
-## Read this first if you used Alpha 1 or 2
-
-**A bug in this tool made healthy machines look like they were crashing.** If you
-have reports where a GPU test ended after a fraction of a second with one
-dispatch and no verifications, that was us, not the hardware under test.
-
-`WM_DESTROY` called `PostQuitMessage`, which posts `WM_QUIT` to the *thread's*
-message queue rather than to the window. Once one preview window had been
-destroyed, the leftover quit message sat there until the next preview opened on
-that thread — whose first message pump found it, concluded the operator had
-closed the window, and stopped the run immediately.
-
-The signature: any preview test (`render`, `rt`, `pathtrace`) that ran *after
-another preview test in the same process* would die at once. A fresh process
-always worked. In one field capture that was 3 crashes out of 3 opportunities,
-with zero false positives — and it produced reports that read as hardware faults.
-
-Fixed: window closure is now per-window state, so one window's teardown cannot
-end another window's run. **Re-test anything you diagnosed off Alpha 1/2 GPU
-crash data.**
-
----
-
 ## Install
 
-1. Download `cec-crucible-0.0.3-win-x64.zip` and extract it.
+1. Download `cec-crucible-0.0.4-win-x64.zip` and extract it.
 2. Double-click **`INSTALL.cmd`**.
 
 Per-user, **no admin required**. Installs to `%LOCALAPPDATA%\Programs\cec-crucible`,
@@ -38,118 +15,105 @@ adds it to your user PATH, and creates Start Menu + Desktop shortcuts.
 terminal and run `cec-crucible` with no arguments.
 
 The main executable is self-contained (statically linked CRT — no Visual C++
-Redistributable needed, so it runs on a freshly imaged machine). **PresentMon is
-now bundled** so `--presentmon` works with no setup.
+Redistributable needed, so it runs on a freshly imaged machine). PresentMon is
+bundled so `--presentmon` works with no setup.
 
 ---
 
-## What's new in Alpha 3
+## What's new in Alpha 4
 
-### The report now carries WHEA and driver-level events — by default
+### Power and thermal telemetry — on every run, no flags
 
-Every run scans the Windows System log across its own window and reports WHEA
-machine-checks, display TDRs, bugchecks and disk resets:
-
-```
-event log: 1 hardware fault(s), 0 warning(s) in the run window:
-  [FAIL] Microsoft-Windows-WHEA-Logger id=19  corrected bus/interconnect error —
-         on AMD typically Infinity Fabric ECC (suspect FCLK / SoC voltage)
-```
-
-**This is the only plane that can see a fault the hardware already corrected.**
-A corrected machine-check is invisible to every checksum we compute — the data
-came back right *because* the hardware fixed it. A machine quietly correcting
-errors is not stable, and now a logged hardware fault **fails the run** even when
-every checksum matched. A scan that could not run is reported as *unavailable*,
-never as clean. Opt out with `--no-eventlog`.
-
-### `uncore` — cross-core / Infinity-Fabric verification
-
-Closes the largest hole in the suite. Every other CPU test here is
-register-resident, which means the L3, the ring/mesh and the Infinity Fabric were
-**idle in every run this tool has ever done**. Marginal FCLK / SoC voltage is one
-of the most common causes of "passes every stress test, crashes in games".
-
-`cec-crucible uncore` walks core pairs with single-producer/single-consumer rings
-and verifies every record arrives exactly once, in order, intact. A fault names
-the **core pair** — cross-CCD points at FCLK / SoC voltage, same-CCD at the L3 or
-ring. That distinction is the diagnosis.
-
-### `run gpu-recovery` — load / idle / load cycling
-
-Cycles a GPU engine with a configurable idle gap between runs, reporting which
-cycle (if any) failed to verify:
+The suite has always been able to tell you *that* a card underperformed. It
+could never tell you **why**. Now it can: GPU power draw, core temperature,
+memory-junction temperature, fan speed, SM/memory clocks and NVIDIA's own
+throttle-reason bits are sampled at 4 Hz for the whole run and land in the
+report, the results CSV, the telemetry CSV and the live dashboard.
 
 ```
-cec-crucible run gpu-recovery --seconds 30 --gap 5 --cycles 6 --preview
-cec-crucible run gpu-recovery --engine render --gap 5      # the present path
+gpu: NVIDIA GeForce RTX 3070 — power avg 200 W, peak 222 W (limit 240 W),
+     peak 77 °C, fan 81%  THROTTLED: SW power cap (at the board's power limit)
 ```
 
-`--engine render|rt|pathtrace`. It was built to chase what looked like a
-GPU recovery-time fault in the field; that turned out to be the `WM_QUIT` bug
-described at the top of these notes, so treat the idle gap as one variable among
-several rather than as a known failure mode. The profile is still the right shape
-for exercising repeated device create/destroy cycles, which is a genuinely
-under-tested path.
+That last clause is the point. A score that comes in low with zero errors is
+either a bad part or a part that was never allowed to run — and until now those
+two looked identical in a report. The throttle reasons are read straight from
+the driver, so `HW power brake` (an **external** power-brake assertion, typically
+the PSU pulling the board back) is distinguishable from an ordinary thermal or
+power-limit clamp. Nothing to install: NVML is driver-resident and needs no
+admin, no SDK, and no vendor tool.
 
-### Crash watchdog — a crash now leaves evidence
+Sensors that a board does not have are written **blank, never zero**. Most
+consumer cards have no memory-junction sensor; recording `0` there would assert a
+0 °C junction, which reads as a measurement and drags a shared temperature axis
+to the floor. A blank cell means "no sensor", which is the truth.
 
-Four hard crashes in a field capture left nothing but a telemetry file that
-stopped mid-write: no report, no verdict, no indication of what the tool had been
-doing. For a QC tool that is the worst possible moment to learn nothing.
+### Charts, rendered automatically
 
-Every run now keeps a **breadcrumb** on disk, rewritten at each phase, and
-installs an **unhandled structured-exception filter** plus a panic hook. An
-access violation raised inside a GPU driver (which `catch_unwind` cannot catch)
-now writes a `*.crash.json` naming the exception, the faulting address, and the
-phase it died in. GPU kernels mark their own teardown, so a driver fault there is
-attributable rather than silent.
+Every run with `--telemetry-csv` now also writes a **self-contained HTML page**
+next to it — GPU power and temperature, CPU effective clock (mean with a
+min–max band), utilisation, per-lane work rate, and red rules at the exact
+moments an error count rose. Hand-written inline SVG: no JavaScript, no CDN, no
+dependency, opens by double-clicking on a machine with nothing installed.
 
-Even an uncatchable `TerminateProcess` leaves the breadcrumb, and the next run
-reports it: *"a previous run did not finish — last seen in running:cpu"*.
-Verified against a real forced kill.
+A CSV is an archive. A chart is what somebody actually looks at — and asking a
+tester to import a file into a spreadsheet to see a power curve means the curve
+never gets looked at. `--no-graph` opts out.
 
-### Fixed: a false PASS on crashed ray-tracing runs
+### `--etw` — the operating system's own account of the run
 
-The field capture contained two runs that managed **one dispatch, zero
-verifications**, and reported `PASS, ok=true, errors=0`. Closing the preview
-window trips the stop flag, so the kernel exited before its first verification
-and fell through to the success path. `render` had guarded this since it was
-written; the RT engines never did.
+Everything else this tool reports is something *we* measured. An ETW trace is the
+opposite: context switches, DPC/ISR latency, GPU work packets, disk queues, power
+state transitions — written by providers we could never instrument ourselves.
+When a machine stutters or dies without leaving a WHEA entry, that trace is
+usually the only artifact that still contains the answer.
 
-A false PASS is the worst outcome a QC gate can produce. `rt` and `pathtrace` now
-return **NOT VERIFIED — no conclusion can be drawn**.
+```
+cec-crucible run worst-case --etw
+cec-crucible render --seconds 120 --etw-profiles CPU,GPU,Power,Thermal
+```
 
-### Priority escalation
+The `.etl` lands in `--out` and opens directly in Windows Performance Analyzer.
+It is driven through the in-box Windows Performance Recorder (`wpr.exe`), so the
+provider sets and keyword masks are Microsoft's own rather than a worse set
+hand-derived by us.
 
-At normal priority the tool's own coordination work competes with the workers it
-just spawned — a laggy UI, and worse, burst edges landing late. The process now
-runs at `ABOVE_NORMAL`, and the dashboard and telemetry threads are raised too so
-sampling keeps its cadence. `--priority high` goes further; `--no-priority` opts
-out. (Deliberately not `HIGH` by default: starving the desktop and the drivers
-we are measuring would distort the measurement.)
+* **Needs an elevated shell.** Arming system-wide ETW is privileged. Run
+  non-elevated and you get told exactly that, in words — a capture that could not
+  run is reported as *unavailable*, never as a clean empty result.
+* **Traces are large** — order 100 MB per minute under load in file mode.
+* **A crash no longer loses the trace.** If a run dies with a session still
+  armed, the kernel keeps buffering it. The next run detects that and flushes it
+  to `*.recovered.etl` — the trace covering the crash, salvaged.
 
-### Fill-the-hardware modes
+`wpr -profiles` lists everything available; custom `.wprp` files are accepted too.
+The Settings screen carries an ETW ring (off / triage / cpu+gpu / power+thermal /
+everything) so it can be driven without touching the command line.
 
-`--mb max` on the memory test and `--vram-mb max` on the VRAM test size
-themselves to the machine instead of taking a default slice.
+### Fixed: the border animation could overwrite live values
 
-`max` on VRAM needed a real answer, not a big number: **WDDM over-commits.** An
-allocation past the end of dedicated VRAM succeeds and silently spills into
-shared system memory, so the allocator never refuses — the failure arrives later,
-during the fill, as a *device loss* that takes the run down. Measured on an RTX
-3070 (8 GiB): 7168 MiB fills clean, 8192 MiB loses the device. So `max` now reads
-the adapter's dedicated VRAM from DXGI and takes 85% of it, leaving the desktop
-and compositor their working set. On that same 8 GiB card it fills 6784 MiB and
-passes. `--mb max` takes 90% of *available* RAM for the same reason.
+The reactive border sparks painted their glyphs onto whatever cell they landed
+on. Where the animation's path crossed a panel frame carrying real output, a
+spark could replace a character of it — and a *missing digit is invisible*: the
+number just reads wrong, with nothing to indicate anything was lost.
 
-`uncore` is also now in the interactive menu, under COMPUTE.
+The FX now decides which cells it may write **before** it paints anything, and
+that set contains only blank cells and box-drawing glyphs. Decoration can cover
+its own trail (an error bolt still overdraws a spark) but it can never cost the
+operator a digit. Two tests pin the property directly: one fills every cell with
+content and requires it back byte for byte after a fully warmed FX pass, the
+other proves the guard did not simply switch the animation off.
 
 ### Also
 
-* **PresentMon bundled** (Intel, MIT, unmodified — see `THIRD-PARTY-NOTICES.md`),
-  found next to the executable, so `--presentmon` works out of the box.
-* `mix` is now documented in `--help` (it shipped working but undocumented).
+* The dashboard has a **POWER · THERMAL strip**: live watts and °C traces on a
+  shared time axis, run peaks, fan and clocks, with the board's enforced power
+  limit as the power trace's full scale — so trace height means "fraction of the
+  power budget", not an autoscale that makes idle look like full load.
+  Temperature colour is on an absolute scale (60 °C looks the same on every
+  machine, and the ramp turns at 83 °C where a GeForce board starts clamping).
+* Report JSON gains a `gpu` block and an `etw` block; the results CSV gains nine
+  `gpu_*` columns; the telemetry CSV gains six per-sample sensor columns.
 
 ---
 
@@ -162,13 +126,20 @@ cec-crucible run quick              # ~15s CPU/RAM/storage QC
 cec-crucible uncore                 # interconnect / FCLK verification
 cec-crucible run gpu-recovery       # GPU load/idle/load recovery test
 cec-crucible benchmark              # graphics composite score
-cec-crucible run worst-case --ui    # everything at once, live dashboard
+cec-crucible run worst-case --ui --telemetry-csv    # everything at once, charted
 ```
 
 ---
 
 ## Known gaps
 
+* **GPU sensors are NVIDIA-only.** They come from NVML. On AMD or Intel Arc the
+  power/thermal columns are blank and the dashboard strip does not appear —
+  correctly reported as absent, but absent.
+* **The elevated ETW path is unverified on our bench.** The non-elevated refusal
+  path is tested and reports correctly; the actual `.etl` capture has not been
+  run end-to-end here. Treat `--etw` as alpha until it has produced a trace on
+  your machine.
 * **Single-bench validation.** AMD GPUs and Intel Arc untested — no hardware.
 * **The PCIe test may not cross PCIe on systems with Resizable BAR.** A field
   capture reported `H2D ~370 GB/s`, which is physically impossible (PCIe Gen5 ×16
@@ -184,6 +155,16 @@ cec-crucible run worst-case --ui    # everything at once, live dashboard
   comparisons as provisional.
 
 Full roadmap and design docs are in `docs/`.
+
+---
+
+## Read this if you used Alpha 1 or 2
+
+A bug in those builds made healthy machines look like they were crashing:
+`WM_DESTROY` called `PostQuitMessage`, so a destroyed preview window left a
+`WM_QUIT` on the *thread's* queue that killed the **next** preview run in the
+same process, instantly, with one dispatch and no verifications. Fixed in Alpha
+3. Re-test anything diagnosed off Alpha 1/2 GPU crash data.
 
 ---
 

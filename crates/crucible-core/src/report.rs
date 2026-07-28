@@ -106,6 +106,17 @@ pub struct PresentSummary {
     pub dropped: u64,
 }
 
+/// An ETW trace record, kept as pre-rendered JSON plus a console line so the
+/// core crate does not have to know anything about Windows Performance Recorder
+/// — the CLI owns that, and the report only carries the result.
+#[derive(Debug, Clone)]
+pub struct EtwRecord {
+    pub available: bool,
+    pub path: String,
+    pub line: String,
+    pub json: Json,
+}
+
 /// A complete, device-identified run report.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -130,6 +141,12 @@ pub struct Report {
     pub events: Option<EventScan>,
     /// ETW present-pipeline summary (`--presentmon`), when a capture succeeded.
     pub present: Option<PresentSummary>,
+    /// GPU sensor summary (NVML): peak power, peak temps, throttle reasons.
+    pub gpu: Option<crate::gputel::GpuSummary>,
+    /// OS-level ETW trace (`--etw`, via Windows Performance Recorder). Carried
+    /// as an opaque record — the `.etl` is the artifact; this says whether one
+    /// exists, where, and why not when it does not.
+    pub etw: Option<EtwRecord>,
 }
 
 impl Report {
@@ -151,6 +168,8 @@ impl Report {
             notes: Vec::new(),
             events: None,
             present: None,
+            gpu: None,
+            etw: None,
         }
     }
 
@@ -229,6 +248,12 @@ impl Report {
         if let Some(ev) = &self.events {
             root.push("event_log", ev.to_json());
         }
+        if let Some(g) = &self.gpu {
+            root.push("gpu", g.to_json());
+        }
+        if let Some(t) = &self.etw {
+            root.push("etw", t.json.clone());
+        }
         if let Some(pm) = &self.present {
             let mut j = Json::object();
             j.push("frames", pm.frames)
@@ -270,7 +295,9 @@ impl Report {
 started_unix_nanos,run_verdict,kernel,kind,mode,seconds,stage_verdict,ok,iterations,\
 checksum_hex,error_count,detail,\
 whea_faults,event_warnings,pm_frames,pm_avg_fps,pm_1pct_low_fps,pm_stutter_ms,\
-pm_gpu_busy_ms,pm_cpu_busy_ms,pm_cpu_wait_ms,pm_display_latency_ms,pm_dropped\n";
+pm_gpu_busy_ms,pm_cpu_busy_ms,pm_cpu_wait_ms,pm_display_latency_ms,pm_dropped,\
+gpu_name,gpu_power_avg_w,gpu_power_peak_w,gpu_power_limit_w,gpu_temp_peak_c,\
+gpu_mem_temp_peak_c,gpu_fan_peak_pct,gpu_sm_mhz_avg,gpu_throttle_reasons\n";
         let mut s = String::from(HEADER);
         let started = self
             .started
@@ -311,6 +338,22 @@ pm_gpu_busy_ms,pm_cpu_busy_ms,pm_cpu_wait_ms,pm_display_latency_ms,pm_dropped\n"
                 pm_col(&self.present, |p| format!("{:.2}", p.cpu_wait_ms)),
                 pm_col(&self.present, |p| format!("{:.2}", p.display_latency_ms)),
                 pm_col(&self.present, |p| p.dropped.to_string()),
+                gpu_col(&self.gpu, |g| csv_field(&g.name)),
+                gpu_col(&self.gpu, |g| format!("{:.1}", g.power_avg_w)),
+                gpu_col(&self.gpu, |g| format!("{:.1}", g.power_peak_w)),
+                gpu_col(&self.gpu, |g| format!("{:.0}", g.power_limit_w)),
+                gpu_col(&self.gpu, |g| g.temp_peak_c.to_string()),
+                // Blank when the board has no memory-junction sensor — see
+                // `markers::gpu_cols` for why a 0 here would be a lie.
+                gpu_col(&self.gpu, |g| match g.mem_temp_peak_c {
+                    0 => String::new(),
+                    v => v.to_string(),
+                }),
+                gpu_col(&self.gpu, |g| g.fan_peak_pct.to_string()),
+                gpu_col(&self.gpu, |g| g.sm_mhz_avg.to_string()),
+                gpu_col(&self.gpu, |g| {
+                    csv_field(&crate::gputel::throttle_names(g.throttle_seen).join("; "))
+                }),
             ]
             .join(",");
             s.push_str(&row);
@@ -332,6 +375,15 @@ pm_gpu_busy_ms,pm_cpu_busy_ms,pm_cpu_wait_ms,pm_display_latency_ms,pm_dropped\n"
 /// would read as "measured, and it was zero".
 fn pm_col(p: &Option<PresentSummary>, f: impl Fn(&PresentSummary) -> String) -> String {
     p.as_ref().map(f).unwrap_or_default()
+}
+
+/// A GPU-sensor column, blank when NVML was unavailable — same reasoning as
+/// [`pm_col`]: a zero-watt reading would look like a power failure on a graph.
+fn gpu_col(
+    g: &Option<crate::gputel::GpuSummary>,
+    f: impl Fn(&crate::gputel::GpuSummary) -> String,
+) -> String {
+    g.as_ref().map(f).unwrap_or_default()
 }
 
 fn csv_field(s: &str) -> String {
@@ -413,6 +465,7 @@ header: {header}
 row:    {row}"
         );
         assert!(header.contains("pm_avg_fps") && header.contains("whea_faults"));
+        assert!(header.contains("gpu_power_peak_w") && header.contains("gpu_temp_peak_c"));
     }
 
     #[test]

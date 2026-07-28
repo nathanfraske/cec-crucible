@@ -18,8 +18,9 @@
 //! zero-dependency.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
@@ -35,10 +36,11 @@ use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crucible_core::cpustats::{aggregate, CoreStat, CpuStats};
+use crucible_core::gputel::{throttle_names, GpuSample, GpuSummary};
 use crucible_core::kernel::StopFlag;
 use crucible_core::markers::{LaneSnap, MarkerLog, PHASE_DONE, PHASE_WORK};
 
-use crate::fx::{self, Fx};
+use crate::fx::{self, is_fx_canvas, Fx};
 
 use crate::theme;
 
@@ -50,13 +52,62 @@ struct RateEma {
     rate: f64,
 }
 
+/// How many GPU sensor samples the live power/temperature traces keep. The
+/// sampler publishes at 4 Hz, so 240 columns is the last ~60 seconds — wide
+/// enough that a terminal at any sane width has more history than it can draw.
+const GPU_HISTORY: usize = 240;
+
+/// The GPU sensor plane as the dashboard sees it: the newest sample plus enough
+/// history to draw power and temperature as live traces. Peaks are tracked here
+/// rather than recomputed from the (truncated) history, so a spike that has
+/// already scrolled off the left edge still shows in the numbers.
+#[derive(Default)]
+pub struct GpuView {
+    pub sample: Option<GpuSample>,
+    pub name: String,
+    pub limit_w: f64,
+    power: VecDeque<f64>,
+    temp: VecDeque<f64>,
+    peak_w: f64,
+    peak_c: u32,
+}
+
+impl GpuView {
+    fn push(&mut self, s: GpuSample) {
+        self.peak_w = self.peak_w.max(s.power_w);
+        self.peak_c = self.peak_c.max(s.temp_c);
+        push_cap(&mut self.power, s.power_w);
+        push_cap(&mut self.temp, s.temp_c as f64);
+        self.sample = Some(s);
+    }
+
+    fn active(&self) -> bool {
+        self.sample.is_some()
+    }
+}
+
+fn push_cap(q: &mut VecDeque<f64>, v: f64) {
+    if q.len() == GPU_HISTORY {
+        q.pop_front();
+    }
+    q.push_back(v);
+}
+
 /// Run the dashboard until `ui_stop` is set (by `Runner::finish`). `q` / Ctrl-C
 /// flips `run_stop` so the whole run ends.
+///
+/// `gpu` is the sample slot the run's single NVML sampler thread publishes into
+/// — the dashboard reads it rather than opening its own handle, so the picture
+/// on screen is exactly what the telemetry CSV and the report recorded. `gpu_id`
+/// is that sampler's running summary, read only for the board name and its
+/// enforced power limit (the power trace's full-scale).
 pub fn render_loop(
     markers: Arc<MarkerLog>,
     ui_stop: Arc<AtomicBool>,
     run_stop: StopFlag,
     title: String,
+    gpu: Arc<Mutex<Option<GpuSample>>>,
+    gpu_id: Arc<Mutex<GpuSummary>>,
 ) {
     // The dashboard redraws while every core is pinned by the run it is
     // watching. Without this the UI visibly stutters under a full cross-load.
@@ -89,6 +140,13 @@ pub fn render_loop(
 
     // Reactive border FX, advanced once per redraw.
     let mut fx = Fx::new();
+
+    // Live GPU power/thermal traces. We redraw at ~16 Hz but the sampler only
+    // publishes at 4 Hz, so record a column when the sample actually changes —
+    // otherwise the trace would be four copies of every reading and the visible
+    // time window would shrink to a quarter of what it should be.
+    let mut gpu_view = GpuView::default();
+    let mut last_gpu = Instant::now() - Duration::from_secs(1);
 
     while !ui_stop.load(Ordering::Relaxed) {
         // Drain input — quit keys end the *run* (raw mode swallows console Ctrl-C).
@@ -130,9 +188,27 @@ pub fn render_loop(
             .fold(0u64, |acc, l| acc.rotate_left(7) ^ l.hash);
         fx.update(activity, errors, verify_mix);
 
+        let now = Instant::now();
+        if now.duration_since(last_gpu) >= Duration::from_millis(240) {
+            last_gpu = now;
+            let s = gpu.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(s) = s {
+                if gpu_view.limit_w == 0.0 {
+                    // Identity is written once, when the sampler opens NVML —
+                    // which may be after this thread started, so re-read until
+                    // it lands rather than snapshotting it at startup.
+                    let id = gpu_id.lock().unwrap_or_else(|e| e.into_inner());
+                    gpu_view.name = id.name.clone();
+                    gpu_view.limit_w = id.power_limit_w;
+                }
+                gpu_view.push(s);
+            }
+        }
+
         let n_markers = markers.len();
-        let _ = terminal
-            .draw(|f| dashboard(f, &title, start, &lanes, &rates, &cpu_stats, n_markers, &fx));
+        let _ = terminal.draw(|f| {
+            dashboard(f, &title, start, &lanes, &rates, &cpu_stats, n_markers, &fx, &gpu_view)
+        });
         std::thread::sleep(Duration::from_millis(60));
     }
 
@@ -178,6 +254,7 @@ fn dashboard(
     cpu: &[CoreStat],
     n_markers: usize,
     fx: &Fx,
+    gpu: &GpuView,
 ) {
     // On-brand full-screen backdrop (CEC --bg); later widgets keep this bg since
     // they only set fg, so the whole dashboard reads as one dark surface.
@@ -210,11 +287,19 @@ fn dashboard(
     } else {
         0
     };
+    // The power/thermal strip is two bordered rows of trace + one of numbers.
+    // It only appears when a sensor plane is actually publishing — on a machine
+    // with no NVML there is nothing honest to draw, so it takes no space.
+    // 3 content rows (power / temp / peaks, against two traces and a footnote)
+    // plus the two border rows.
+    let gpu_h: u16 = if gpu.active() && ui.height >= 18 { 5 } else { 0 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),        // header
             Constraint::Length(core_h),   // core grid
+            Constraint::Length(gpu_h),    // power / thermal strip
             Constraint::Min(6),           // domain panels
         ])
         .split(ui);
@@ -223,7 +308,10 @@ fn dashboard(
     if has_cores {
         draw_core_grid(f, chunks[1], &cores, rates, cpu);
     }
-    draw_panels(f, chunks[2], &domains, rates);
+    if gpu_h > 0 {
+        draw_gpu_strip(f, chunks[2], gpu);
+    }
+    draw_panels(f, chunks[3], &domains, rates);
 
     // Last: the ambient field fills the margin outside the panel, and the border
     // sparks ride on top of the panel borders they share cells with — so neither
@@ -408,6 +496,183 @@ fn core_heat(frac: f64) -> Color {
     };
     let lerp = |i: usize| (a[i] + (b[i] - a[i]) * t) as u8;
     Color::Rgb(lerp(0), lerp(1), lerp(2))
+}
+
+/// The GPU power / thermal strip: two live traces (watts, °C) with the current
+/// value, the run peak, and any throttle reason.
+///
+/// Power and temperature are the two channels that explain a result no checksum
+/// can. A card sitting on its power limit is not being stressed as hard as the
+/// score suggests; a card climbing past 83 °C is about to clock itself down. Both
+/// belong on screen *while* the run happens, not only in the report afterwards —
+/// the operator watching the bench is the one who can act on them.
+fn draw_gpu_strip(f: &mut Frame, area: Rect, gpu: &GpuView) {
+    let Some(s) = &gpu.sample else { return };
+
+    let throttles = throttle_names(s.throttle);
+    let (title_tail, title_col) = if throttles.is_empty() {
+        (String::new(), theme::LABEL)
+    } else {
+        (format!(" · THROTTLED: {} ", throttles.join("; ")), theme::WARN)
+    };
+    let name = if gpu.name.is_empty() { "GPU" } else { gpu.name.as_str() };
+    // The enforced power limit lives in the title: it is the number every other
+    // figure on this strip is read against, and the title is the one place with
+    // room for it at any terminal width.
+    let cap = if gpu.limit_w > 0.0 {
+        format!(" · cap {:.0} W", gpu.limit_w)
+    } else {
+        String::new()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if throttles.is_empty() {
+            theme::BORDER
+        } else {
+            theme::WARN
+        }))
+        .title(Span::styled(
+            format!(" POWER · THERMAL · {name}{cap}{title_tail}"),
+            Style::default().fg(title_col).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 24 || inner.height == 0 {
+        return;
+    }
+
+    // Left column carries the numbers, the rest is trace. The label column is
+    // fixed-width so the traces of both rows start at the same x and can be read
+    // against each other as a single time axis.
+    const LABEL_W: u16 = 24;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(LABEL_W), Constraint::Min(4)])
+        .split(inner);
+    let trace_w = cols[1].width as usize;
+
+    // Power scales to the board's enforced limit when NVML reports one, so the
+    // trace height means "fraction of the power budget" rather than an arbitrary
+    // autoscale that makes idle look like full load.
+    let p_full = if gpu.limit_w > 0.0 {
+        gpu.limit_w
+    } else {
+        gpu.peak_w.max(1.0)
+    };
+    let pct = (s.power_w / p_full * 100.0).clamp(0.0, 999.0);
+
+    let mut labels = vec![
+        Line::from(vec![
+            Span::styled("power ", Style::default().fg(theme::DIM)),
+            Span::styled(
+                format!("{:>6.1} W", s.power_w),
+                Style::default().fg(theme::VALUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {pct:>3.0}%"), Style::default().fg(theme::FAINT)),
+        ]),
+        Line::from(vec![
+            Span::styled(" temp ", Style::default().fg(theme::DIM)),
+            Span::styled(
+                format!("{:>6} °C", s.temp_c),
+                Style::default().fg(temp_heat(s.temp_c)).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if s.fan_pct > 0 {
+                    format!(" fan {}%", s.fan_pct)
+                } else {
+                    String::new()
+                },
+                Style::default().fg(theme::FAINT),
+            ),
+        ]),
+    ];
+    // Peaks on the third row — the numbers that go in the report.
+    labels.push(Line::from(vec![
+        Span::styled("peak ", Style::default().fg(theme::DIM)),
+        Span::styled(
+            format!("{:.0} W", gpu.peak_w),
+            Style::default().fg(theme::ACCENT),
+        ),
+        Span::styled(" / ", Style::default().fg(theme::FAINT)),
+        Span::styled(
+            format!("{} °C", gpu.peak_c),
+            Style::default().fg(temp_heat(gpu.peak_c)),
+        ),
+    ]));
+    f.render_widget(Paragraph::new(labels), cols[0]);
+
+    // Two traces stacked in the same column, sharing the time axis.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+        .split(cols[1]);
+    f.render_widget(
+        Paragraph::new(trace(&gpu.power, trace_w, 0.0, p_full, |v| {
+            core_heat(v / p_full)
+        })),
+        rows[0],
+    );
+    // Fixed 30–95 °C scale: an autoscaled temperature trace makes a 4 °C wobble
+    // look like a thermal event. The colours are the same absolute scale the
+    // number above uses, so "the trace went pink" always means the same thing.
+    f.render_widget(
+        Paragraph::new(trace(&gpu.temp, trace_w, 30.0, 95.0, |v| temp_heat(v as u32))),
+        rows[1],
+    );
+    if rows[2].height > 0 {
+        let span = gpu.power.len().min(trace_w) as f64 / 4.0;
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("last {span:.0}s   sm {} MHz   mem {} MHz", s.sm_mhz, s.mem_mhz),
+                Style::default().fg(theme::FAINT),
+            ))),
+            rows[2],
+        );
+    }
+}
+
+/// One row of history as coloured eighth-blocks, newest at the right. `lo`/`hi`
+/// are the fixed value range the row height maps onto; values outside it clamp
+/// rather than rescale the axis.
+fn trace(
+    hist: &VecDeque<f64>,
+    width: usize,
+    lo: f64,
+    hi: f64,
+    color: impl Fn(f64) -> Color,
+) -> Line<'static> {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if width == 0 || hist.is_empty() {
+        return Line::default();
+    }
+    let span = (hi - lo).max(f64::EPSILON);
+    // Show the most recent `width` samples; older ones scroll off the left.
+    let skip = hist.len().saturating_sub(width);
+    let spans: Vec<Span> = hist
+        .iter()
+        .skip(skip)
+        .map(|&v| {
+            let f = ((v - lo) / span).clamp(0.0, 1.0);
+            let i = ((f * BARS.len() as f64).ceil() as usize).clamp(1, BARS.len()) - 1;
+            Span::styled(BARS[i].to_string(), Style::default().fg(color(v)))
+        })
+        .collect();
+    Line::from(spans)
+}
+
+/// Absolute temperature ramp, in °C — cyan cool, amber warm, red at the point a
+/// GeForce board starts throttling itself (~83 °C). Absolute, not normalised:
+/// 60 °C must look the same on every machine or the colour tells you nothing.
+fn temp_heat(c: u32) -> Color {
+    match c {
+        0..=59 => theme::GOOD,
+        60..=74 => theme::LABEL,
+        75..=82 => theme::WARN,
+        83..=89 => theme::ACCENT,
+        _ => theme::BAD,
+    }
 }
 
 /// Domain lanes as a wrapping grid of rounded panels (≤3 per row).
@@ -668,6 +933,30 @@ mod tests {
             .collect()
     }
 
+    /// Synthetic GPU sensor plane: a card sitting at ~92% of a 240 W limit and
+    /// 74 °C, with a plausible warm-up ramp behind it so the traces have shape.
+    /// Deterministic — no clock, no RNG.
+    fn synth_gpu() -> GpuView {
+        let mut g = GpuView {
+            name: "NVIDIA GeForce RTX 3070".to_string(),
+            limit_w: 240.0,
+            ..Default::default()
+        };
+        for i in 0..90u32 {
+            let ramp = (i as f64 / 89.0).min(1.0);
+            g.push(GpuSample {
+                power_w: 55.0 + ramp * 165.0 + ((i % 7) as f64 - 3.0) * 4.0,
+                temp_c: 41 + (ramp * 33.0) as u32 + (i % 3),
+                mem_temp_c: 0,
+                fan_pct: 38 + (ramp * 42.0) as u32,
+                sm_mhz: 1830 + (i % 5) * 15,
+                mem_mhz: 7001,
+                throttle: 0,
+            });
+        }
+        g
+    }
+
     fn render(w: u16, h: u16) -> Buffer {
         let lanes = synth_lanes();
         let rates = synth_rates(&lanes);
@@ -682,7 +971,18 @@ mod tests {
         let start = Instant::now();
         terminal
             .draw(|f| {
-                dashboard(f, "RTX 3070 · worst-case", start, &lanes, &rates, &cpu, 20590, &fx)
+                let gpu = synth_gpu();
+                dashboard(
+                    f,
+                    "RTX 3070 · worst-case",
+                    start,
+                    &lanes,
+                    &rates,
+                    &cpu,
+                    20590,
+                    &fx,
+                    &gpu,
+                )
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -698,6 +998,80 @@ mod tests {
             s.push('\n');
         }
         s
+    }
+
+    /// Render the same frame with and without the border FX, and report every
+    /// cell the FX changed. Used to prove the animation only ever paints over
+    /// background and box-drawing — never over a live value.
+    fn fx_overwrites() -> Vec<(u16, u16, String, String)> {
+        let lanes = synth_lanes();
+        let rates = synth_rates(&lanes);
+        let cpu = synth_cpu();
+        let gpu = synth_gpu();
+        let start = Instant::now();
+        let mut out = Vec::new();
+        for (w, h) in [
+            (60u16, 20u16),
+            (80, 24),
+            (90, 24),
+            (100, 30),
+            (120, 36),
+            (140, 44),
+            (160, 50),
+            (200, 60),
+            (240, 70),
+            (300, 80),
+        ] {
+            let mut warm = Fx::new();
+            for i in 0..400 {
+                warm.update(0.95, 0, 0x9e37_79b9_7f4a_7c15 ^ (i / 3));
+            }
+            let cold = Fx::new();
+            let draw = |fx: &Fx| {
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| {
+                    dashboard(f, "RTX 3070 · worst-case", start, &lanes, &rates, &cpu, 20590, fx, &gpu)
+                })
+                .unwrap();
+                t.backend().buffer().clone()
+            };
+            // Two FX-free renders bracket the FX one: the elapsed-time counter
+            // in the header ticks between draws, so any cell that differs
+            // between the two clean frames is the clock, not the animation.
+            let a = draw(&cold);
+            let b = draw(&warm);
+            let a2 = draw(&cold);
+            for y in 0..h {
+                for x in 0..w {
+                    let pos = Position::new(x, y);
+                    if a[pos].symbol() != a2[pos].symbol() {
+                        continue; // unstable between identical frames
+                    }
+                    let (p, q) = (a[pos].symbol().to_string(), b[pos].symbol().to_string());
+                    if p != q {
+                        out.push((x, y, p, q));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fx_never_paints_over_content() {
+        // Box-drawing and blank cells are the FX's canvas. Anything else the
+        // dashboard drew is a live value, and decoration must never cost the
+        // operator a digit of it.
+        let bad: Vec<_> = fx_overwrites()
+            .into_iter()
+            .filter(|(_, _, before, _)| !is_fx_canvas(before))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "the border FX painted over {} cells of real content, e.g. {:?}",
+            bad.len(),
+            &bad[..bad.len().min(12)]
+        );
     }
 
     #[test]
@@ -717,6 +1091,11 @@ mod tests {
             assert!(text.contains("GHz avg"), "cpu clock aggregate missing @ {w}x{h}");
             assert!(text.contains("% util"), "cpu util aggregate missing @ {w}x{h}");
             assert!(text.contains("4.6"), "per-core effective clock missing @ {w}x{h}");
+            // The power/thermal strip: label, live watts and the board's cap.
+            assert!(text.contains("POWER"), "power strip missing @ {w}x{h}");
+            assert!(text.contains("cap 240 W"), "power limit missing @ {w}x{h}");
+            assert!(text.contains("°C"), "gpu temperature missing @ {w}x{h}");
+            assert!(text.contains("peak"), "gpu peak line missing @ {w}x{h}");
         }
     }
 

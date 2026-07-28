@@ -14,7 +14,7 @@ mod args;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +37,11 @@ use args::Parsed;
 
 mod mix;
 
+// Self-contained SVG charts rendered from the telemetry CSV. Zero-dependency
+// (hand-written SVG), so it stays in the default build alongside the CSV it
+// draws — a graph nobody has to install anything to open.
+mod graph;
+
 #[cfg(feature = "tui")]
 mod theme;
 
@@ -48,6 +53,10 @@ mod fx;
 
 #[cfg(feature = "tui")]
 mod menu;
+
+// Opt-in ETW capture through the in-box Windows Performance Recorder.
+#[cfg(windows)]
+mod etw;
 
 // Opt-in PresentMon driver — Windows + presenting (gpu) only. No bundling.
 #[cfg(all(windows, feature = "gpu"))]
@@ -81,6 +90,8 @@ const COMMON_BOOLS: &[&str] = &[
     "dry-run",
     "no-eventlog",
     "no-priority",
+    "no-graph",
+    "etw",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -278,6 +289,26 @@ GPU OPTIONS (builds with --features gpu):
                          (admin) run for the ETW session; a `.presentmon.csv`
                          lands in --out. Never fails the run if absent.
     --presentmon-path <FILE>   Explicit path to PresentMon.exe for --presentmon.
+    --etw                Record a full OS-level ETW trace across the run with the
+                         in-box Windows Performance Recorder, and write a `.etl`
+                         to --out for Windows Performance Analyzer. This is the
+                         operating system's own account of the run — context
+                         switches, DPC/ISR, GPU packets, power transitions — the
+                         things no self-measurement can see. NEEDS AN ELEVATED
+                         SHELL, and file-mode traces are large (order 100 MB per
+                         minute under load).
+    --etw-profiles <LIST>   Which WPR profiles to record, comma-separated
+                         (implies --etw). Default `GeneralProfile`. e.g.
+                           --etw-profiles CPU,GPU,Power,Thermal
+                         (in-box profiles: GeneralProfile CPU GPU Power Thermal
+                          DiskIO FileIO Video Network Registry Handle Pool
+                          VirtualAllocation Minifilter DesktopComposition …;
+                          `wpr -profiles` lists them all, and a custom .wprp
+                          path is accepted too). If a previous run crashed with a
+                         session still armed, the next run salvages that trace.
+    --no-graph           Skip the self-contained HTML chart page that is normally
+                         rendered next to --telemetry-csv (power, temperature,
+                         clocks, per-lane rates, error markers).
 
 EXIT CODES:
     0 PASS/PARTIAL   1 FAIL   2 usage error
@@ -2213,6 +2244,12 @@ struct Runner {
     telemetry_handle: Option<JoinHandle<()>>,
     /// Scan the Windows event log across the run window (default on).
     eventlog: bool,
+    /// GPU sensor sampler: the running summary, and the latest sample for the
+    /// telemetry writer. Shared so one NVML handle serves both.
+    gpu_summary: Arc<Mutex<crucible_core::gputel::GpuSummary>>,
+    gpu_latest: Arc<Mutex<Option<crucible_core::gputel::GpuSample>>>,
+    gpu_stop: Option<Arc<AtomicBool>>,
+    gpu_handle: Option<JoinHandle<()>>,
     /// Live ETW capture, owned by the Runner so its stats land in the report
     /// BEFORE the report is written (a capture finished by the caller
     /// afterwards would always be too late).
@@ -2226,6 +2263,16 @@ struct Runner {
     pm_path: Option<String>,
     /// When the run began, so the scan window matches it.
     run_started: Instant,
+    /// Render the telemetry CSV to a self-contained chart page (`--no-graph`
+    /// opts out). On whenever telemetry is on: the cost is milliseconds and the
+    /// operator gets a power/thermal curve without importing anything.
+    graph: bool,
+    /// What this run is, for the chart page title and the crash breadcrumb.
+    label: String,
+    /// Live ETW (WPR) capture and the profiles it was asked for.
+    #[cfg(windows)]
+    etw: Option<etw::Capture>,
+    etw_profiles: Vec<String>,
 }
 
 impl Runner {
@@ -2288,6 +2335,24 @@ impl Runner {
             telemetry_stop: None,
             telemetry_handle: None,
             eventlog: !p.has("no-eventlog"),
+            graph: !p.has("no-graph"),
+            #[cfg(windows)]
+            etw: None,
+            // `--etw` alone means first-level triage; `--etw CPU,GPU,Power`
+            // names profiles explicitly. Absent = no capture at all.
+            // `--etw` alone means first-level triage; `--etw-profiles` names
+            // them explicitly (and implies the capture, so `--etw-profiles CPU`
+            // on its own does what it plainly says).
+            etw_profiles: if p.has("etw") || p.get("etw-profiles").is_some() {
+                etw::parse_profiles(p.get("etw-profiles"))
+            } else {
+                Vec::new()
+            },
+            label: p.positional.first().cloned().unwrap_or_else(|| "run".to_string()),
+            gpu_summary: Arc::new(Mutex::new(Default::default())),
+            gpu_latest: Arc::new(Mutex::new(None)),
+            gpu_stop: None,
+            gpu_handle: None,
             #[cfg(all(windows, feature = "gpu"))]
             pm: None,
             pm_seconds: p.get_u64("seconds").ok().flatten().unwrap_or(60),
@@ -2629,11 +2694,75 @@ impl Runner {
             for corpse in crucible_core::crashguard::resolve(dir) {
                 eprintln!("note: {corpse}");
                 self.report.note(corpse);
+                // A run that died mid-flight never got to stop its ETW session,
+                // so the kernel is still buffering the trace that covers the
+                // crash. It is the single most valuable artifact we could
+                // recover, and it is lost the moment anything else starts a
+                // session — so salvage it now, whether or not THIS run asked
+                // for a capture.
+                #[cfg(windows)]
+                {
+                    let out = dir.join(format!("crucible-{}.recovered.etl", self.stamp));
+                    if let Some(t) = etw::salvage(out, "cec-crucible recovered from a crashed run") {
+                        eprintln!("note: salvaged the crashed run's ETW trace — {}", t.line());
+                        self.report.note(format!("recovered ETW trace: {}", t.path));
+                    }
+                }
             }
             crucible_core::crashguard::arm(
                 dir.join(format!("crucible-{}", self.stamp)),
                 self.stamp.clone(),
             );
+        }
+
+        // GPU sensors (power / temp / fan / clocks / throttle reasons) run on
+        // every run, not just when a CSV was asked for: peak power, peak temp and
+        // any throttle reason belong in the report regardless. NVML is
+        // driver-resident, so this is a no-op on non-NVIDIA machines.
+        if let Some(t) = crucible_core::gputel::GpuTelemetry::open(0) {
+            {
+                let mut g = self.gpu_summary.lock().unwrap_or_else(|e| e.into_inner());
+                g.name = t.name();
+                g.power_limit_w = t.power_limit_w();
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let summary = Arc::clone(&self.gpu_summary);
+            let latest = Arc::clone(&self.gpu_latest);
+            let s2 = Arc::clone(&stop);
+            self.gpu_stop = Some(stop);
+            self.gpu_handle = Some(std::thread::spawn(move || {
+                while !s2.load(Ordering::SeqCst) {
+                    let sample = t.sample();
+                    summary
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .accumulate(&sample);
+                    *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(sample);
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }));
+        }
+
+        // Arm the OS-level ETW capture. This goes last in begin() so the trace
+        // brackets the load as tightly as possible rather than the setup.
+        #[cfg(windows)]
+        if !self.etw_profiles.is_empty() {
+            let dir = self.out_dir.clone().unwrap_or_else(default_out_dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let out = dir.join(format!("crucible-{}.etl", self.stamp));
+            match etw::Capture::start(&self.etw_profiles, out.clone()) {
+                Ok(c) => {
+                    println!("etw:     recording {} -> {}", self.etw_profiles.join("+"), out.display());
+                    self.etw = Some(c);
+                }
+                Err(t) => {
+                    // Never silently: a run the operator believes is being traced
+                    // but is not produces a report with a hole exactly where the
+                    // evidence was supposed to be.
+                    eprintln!("warning: {}", t.line());
+                    self.report.etw = Some(t.record());
+                }
+            }
         }
 
         // Start the ETW capture here, not at the call site, so every command
@@ -2694,8 +2823,10 @@ impl Runner {
                 let stop_flag = Arc::clone(&ui_stop);
                 let run_stop = self.stop.clone();
                 let title = self.device.board.clone();
+                let gpu_latest = Arc::clone(&self.gpu_latest);
+                let gpu_id = Arc::clone(&self.gpu_summary);
                 self.ui_handle = Some(std::thread::spawn(move || {
-                    tui::render_loop(markers, stop_flag, run_stop, title);
+                    tui::render_loop(markers, stop_flag, run_stop, title, gpu_latest, gpu_id);
                 }));
                 self.ui_stop = Some(ui_stop);
             }
@@ -2720,8 +2851,9 @@ impl Runner {
                         let stop_c = Arc::clone(&stop);
                         let markers = Arc::clone(&self.markers);
                         let start = Instant::now();
+                        let gpu_latest = Arc::clone(&self.gpu_latest);
                         self.telemetry_handle = Some(std::thread::spawn(move || {
-                            telemetry_loop(&path, markers, stop_c, start)
+                            telemetry_loop(&path, markers, stop_c, start, gpu_latest)
                         }));
                         self.telemetry_stop = Some(stop);
                     }
@@ -2820,6 +2952,42 @@ impl Runner {
             self.report.events = Some(crucible_core::eventlog::scan_system_log(window_ms));
         }
 
+        // Stop the ETW capture BEFORE the report is written so its path and size
+        // land in the JSON. Flushing a file-mode trace can take a while; that
+        // wait buys the artifact, so it is not skipped.
+        #[cfg(windows)]
+        if let Some(c) = self.etw.take() {
+            if self.report.stages.is_empty() {
+                // Nothing ran, so the trace holds nothing worth the hundreds of
+                // megabytes it would cost to flush.
+                c.cancel();
+                self.report
+                    .note("etw capture discarded: the run produced no stages");
+            } else {
+            crucible_core::crashguard::phase("flushing etw trace");
+            println!("etw:     flushing trace (this can take a moment)...");
+            let t = c.finish(&format!("cec-crucible {} {}", self.label, self.stamp));
+            if !t.available {
+                eprintln!("warning: {}", t.line());
+            }
+            self.report.etw = Some(t.record());
+            }
+        }
+
+        // Stop the GPU sampler and fold its summary into the report.
+        if let Some(stop) = self.gpu_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(h) = self.gpu_handle.take() {
+            let _ = h.join();
+        }
+        {
+            let g = self.gpu_summary.lock().unwrap_or_else(|e| e.into_inner());
+            if g.samples > 0 {
+                self.report.gpu = Some(g.clone());
+            }
+        }
+
         crucible_core::crashguard::phase("writing report");
 
         // Retire the Ctrl-C bridge thread now that the run is over.
@@ -2833,6 +3001,7 @@ impl Runner {
         let mut markers_path: Option<PathBuf> = None;
         let mut csv_path: Option<PathBuf> = None;
         let mut telemetry_path: Option<PathBuf> = None;
+        let mut graph_path: Option<PathBuf> = None;
         if let Some(dir) = self.out_dir.clone() {
             match std::fs::create_dir_all(&dir) {
                 Ok(()) => {
@@ -2862,8 +3031,23 @@ impl Runner {
                     // The telemetry file was streamed by its logger thread; just
                     // surface its path in the summary.
                     if self.telemetry {
-                        telemetry_path =
-                            Some(dir.join(format!("crucible-{}.telemetry.csv", self.stamp)));
+                        let tp = dir.join(format!("crucible-{}.telemetry.csv", self.stamp));
+                        // Chart it while we are here. A CSV is the archive; the
+                        // page is what somebody actually looks at, and asking a
+                        // tester to import a file into a spreadsheet to see a
+                        // power curve means the curve never gets looked at.
+                        if self.graph {
+                            let gp = dir.join(format!("crucible-{}.telemetry.html", self.stamp));
+                            let title = format!(
+                                "{} · {} · {}",
+                                self.label, self.device.board, self.stamp
+                            );
+                            match graph::render_html(&tp, &gp, &title) {
+                                Ok(()) => graph_path = Some(gp),
+                                Err(e) => eprintln!("warning: could not chart telemetry: {e}"),
+                            }
+                        }
+                        telemetry_path = Some(tp);
                     }
                 }
                 Err(e) => eprintln!("warning: could not create out dir {}: {e}", dir.display()),
@@ -2877,6 +3061,16 @@ impl Runner {
             crucible_core::crashguard::finished();
             println!("{}", self.report.to_pretty_json());
         } else {
+            // Power and thermals, then the event log, then the verdict — each
+            // line closer to the verdict is one the operator should read first.
+            // A throttle reason here is often the whole explanation for a score
+            // that came in low without a single error.
+            if let Some(g) = &self.report.gpu {
+                println!("{}", g.line());
+            }
+            if let Some(t) = &self.report.etw {
+                println!("{}", t.line);
+            }
             // Event-log findings come BEFORE the verdict line: a WHEA or TDR is
             // usually the most important thing on the screen, and it explains a
             // FAIL that no stage error accounts for.
@@ -2926,6 +3120,9 @@ impl Runner {
             }
             if let Some(tp) = &telemetry_path {
                 println!("telem:   {}", tp.display());
+            }
+            if let Some(gp) = &graph_path {
+                println!("charts:  {}", gp.display());
             }
         }
 
@@ -3199,7 +3396,13 @@ fn print_stage(name: &str, mode: &str, secs: f64, result: &LoadResult) {
 /// sample (every live lane) roughly 4×/s until stopped, capturing one final
 /// sample after the stop so the end state (phases DONE) is recorded. Best-effort
 /// — a write error just ends logging, never the run.
-fn telemetry_loop(path: &Path, markers: Arc<MarkerLog>, stop: Arc<AtomicBool>, start: Instant) {
+fn telemetry_loop(
+    path: &Path,
+    markers: Arc<MarkerLog>,
+    stop: Arc<AtomicBool>,
+    start: Instant,
+    gpu: Arc<Mutex<Option<crucible_core::gputel::GpuSample>>>,
+) {
     use std::io::Write;
     // Sampling on a fixed cadence only means something if we actually get
     // scheduled on that cadence; under a saturating run we otherwise drift.
@@ -3229,8 +3432,14 @@ fn telemetry_loop(path: &Path, markers: Arc<MarkerLog>, stop: Arc<AtomicBool>, s
                 cpu_stats = s;
             }
         }
+        // The GPU sensor thread publishes its latest sample here; we copy it out
+        // under the lock rather than holding it across the write.
+        let gpu_now = gpu.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if w
-            .write_all(telemetry_csv_rows(el, &markers.live_snapshot(), &cpu_stats).as_bytes())
+            .write_all(
+                telemetry_csv_rows(el, &markers.live_snapshot(), &cpu_stats, gpu_now.as_ref())
+                    .as_bytes(),
+            )
             .is_err()
         {
             return;

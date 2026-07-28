@@ -283,6 +283,9 @@ impl Fx {
                 // Motes read dimmer than the border sparks so the panel edge
                 // stays the brightest thing on screen.
                 let cell = &mut buf[Position::new(xi as u16, yi as u16)];
+                if !is_fx_canvas(cell.symbol()) {
+                    continue;
+                }
                 cell.set_symbol(glyph);
                 cell.set_fg(dim_toward(heat_color(m.heat), m.life * 0.75));
             }
@@ -294,6 +297,18 @@ impl Fx {
         };
         let area = ui;
         let buf = f.buffer_mut();
+
+        // Which perimeter cells the FX may write to, decided ONCE before any of
+        // it is painted. Taking the snapshot up front is what lets a bolt
+        // overdraw a spark's trail (the FX may cover its own work) while a block
+        // title or a live value that reaches the frame stays untouched for the
+        // whole frame rather than only until the next glyph lands on it.
+        let open: Vec<bool> = (0..per)
+            .map(|t| match perimeter_cell(area, t) {
+                Some((x, y)) => is_fx_canvas(buf[Position::new(x, y)].symbol()),
+                None => false,
+            })
+            .collect();
 
         // Sparks first, then bolts on top (an error must never be hidden).
         for s in &self.sparks {
@@ -314,6 +329,9 @@ impl Fx {
                 } else {
                     (trail_glyph(back), dim_toward(heat_color(s.heat), fade))
                 };
+                if !open[t as usize] {
+                    continue;
+                }
                 if let Some((x, y)) = perimeter_cell(area, t) {
                     let cell = &mut buf[Position::new(x, y)];
                     cell.set_symbol(glyph);
@@ -333,6 +351,9 @@ impl Fx {
                 };
                 // Flash white-hot at birth, settle to the brand red.
                 let col = if b.life > 0.75 { theme::TEXT } else { theme::BAD };
+                if !open[t as usize] {
+                    continue;
+                }
                 if let Some((x, y)) = perimeter_cell(area, t) {
                     let cell = &mut buf[Position::new(x, y)];
                     cell.set_symbol(glyph);
@@ -341,6 +362,20 @@ impl Fx {
             }
         }
     }
+}
+
+/// Cells the FX is allowed to paint on: empty, blank, or one of the box-drawing
+/// glyphs the panel frames are made of.
+///
+/// The border sparks chase the outer edge of the panel area, and that edge is
+/// shared with real output — a block title, a value that reaches the frame. A
+/// spark that lands there erases a digit and replaces it with a decoration, and
+/// the operator has no way to know a character is missing. So the rule is stated
+/// once, here, as a property of the *cell* rather than as a list of widgets to
+/// avoid: it keeps holding as the layout changes.
+pub fn is_fx_canvas(sym: &str) -> bool {
+    const FRAME: &str = "─│╭╮╰╯┌┐└┘├┤┬┴┼━┃╔╗╚╝║╬╠╣╦╩▏▕▁▂▃▄▅▆▇█";
+    sym.is_empty() || sym == " " || (sym.chars().count() == 1 && FRAME.contains(sym))
 }
 
 /// Trail glyphs: a bright head fading to a faint tail.
@@ -441,6 +476,86 @@ mod tests {
         assert!(perimeter(Rect::new(0, 0, 1, 5)).is_none());
         assert!(perimeter(Rect::new(0, 0, 5, 1)).is_none());
         assert!(perimeter_cell(Rect::new(0, 0, 0, 0), 3).is_none());
+    }
+
+    /// The guard, proven directly rather than through a layout that happens not
+    /// to put text on the frame today: fill every cell with content, run a fully
+    /// warmed FX over it, and require the content back byte for byte.
+    #[test]
+    fn fx_refuses_to_paint_over_occupied_cells() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Paragraph;
+        use ratatui::Terminal;
+
+        // Big enough that `inset` leaves a margin, so the ambient motes are in
+        // play here too and not only the border sparks.
+        let (w, h) = (140u16, 44u16);
+        let mut fx = Fx::new();
+        for i in 0..300 {
+            fx.update(1.0, 0, 0xdead_beef ^ i);
+        }
+        fx.update(1.0, 9, 0xfeed_face); // fresh errors → bolts live on this frame
+        assert!(
+            !fx.sparks.is_empty() && !fx.bolts.is_empty() && !fx.motes.is_empty(),
+            "FX must be live"
+        );
+
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let full = Rect::new(0, 0, w, h);
+        let ui = inset(full);
+        assert_ne!(ui, full, "this size must leave a margin for the motes");
+        let text: Vec<_> = (0..h).map(|_| "X".repeat(w as usize)).collect();
+        term.draw(|f| {
+            f.render_widget(Paragraph::new(text.join("\n")), full);
+            fx.render(f, full, ui);
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    buf[Position::new(x, y)].symbol(),
+                    "X",
+                    "FX overwrote content at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fx_still_paints_on_empty_and_frame_cells() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::{Block, BorderType, Borders};
+        use ratatui::Terminal;
+
+        let (w, h) = (60u16, 20u16);
+        let mut fx = Fx::new();
+        for i in 0..300 {
+            fx.update(1.0, 0, 0xdead_beef ^ i);
+        }
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let full = Rect::new(0, 0, w, h);
+        term.draw(|f| {
+            f.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+                full,
+            );
+            fx.render(f, full, full);
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let painted = (0..perimeter(full).unwrap())
+            .filter_map(|t| perimeter_cell(full, t))
+            .filter(|&(x, y)| {
+                let s = buf[Position::new(x, y)].symbol();
+                s == "✦" || s == "•" || s == "·"
+            })
+            .count();
+        assert!(painted > 0, "the guard must not disable the animation itself");
     }
 
     #[test]

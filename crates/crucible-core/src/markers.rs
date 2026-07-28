@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::clock::{Clock, Timestamp};
 use crate::cpustats::CoreStat;
+use crate::gputel::GpuSample;
 use crate::json::Json;
 
 /// Live per-lane activity for an in-process UI (`--ui`) or a harness readout.
@@ -91,7 +92,39 @@ pub struct LaneSnap {
 /// The trailing `eff_mhz,util_pct` carry PDH per-core telemetry: populated on
 /// `core N` rows (and standalone `cpu N` rows), blank on other lanes.
 pub fn telemetry_csv_header() -> &'static str {
-    "elapsed_s,lane,work,phase,errors,hash_hex,eff_mhz,util_pct\n"
+    "elapsed_s,lane,work,phase,errors,hash_hex,eff_mhz,util_pct,\
+gpu_power_w,gpu_temp_c,gpu_mem_temp_c,gpu_fan_pct,gpu_sm_mhz,gpu_throttle\n"
+}
+
+/// GPU sensor columns for one sample, or empty cells when no GPU telemetry is
+/// available. Blank rather than 0 deliberately: a zero-watt reading would look
+/// like a power failure on a graph, whereas an empty cell reads as "not measured".
+fn gpu_cols(g: Option<&GpuSample>) -> String {
+    match g {
+        Some(s) => format!(
+            "{:.1},{},{},{},{},{:#x}",
+            s.power_w,
+            s.temp_c,
+            // Most consumer boards do not expose a memory-junction sensor, and
+            // NVML answers with an error we carry as 0. Writing that 0 would
+            // assert a 0 °C junction — which reads as a real measurement, and on
+            // a shared temperature axis drags the whole chart to the floor.
+            // Blank means "no sensor", which is the truth.
+            blank_if_zero(s.mem_temp_c),
+            s.fan_pct, // a genuine 0 here: zero-RPM idle mode
+            s.sm_mhz,
+            s.throttle
+        ),
+        None => ",,,,,".to_string(),
+    }
+}
+
+fn blank_if_zero(v: u32) -> String {
+    if v == 0 {
+        String::new()
+    } else {
+        v.to_string()
+    }
 }
 
 /// Parse the core index out of a `"core N"` lane label.
@@ -109,7 +142,12 @@ fn core_index(label: &str) -> Option<u32> {
 /// effective clock + utilization are attached to its matching `core N` load
 /// lane; cores with telemetry but no load lane this sample (e.g. during a
 /// GPU-only test) get a standalone `cpu N` row so the whole chip is still logged.
-pub fn telemetry_csv_rows(elapsed_s: f64, lanes: &[LaneSnap], cpu: &[CoreStat]) -> String {
+pub fn telemetry_csv_rows(
+    elapsed_s: f64,
+    lanes: &[LaneSnap],
+    cpu: &[CoreStat],
+    gpu: Option<&GpuSample>,
+) -> String {
     use std::collections::{BTreeMap, BTreeSet};
     let by_core: BTreeMap<u32, &CoreStat> = cpu.iter().map(|c| (c.core, c)).collect();
     let mut charted: BTreeSet<u32> = BTreeSet::new();
@@ -132,8 +170,11 @@ pub fn telemetry_csv_rows(elapsed_s: f64, lanes: &[LaneSnap], cpu: &[CoreStat]) 
             None => (String::new(), String::new()),
         };
         s.push_str(&format!(
-            "{elapsed_s:.3},{label},{},{phase},{},{:#018x},{mhz},{util}\n",
-            l.work, l.errors, l.hash
+            "{elapsed_s:.3},{label},{},{phase},{},{:#018x},{mhz},{util},{g}\n",
+            l.work,
+            l.errors,
+            l.hash,
+            g = gpu_cols(gpu)
         ));
     }
 
@@ -142,8 +183,11 @@ pub fn telemetry_csv_rows(elapsed_s: f64, lanes: &[LaneSnap], cpu: &[CoreStat]) 
     for (core, cs) in &by_core {
         if !charted.contains(core) {
             s.push_str(&format!(
-                "{elapsed_s:.3},cpu {core},0,idle,0,{:#018x},{},{:.1}\n",
-                0u64, cs.effective_mhz, cs.util_pct
+                "{elapsed_s:.3},cpu {core},0,idle,0,{:#018x},{},{:.1},{g}\n",
+                0u64,
+                cs.effective_mhz,
+                cs.util_pct,
+                g = gpu_cols(gpu)
             ));
         }
     }
@@ -386,26 +430,94 @@ mod tests {
             CoreStat { core: 0, effective_mhz: 4800, util_pct: 99.5 },
             CoreStat { core: 1, effective_mhz: 1200, util_pct: 3.0 },
         ];
-        let out = telemetry_csv_rows(1.5, &lanes, &cpu);
+        let out = telemetry_csv_rows(1.5, &lanes, &cpu, None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3, "core 0 + mem + backfilled cpu 1");
 
+        // Assert on FIELD POSITIONS, not on line suffixes: GPU sensor columns
+        // now follow the CPU ones, and a suffix assertion silently stops testing
+        // what it claims the moment another column is appended.
+        let field = |line: &str, name: &str| -> String {
+            let hdr: Vec<&str> = telemetry_csv_header().trim().split(',').collect();
+            let i = hdr.iter().position(|h| *h == name).expect("known column");
+            line.split(',').nth(i).unwrap_or_default().to_string()
+        };
+
         // The core lane carries its own effective clock + utilization.
         let core0 = lines.iter().find(|l| l.contains(",core 0,")).unwrap();
-        assert!(core0.ends_with(",4800,99.5"), "core0: {core0}");
+        assert_eq!(field(core0, "eff_mhz"), "4800");
+        assert_eq!(field(core0, "util_pct"), "99.5");
         // A non-core lane leaves the cpu columns blank.
         let mem = lines.iter().find(|l| l.contains(",mem,")).unwrap();
-        assert!(mem.ends_with(",,"), "mem: {mem}");
+        assert_eq!(field(mem, "eff_mhz"), "");
+        assert_eq!(field(mem, "util_pct"), "");
         // A core with telemetry but no load lane is backfilled as `cpu N`.
         let cpu1 = lines.iter().find(|l| l.contains(",cpu 1,")).unwrap();
-        assert!(cpu1.ends_with(",1200,3.0"), "cpu1: {cpu1}");
+        assert_eq!(field(cpu1, "eff_mhz"), "1200");
+        assert_eq!(field(cpu1, "util_pct"), "3.0");
         assert!(cpu1.contains(",idle,"));
+
+        // No GPU sample -> the sensor columns are BLANK, never 0. A zero-watt
+        // reading would look like a power failure on a graph.
+        assert_eq!(field(core0, "gpu_power_w"), "");
+        assert_eq!(field(core0, "gpu_temp_c"), "");
+
+        // Every row must have exactly as many fields as the header.
+        let want = telemetry_csv_header().trim().split(',').count();
+        for l in &lines {
+            assert_eq!(l.split(',').count(), want, "column count mismatch: {l}");
+        }
+    }
+
+    #[test]
+    fn telemetry_csv_carries_gpu_sensors_when_present() {
+        let g = GpuSample {
+            power_w: 213.4,
+            temp_c: 71,
+            fan_pct: 62,
+            sm_mhz: 1905,
+            throttle: 0x4,
+            ..Default::default()
+        };
+        let out = telemetry_csv_rows(2.0, &[snap("gpu", 9, PHASE_WORK)], &[], Some(&g));
+        let line = out.lines().next().unwrap();
+        let field = |name: &str| -> String {
+            let hdr: Vec<&str> = telemetry_csv_header().trim().split(',').collect();
+            let i = hdr.iter().position(|h| *h == name).expect("known column");
+            line.split(',').nth(i).unwrap_or_default().to_string()
+        };
+        assert_eq!(field("gpu_power_w"), "213.4");
+        assert_eq!(field("gpu_temp_c"), "71");
+        assert_eq!(field("gpu_fan_pct"), "62");
+        assert_eq!(field("gpu_sm_mhz"), "1905");
+        assert_eq!(field("gpu_throttle"), "0x4");
+        // No memory-junction sensor on this board: NVML answers with an error,
+        // which we carry as 0. Writing that 0 would assert a 0 °C junction —
+        // a reading, not a gap — and on a shared axis it drags the real curve
+        // to the floor. Blank is the truth.
+        assert_eq!(field("gpu_mem_temp_c"), "");
+
+        let want = telemetry_csv_header().trim().split(',').count();
+        assert_eq!(line.split(',').count(), want);
+    }
+
+    #[test]
+    fn a_reported_memory_junction_temperature_is_written() {
+        // The flip side: when the board DOES have the sensor, the value must
+        // survive — the blank-if-zero rule must not swallow real readings.
+        let g = GpuSample { mem_temp_c: 94, ..Default::default() };
+        let out = telemetry_csv_rows(1.0, &[snap("gpu", 1, PHASE_WORK)], &[], Some(&g));
+        let line = out.lines().next().unwrap();
+        let hdr: Vec<&str> = telemetry_csv_header().trim().split(',').collect();
+        let i = hdr.iter().position(|h| *h == "gpu_mem_temp_c").unwrap();
+        assert_eq!(line.split(',').nth(i).unwrap(), "94");
     }
 
     #[test]
     fn telemetry_csv_blank_cpu_columns_without_pdh() {
-        let out = telemetry_csv_rows(0.0, &[snap("core 0", 1, PHASE_WORK)], &[]);
+        let out = telemetry_csv_rows(0.0, &[snap("core 0", 1, PHASE_WORK)], &[], None);
         assert_eq!(out.lines().count(), 1, "no PDH -> no backfill rows");
-        assert!(out.lines().next().unwrap().ends_with(",,"), "blank cpu columns");
+        let want = telemetry_csv_header().trim().split(',').count();
+        assert_eq!(out.lines().next().unwrap().split(',').count(), want);
     }
 }
