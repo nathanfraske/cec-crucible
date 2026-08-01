@@ -3027,7 +3027,16 @@ impl Runner {
         // and the results CSV rather than only in a side file.
         #[cfg(all(windows, feature = "gpu"))]
         if let Some(c) = self.pm.take() {
-            match c.finish() {
+            // Time the stop and say so. This step has been the single worst
+            // stall in the tool, and an operator watching a blank console needs
+            // the number in the output rather than a stopwatch.
+            let pm_t0 = Instant::now();
+            let outcome = c.finish();
+            let pm_secs = pm_t0.elapsed().as_secs_f64();
+            if pm_secs > 2.0 {
+                eprintln!("presentmon: capture closed in {pm_secs:.1}s");
+            }
+            match outcome {
                 Some(csv) => {
                     if let Some(st) = presentmon::summarize(&csv) {
                         println!("  {}", st.line());
@@ -3046,7 +3055,11 @@ impl Runner {
                     eprintln!("presentmon: {}", csv.display());
                 }
                 None => eprintln!(
-                    "note: PresentMon produced no CSV — the ETW session needs elevation                      (approve the UAC prompt, or run cec-crucible from an admin shell)."
+                    "note: PresentMon captured no frames in {pm_secs:.1}s. Either the ETW session 
+                     needed elevation (run from an admin shell), or this test never presents — 
+                     PresentMon records DISPLAYED frames, so it only has anything to say on 
+                     render / rt / pathtrace with --preview. Compute, memory, storage and PCIe 
+                     loads put nothing on screen."
                 ),
             }
         }

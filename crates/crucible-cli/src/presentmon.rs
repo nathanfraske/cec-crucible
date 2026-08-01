@@ -21,6 +21,7 @@
 //! presenting GPU run).
 
 use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -223,8 +224,20 @@ impl Capture {
                 if len == last_len && len > 0 {
                     stable_for += 1;
                     // ~1.2s unchanged, and it holds more than just a header row.
-                    if stable_for >= 4 && has_data_row(&self.csv) {
-                        return Some(std::mem::take(&mut self.csv));
+                    if stable_for >= 4 {
+                        if has_data_row(&self.csv) {
+                            return Some(std::mem::take(&mut self.csv));
+                        }
+                        // Stable, non-empty, and still only a header: the capture
+                        // has stopped and no frame ever arrived. Nothing is
+                        // coming, so waiting out the rest of the budget buys
+                        // nothing — and this is the COMMON case, because most of
+                        // the suite never presents. A `worst-case` cross-load
+                        // drives compute, memory, storage and PCIe; not one of
+                        // those puts a frame on screen, so PresentMon writes its
+                        // header and then sits there while we wait for frames
+                        // that cannot exist.
+                        return None;
                     }
                 } else {
                     stable_for = 0;
@@ -275,9 +288,26 @@ fn backstop_seconds(seconds: u64) -> u64 {
 /// True once the CSV holds at least one row beyond its header — i.e. real frames
 /// were captured, not just an opened file.
 fn has_data_row(csv: &Path) -> bool {
-    std::fs::read_to_string(csv)
-        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count() > 1)
-        .unwrap_or(false)
+    // Read the first couple of lines, not the file.
+    //
+    // This is called from a poll loop, and a long capture's CSV runs to hundreds
+    // of megabytes — `read_to_string` on that, repeatedly, is its own stall. The
+    // question is only "is there anything past the header", which the first two
+    // non-empty lines answer.
+    let Ok(f) = std::fs::File::open(csv) else {
+        return false;
+    };
+    let mut seen = 0;
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        seen += 1;
+        if seen > 1 {
+            return true;
+        }
+    }
+    false
 }
 
 impl Drop for Capture {
