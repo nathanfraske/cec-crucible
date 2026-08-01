@@ -121,6 +121,10 @@ enum Launch {
     /// lane dashboard, and it takes only the output-dir setting (it writes its
     /// own benchmark CSV, so `--csv` / `--telemetry-csv` do not apply).
     Bench(&'static str),
+    /// Build and open the per-machine report page — argv is
+    /// `[package, --open, <--out …>]`. Like `Info` it prints and exits, but it
+    /// still needs the output-directory setting to know where to look.
+    Package,
 }
 
 /// One selectable value for a [`Field`]: what to show, and the argv fragment it
@@ -185,6 +189,14 @@ impl Test {
                 }
                 // Benchmark writes its own CSV and has no live UI: only the
                 // output-dir setting applies (no --csv / --telemetry-csv / --ui).
+                argv.extend(settings.out_args());
+                argv
+            }
+            // Only the output directory applies: this reads a folder rather than
+            // running anything, so there is nothing to log, no UI, and no
+            // priority to raise.
+            Launch::Package => {
+                let mut argv = vec!["package".to_string(), "--open".to_string()];
                 argv.extend(settings.out_args());
                 argv
             }
@@ -357,6 +369,16 @@ fn catalog() -> Vec<Group> {
         label: "GPU info",
         desc: "List usable adapters + limits — no load.",
         launch: Launch::Info("gpu-info"),
+        fields: vec![],
+    });
+    // The way to actually look at what a bench session produced, without
+    // remembering a command or hunting through a folder of timestamps. Takes the
+    // Output setting like everything else, so it opens whatever directory the
+    // runs were written to.
+    diag.push(Test {
+        label: "Open reports",
+        desc: "Build this machine's report page and open it in a browser.",
+        launch: Launch::Package,
         fields: vec![],
     });
     groups.push(Group { cat: Category::Diagnostics, tests: diag });
@@ -542,42 +564,15 @@ fn out_presets() -> Vec<Opt> {
 }
 
 /// Rows on the Settings screen: results CSV, telemetry CSV, output directory,
-/// PresentMon, priority, ETW.
-const SETTINGS_ROWS: usize = 6;
+/// PresentMon, priority, ETW, charts, open-in-browser.
+const SETTINGS_ROWS: usize = 8;
 
-/// ETW profile sets offered on the Settings ring, from cheapest to broadest.
-/// Index 0 is off. Anything beyond triage costs real disk, so the labels say so.
-const ETW_RINGS: &[(&str, &str)] = &[
-    ("off", ""),
-    ("triage", "GeneralProfile"),
-    ("cpu+gpu", "CPU,GPU"),
-    ("power+thermal", "Power,Thermal"),
-    ("everything (big)", "GeneralProfile,CPU,GPU,Power,Thermal,DiskIO"),
-];
 
-/// Global CSV-logging + output settings, injected into every load and profile
-/// launch (never `Info` diagnostics). All-off by default, so an untouched menu
-/// launch stays byte-identical to the equivalent hand-typed command.
-#[derive(Default)]
-struct Settings {
-    /// `--csv`: also write a per-stage results CSV.
-    results_csv: bool,
-    /// `--telemetry-csv`: also log the time-series telemetry CSV.
-    telemetry_csv: bool,
-    /// Index into [`out_presets`] — the `--out` directory preset (0 = Default).
-    out: usize,
-    /// `--presentmon`: capture ETW frame data on presenting runs. Harmless on
-    /// tests that do not present, so it can ride along with every launch.
-    presentmon: bool,
-    /// Scheduling priority ring: 0 = above normal (default), 1 = high,
-    /// 2 = normal (opt out). A stress run saturates every core, so the tool's
-    /// own coordination work needs headroom or burst edges land late.
-    priority: usize,
-    /// Index into [`ETW_RINGS`] — the OS-level Windows Performance Recorder
-    /// capture. 0 = off, which is the default: it needs elevation and writes
-    /// hundreds of megabytes, so it is never something you get by accident.
-    etw: usize,
-}
+/// The Settings screen operates on the persisted [`crate::settings::Settings`],
+/// so what an operator arms here is still armed after a restart. All-off by
+/// default, so an untouched install stays byte-identical to the equivalent
+/// hand-typed command.
+use crate::settings::{Settings, ETW_RINGS};
 
 impl Settings {
     /// Label of the selected output preset, for the Output ring.
@@ -610,6 +605,15 @@ impl Settings {
     /// Cycle the focused row. Rows 0/1 are on/off toggles (←/→ both flip); row 2
     /// steps the output-preset ring by `delta` (−1 / +1), wrapping.
     fn cycle(&mut self, row: usize, delta: isize) {
+        self.cycle_inner(row, delta);
+        // Persist immediately rather than on exit: the menu can be closed by
+        // launching a run, by Ctrl-C, or by the window going away, and a
+        // setting the operator armed and then lost is worse than useless.
+        // Best-effort — a read-only profile must not break the menu.
+        let _ = self.save();
+    }
+
+    fn cycle_inner(&mut self, row: usize, delta: isize) {
         match row {
             0 => self.results_csv = !self.results_csv,
             1 => self.telemetry_csv = !self.telemetry_csv,
@@ -619,10 +623,12 @@ impl Settings {
             }
             3 => self.presentmon = !self.presentmon,
             4 => self.priority = (self.priority as isize + delta).rem_euclid(3) as usize,
-            _ => {
+            5 => {
                 let n = ETW_RINGS.len() as isize;
                 self.etw = (self.etw as isize + delta).rem_euclid(n) as usize;
             }
+            6 => self.graph = !self.graph,
+            _ => self.open_report = !self.open_report,
         }
     }
 
@@ -638,6 +644,9 @@ impl Settings {
         }
         if self.presentmon {
             argv.push("--presentmon".to_string());
+        }
+        if !self.graph {
+            argv.push("--no-graph".to_string());
         }
         match self.priority {
             1 => {
@@ -697,8 +706,22 @@ impl App {
             screen: Screen::Menu,
             sel: 0,
             field_sel: 0,
-            settings: Settings::default(),
+            settings: Settings::load(),
             set_sel: 0,
+        }
+    }
+
+    /// An App with stock settings, for tests.
+    ///
+    /// `new()` loads whatever the operator has persisted, which is right at
+    /// runtime and wrong in a test: the assertions here are about what the menu
+    /// builds from a *known* configuration, and reading the developer's own
+    /// settings file makes them pass or fail based on the machine they run on.
+    #[cfg(test)]
+    fn with_default_settings() -> App {
+        App {
+            settings: Settings::default(),
+            ..App::new()
         }
     }
 
@@ -1134,6 +1157,8 @@ impl App {
             ("PresentMon", onoff(self.settings.presentmon)),
             ("Priority", self.settings.priority_label().to_string()),
             ("ETW trace", self.settings.etw_label().to_string()),
+            ("Charts", onoff(self.settings.graph)),
+            ("Open in browser", onoff(self.settings.open_report)),
         ];
         let lines: Vec<Line> = rows
             .iter()
@@ -1271,6 +1296,8 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Entry point for the `menu` command (and bare `cec-crucible`).
 pub fn run_menu() -> Result<u8, String> {
+    // The real menu loads what the operator persisted; only the tests want a
+    // known-stock configuration.
     let mut app = App::new();
     if app.flat.is_empty() {
         return Err("no menu items compiled in".to_string());
@@ -1354,13 +1381,15 @@ mod tests {
     /// An app parked on a given command's setup screen (with FIRE focused, so the
     /// button shows in its prominent state).
     fn setup_app_on(cmd: &str) -> App {
-        let mut app = App::new();
+        let mut app = App::with_default_settings();
         let idx = app
             .flat
             .iter()
             .position(|&(g, t)| match app.groups[g].tests[t].launch {
                 Launch::Load(c) | Launch::Info(c) | Launch::Bench(c) => c == cmd,
-                Launch::Profile(_) => false,
+                // Neither carries a command string to match on: a profile is
+                // addressed by its name, and Package is a fixed argv.
+                Launch::Profile(_) | Launch::Package => false,
             })
             .expect("command present in catalog");
         app.sel = idx;
@@ -1372,7 +1401,7 @@ mod tests {
 
     /// An app parked on the Settings screen (top row focused).
     fn settings_app() -> App {
-        let mut app = App::new();
+        let mut app = App::with_default_settings();
         app.enter_settings();
         app
     }
@@ -1393,7 +1422,7 @@ mod tests {
     fn menu_renders_key_content() {
         // A range of sizes: the layout must fit (no panic) and keep the essentials.
         for (w, h) in [(100u16, 30u16), (140, 44), (200, 60)] {
-            let app = App::new();
+            let app = App::with_default_settings();
             let text = buffer_text(&render(&app, w, h));
             assert!(text.contains("CRUCIBLE"), "brand missing @ {w}x{h}");
             assert!(text.contains("DIAGNOSTICS"), "category missing @ {w}x{h}");
@@ -1449,7 +1478,7 @@ mod tests {
 
     #[test]
     fn profiles_launch_via_run() {
-        let app = App::new();
+        let app = App::with_default_settings();
         // Find the `quick` profile row and check its argv shape.
         let (gi, ti) = app
             .flat
@@ -1470,7 +1499,7 @@ mod tests {
     #[cfg(any(feature = "rt", feature = "preview"))]
     #[test]
     fn benchmark_launch_has_no_ui() {
-        let app = App::new();
+        let app = App::with_default_settings();
         let (gi, ti) = app
             .flat
             .iter()
@@ -1533,7 +1562,7 @@ mod tests {
         );
 
         // Profiles carry the settings flags too (they route through `load_argv`).
-        let mut app = App::new();
+        let mut app = App::with_default_settings();
         app.settings.results_csv = true;
         let (gi, ti) = app
             .flat

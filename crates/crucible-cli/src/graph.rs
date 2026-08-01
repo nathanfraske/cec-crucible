@@ -1732,3 +1732,163 @@ mod tests {
         let _ = std::fs::remove_file(&out);
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// PNG export
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+
+use crate::png::{Canvas, Rgb};
+
+/// Palette as RGB triples, mirroring the SVG constants above so a PNG and the
+/// page it came from cannot drift apart.
+const P_BG: Rgb = (7, 7, 17);
+const P_SURFACE: Rgb = (22, 21, 38);
+const P_TEXT: Rgb = (245, 245, 248);
+const P_DIM: Rgb = (169, 169, 183);
+const P_PINK: Rgb = (237, 35, 152);
+const P_CYAN: Rgb = (65, 217, 248);
+const P_AMBER: Rgb = (242, 166, 24);
+const P_RED: Rgb = (238, 11, 42);
+const P_GRID: Rgb = (40, 40, 62);
+
+/// One chart's worth of PNG, at a size that drops into a document without
+/// resampling.
+const PNG_W: usize = 1200;
+const PNG_H: usize = 420;
+
+/// Render the analysis charts from a telemetry CSV as **PNG files**.
+///
+/// The SVG page is for looking at; a PNG is what goes into a ticket, an email or
+/// a customer-facing report — the places an `.html` full of inline SVG does not
+/// survive. Same data, same palette, same column-name-keyed parsing, so the two
+/// cannot disagree.
+///
+/// Returns the files written. A series with no points is skipped rather than
+/// drawn as an empty frame, for the same reason the HTML page moves it to a
+/// "not charted" section: an empty axis reads as a measured zero.
+pub fn render_pngs(csv_path: &Path, out_dir: &Path, stem: &str) -> io::Result<Vec<PathBuf>> {
+    let text = std::fs::read_to_string(csv_path)?;
+    let tel = parse_csv(&text);
+    std::fs::create_dir_all(out_dir)?;
+
+    // Cumulative error counts, so a rising edge can be marked on every chart —
+    // the moment something broke is the most useful annotation on any of them.
+    let errors = tel.series(|f| Some(f.errors));
+    let fail_marks: Vec<f64> = errors
+        .windows(2)
+        .filter(|w| w[1].1 > w[0].1)
+        .map(|w| w[1].0)
+        .collect();
+
+    let charts: Vec<(&str, &str, Rgb, Vec<(f64, f64)>)> = vec![
+        ("gpu-power", "GPU POWER (W)", P_PINK, tel.series(|f| f.gpu_power)),
+        ("gpu-temp", "GPU TEMPERATURE (C)", P_AMBER, tel.series(|f| f.gpu_temp)),
+        (
+            "cpu-clock",
+            "CPU EFFECTIVE CLOCK (MHZ, MEAN)",
+            P_CYAN,
+            tel.series(|f| mean_of(f.mhz.values().copied())),
+        ),
+        (
+            "cpu-util",
+            "CPU UTILISATION (PERCENT, MEAN)",
+            P_CYAN,
+            tel.series(|f| mean_of(f.util.values().copied())),
+        ),
+    ];
+
+    let mut written = Vec::new();
+    for (slug, title, colour, pts) in charts {
+        if pts.len() < 2 {
+            continue; // nothing measured — see the doc comment
+        }
+        let img = draw_chart(title, &pts, colour, &fail_marks);
+        let p = out_dir.join(format!("{stem}.{slug}.png"));
+        std::fs::write(&p, img.to_png())?;
+        written.push(p);
+    }
+    Ok(written)
+}
+
+fn mean_of(vals: impl Iterator<Item = f64>) -> Option<f64> {
+    let (sum, n) = vals.fold((0.0, 0usize), |(s, n), v| (s + v, n + 1));
+    if n == 0 {
+        None
+    } else {
+        Some(sum / n as f64)
+    }
+}
+
+/// One chart: framed plot area, labelled gridlines, the trace, and a red rule
+/// wherever an error count rose.
+fn draw_chart(title: &str, pts: &[(f64, f64)], colour: Rgb, fail_marks: &[f64]) -> Canvas {
+    let mut c = Canvas::new(PNG_W, PNG_H, P_BG);
+
+    let (l, t, r, b) = (110i64, 64i64, PNG_W as i64 - 40, PNG_H as i64 - 56);
+    c.rect(l, t, r - l, b - t, P_SURFACE);
+    c.text(40, 26, title, P_TEXT, 3);
+
+    let (t0, t1) = (pts[0].0, pts[pts.len() - 1].0);
+    let span_t = (t1 - t0).max(1e-9);
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &(_, v) in pts {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    // Pad the value axis so a flat trace is not drawn along the frame itself.
+    if (hi - lo).abs() < 1e-9 {
+        lo -= 1.0;
+        hi += 1.0;
+    }
+    let pad = (hi - lo) * 0.1;
+    let (lo, hi) = (lo - pad, hi + pad);
+    let span_v = (hi - lo).max(1e-9);
+
+    let x_of = |tv: f64| l as f64 + (tv - t0) / span_t * (r - l) as f64;
+    let y_of = |v: f64| b as f64 - (v - lo) / span_v * (b - t) as f64;
+
+    // Horizontal gridlines, each labelled with its value.
+    for i in 0..=4 {
+        let v = lo + span_v * i as f64 / 4.0;
+        let y = y_of(v) as i64;
+        c.hline(l, r, y, P_GRID);
+        let label = format!("{v:.0}");
+        c.text(l - 12 - Canvas::text_width(&label, 2), y - 7, &label, P_DIM, 2);
+    }
+    // Time axis: start, middle, end.
+    for i in 0..=2 {
+        let tv = t0 + span_t * i as f64 / 2.0;
+        let x = x_of(tv) as i64;
+        c.vline(x, t, b, P_GRID);
+        let label = format!("{tv:.0}S");
+        c.text(x - Canvas::text_width(&label, 2) / 2, b + 14, &label, P_DIM, 2);
+    }
+
+    // Errors first, so the trace draws over them and stays legible.
+    for &tv in fail_marks {
+        c.vline(x_of(tv) as i64, t, b, P_RED);
+    }
+
+    for w in pts.windows(2) {
+        c.line(x_of(w[0].0), y_of(w[0].1), x_of(w[1].0), y_of(w[1].1), colour, 2.5);
+    }
+
+    // Peak and mean go on the title row, right-aligned: they are the two numbers
+    // anyone reads off a chart, and eyeballing them off a trace is how a report
+    // gets them wrong. Along the bottom they would crowd the time axis.
+    let peak = pts.iter().fold(f64::NEG_INFINITY, |m, p| m.max(p.1));
+    let avg = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
+    let head = format!("PEAK {peak:.1}   MEAN {avg:.1}   {} SAMPLES", pts.len());
+    c.text(r - Canvas::text_width(&head, 2), 32, &head, P_DIM, 2);
+
+    // Frame last so nothing overdraws it.
+    c.hline(l, r, t, P_DIM);
+    c.hline(l, r, b, P_DIM);
+    c.vline(l, t, b, P_DIM);
+    c.vline(r, t, b, P_DIM);
+    c
+}

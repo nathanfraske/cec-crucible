@@ -195,6 +195,7 @@ mod win {
     use core::ffi::c_void;
 
     const ERROR_NO_MORE_ITEMS: u32 = 259;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     /// `EvtQueryChannelPath | EvtQueryReverseDirection` — newest first, so a busy
     /// log cannot push our window off the end of a capped result set.
     const EVT_QUERY_CHANNEL_PATH: u32 = 0x1;
@@ -232,6 +233,14 @@ mod win {
             property_count: *mut u32,
         ) -> i32;
         fn EvtClose(object: isize) -> i32;
+        /// Enumerate every channel registered on the machine.
+        fn EvtOpenChannelEnum(session: isize, flags: u32) -> isize;
+        fn EvtNextChannelPath(
+            channel_enum: isize,
+            path_buffer_size: u32,
+            path_buffer: *mut u16,
+            path_buffer_used: *mut u32,
+        ) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -395,7 +404,176 @@ mod win {
         out.events.reverse();
         out
     }
+    // -----------------------------------------------------------------------
+    // Full capture
+    // -----------------------------------------------------------------------
+
+    /// A machine registers on the order of a thousand channels; this only bounds
+    /// a pathological enumeration.
+    const MAX_CHANNELS: usize = 4096;
+    /// Per-channel event cap, so one chatty provider cannot fill the archive and
+    /// crowd out the channel that mattered.
+    const MAX_PER_CHANNEL: usize = 512;
+
+    /// Every channel path the machine will name.
+    fn channel_paths() -> Vec<String> {
+        let mut out = Vec::new();
+        // SAFETY: null session = local machine.
+        let e = unsafe { EvtOpenChannelEnum(0, 0) };
+        if e == 0 {
+            return out;
+        }
+        let mut buf: Vec<u16> = vec![0; 512];
+        while out.len() < MAX_CHANNELS {
+            let mut used: u32 = 0;
+            // SAFETY: buffer and length agree; `used` is a valid out-param.
+            let ok =
+                unsafe { EvtNextChannelPath(e, buf.len() as u32, buf.as_mut_ptr(), &mut used) };
+            if ok == 0 {
+                // SAFETY: trivially safe.
+                let err = unsafe { GetLastError() };
+                if err == ERROR_INSUFFICIENT_BUFFER && used as usize > buf.len() {
+                    buf.resize(used as usize, 0);
+                    continue; // retry the same channel with room for its name
+                }
+                break; // ERROR_NO_MORE_ITEMS, or something unrecoverable
+            }
+            let chars = (used as usize).saturating_sub(1).min(buf.len());
+            out.push(String::from_utf16_lossy(&buf[..chars]));
+        }
+        // SAFETY: handle came from EvtOpenChannelEnum and is closed once.
+        unsafe { EvtClose(e) };
+        out
+    }
+
+    pub(super) fn capture_all(window_ms: u64, max_records: usize) -> super::FullLog {
+        use super::{FullLog, RawEvent};
+
+        let mut out = FullLog::default();
+        let channels = channel_paths();
+        out.channels_total = channels.len();
+
+        let query = format!("*[System[TimeCreated[timediff(@SystemTime) <= {window_ms}]]]");
+        let q = wide(&query);
+        let mut buf: Vec<u16> = vec![0; 16 * 1024];
+
+        for channel in channels {
+            if out.records.len() >= max_records {
+                out.truncated = true;
+                break;
+            }
+            let path = wide(&channel);
+            // SAFETY: null session = local machine; both strings NUL-terminated.
+            let results = unsafe {
+                EvtQuery(
+                    0,
+                    path.as_ptr(),
+                    q.as_ptr(),
+                    EVT_QUERY_CHANNEL_PATH | EVT_QUERY_REVERSE_DIRECTION,
+                )
+            };
+            if results == 0 {
+                // Disabled, empty, or access-denied. Counted, never fatal: most
+                // of a Windows machine's channels are simply not enabled, and
+                // Security needs elevation.
+                out.channels_denied += 1;
+                continue;
+            }
+            out.channels_read += 1;
+
+            let mut from_channel = 0usize;
+            'chan: while from_channel < MAX_PER_CHANNEL {
+                let mut handles = [0isize; 32];
+                let mut returned: u32 = 0;
+                // SAFETY: valid out-array of the stated length.
+                let ok = unsafe {
+                    EvtNext(
+                        results,
+                        handles.len() as u32,
+                        handles.as_mut_ptr(),
+                        1000,
+                        0,
+                        &mut returned,
+                    )
+                };
+                if ok == 0 || returned == 0 {
+                    break;
+                }
+                for &h in handles.iter().take(returned as usize) {
+                    let mut used: u32 = 0;
+                    let mut props: u32 = 0;
+                    // SAFETY: rendering into a buffer we own; sizes in bytes.
+                    let rendered = unsafe {
+                        EvtRender(
+                            0,
+                            h,
+                            EVT_RENDER_EVENT_XML,
+                            (buf.len() * 2) as u32,
+                            buf.as_mut_ptr() as *mut c_void,
+                            &mut used,
+                            &mut props,
+                        )
+                    };
+                    // SAFETY: handle came from EvtNext, closed exactly once.
+                    unsafe { EvtClose(h) };
+                    if rendered == 0 {
+                        continue;
+                    }
+                    let chars = (used as usize / 2).saturating_sub(1).min(buf.len());
+                    let xml = String::from_utf16_lossy(&buf[..chars]);
+
+                    let provider = attr(&xml, "Name").unwrap_or("").to_string();
+                    let event_id: u32 = between(&xml, "<EventID", "</EventID>")
+                        .and_then(|s| s.rsplit('>').next())
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    let time = attr(&xml, "SystemTime").unwrap_or("").to_string();
+                    let level: u32 = between(&xml, "<Level>", "</Level>")
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+
+                    let mut data = String::new();
+                    let mut rest = xml.as_str();
+                    while let Some(v) = between(rest, "<Data", "</Data>") {
+                        if let Some(inner) = v.split_once('>') {
+                            let t = inner.1.trim();
+                            if !t.is_empty() && data.len() < 400 {
+                                if !data.is_empty() {
+                                    data.push_str("; ");
+                                }
+                                data.push_str(t);
+                            }
+                        }
+                        let adv = rest.find("</Data>").map(|i| i + 7).unwrap_or(rest.len());
+                        rest = &rest[adv..];
+                    }
+
+                    out.records.push(RawEvent {
+                        channel: channel.clone(),
+                        time,
+                        provider,
+                        event_id,
+                        level,
+                        data,
+                    });
+                    from_channel += 1;
+                    if out.records.len() >= max_records {
+                        out.truncated = true;
+                        break 'chan;
+                    }
+                }
+            }
+            // SAFETY: result set came from EvtQuery, closed exactly once.
+            unsafe { EvtClose(results) };
+        }
+
+        // Newest-first per channel from the query; present oldest-first overall
+        // so the archive reads as a timeline.
+        out.records.sort_by(|a, b| a.time.cmp(&b.time));
+        out
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -460,5 +638,108 @@ mod tests {
         if !s.available {
             assert!(!s.unavailable_reason.is_empty());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full capture — every channel, not a curated list
+// ---------------------------------------------------------------------------
+
+/// One event, kept verbatim rather than classified.
+///
+/// [`EventRecord`] is the *detector* plane: it keeps only what it recognises, so
+/// it can decide a verdict. This is the *archive* plane, and it keeps everything
+/// — including the provider nobody has written a classifier for yet, which is
+/// exactly the one that turns out to matter when a machine fails in a new way.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawEvent {
+    pub channel: String,
+    pub time: String,
+    pub provider: String,
+    pub event_id: u32,
+    pub level: u32,
+    pub data: String,
+}
+
+impl RawEvent {
+    /// One JSON object per line — the archive format. JSONL rather than one
+    /// large document so a capture that is interrupted is still readable up to
+    /// the point it stopped, and so `findstr`/`grep` works on it directly.
+    pub fn to_json(&self) -> Json {
+        let mut o = Json::object();
+        o.push("channel", Json::str(&self.channel))
+            .push("time", Json::str(&self.time))
+            .push("provider", Json::str(&self.provider))
+            .push("event_id", Json::U64(self.event_id as u64))
+            .push("level", Json::U64(self.level as u64))
+            .push("data", Json::str(&self.data));
+        o
+    }
+}
+
+/// The result of a full capture, including what it could *not* read.
+#[derive(Debug, Clone, Default)]
+pub struct FullLog {
+    pub channels_total: usize,
+    /// Channels that answered a query — most machines have hundreds registered
+    /// and only a fraction enabled.
+    pub channels_read: usize,
+    /// Channels that refused. Overwhelmingly "disabled" or "needs elevation"
+    /// (Security is the notable one), not errors worth failing over — but the
+    /// count is reported, because "we read everything" and "we read what we were
+    /// allowed to" are different claims.
+    pub channels_denied: usize,
+    pub records: Vec<RawEvent>,
+    /// The cap was hit and events were dropped. A capture that silently
+    /// truncates reads as a quiet log.
+    pub truncated: bool,
+}
+
+impl FullLog {
+    pub fn summary(&self) -> String {
+        format!(
+            "{} event(s) from {}/{} channel(s){}{}",
+            self.records.len(),
+            self.channels_read,
+            self.channels_total,
+            if self.channels_denied > 0 {
+                format!(", {} not readable", self.channels_denied)
+            } else {
+                String::new()
+            },
+            if self.truncated { " (TRUNCATED)" } else { "" }
+        )
+    }
+
+    /// Render the archive as JSONL.
+    pub fn to_jsonl(&self) -> String {
+        let mut s = String::new();
+        for r in &self.records {
+            s.push_str(&r.to_json().to_compact());
+            s.push('\n');
+        }
+        s
+    }
+}
+
+/// Capture **every** event the machine logged in the last `window_ms`, across
+/// every channel it will let us read.
+///
+/// The curated [`scan_system_log`] decides the verdict; this decides whether the
+/// evidence still exists tomorrow. A QC tool that reports "WHEA: clean" and
+/// keeps nothing else has thrown away the context that explains the failure
+/// nobody predicted.
+///
+/// `max_records` bounds the archive; hitting it sets `truncated`, because a
+/// silently-capped capture reads exactly like a quiet machine.
+pub fn capture_all_channels(window_ms: u64, max_records: usize) -> FullLog {
+    #[cfg(windows)]
+    {
+        win::capture_all(window_ms, max_records)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window_ms, max_records);
+        FullLog::default()
     }
 }

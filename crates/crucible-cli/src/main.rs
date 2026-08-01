@@ -37,10 +37,20 @@ use args::Parsed;
 
 mod mix;
 
+// Settings that survive a restart (Settings screen + CLI defaults).
+mod settings;
+
 // Self-contained SVG charts rendered from the telemetry CSV. Zero-dependency
 // (hand-written SVG), so it stays in the default build alongside the CSV it
 // draws — a graph nobody has to install anything to open.
 mod graph;
+
+// Zero-dependency raster canvas + PNG encoder, for chart export.
+mod deflate;
+mod png;
+
+// The per-machine index page: every run for one box, gathered and linked.
+mod package;
 
 #[cfg(feature = "tui")]
 mod theme;
@@ -70,6 +80,17 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// crash-then-relaunch cycle without dredging up unrelated history.
 const PRIOR_EVENT_WINDOW_MS: u64 = 10 * 60 * 1000;
 
+/// Slack added to the run window when archiving every channel, so an event
+/// logged a moment before the first kernel started — a driver reset during
+/// setup, say — is still inside the capture.
+const EVENT_ARCHIVE_MARGIN_MS: u64 = 60 * 1000;
+
+/// Cap on the full archive. A busy machine logs thousands of events a minute
+/// across all channels; 20k keeps a long soak's archive to a few MB while being
+/// far more than any real investigation needs. Hitting it is reported, never
+/// silent.
+const MAX_ARCHIVED_EVENTS: usize = 20_000;
+
 const COMMON_BOOLS: &[&str] = &[
     "json",
     "no-report",
@@ -92,6 +113,7 @@ const COMMON_BOOLS: &[&str] = &[
     "no-priority",
     "no-graph",
     "etw",
+    "open",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -133,6 +155,9 @@ COMMANDS:
     info                 Print device id, CPU, memory and QPC info, then exit.
     drives               List fixed physical drives (NVMe/SATA), then exit.
     gpu-info             List usable GPUs, then exit.            [--features gpu]
+    package [--open]     Build the per-machine index page for --out (every run
+                         for one box: verdicts, charts, and every artifact
+                         linked), and open it in a browser with --open.
     cpu                  Run the CPU FMA/AVX burn kernel.
     mem                  Run the RAM pattern kernel.
     uncore               Cross-core coherence / Infinity-Fabric verify (FCLK, L3, ring).
@@ -376,6 +401,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "info" => cmd_info(rest),
         "drives" => cmd_drives(rest),
         "gpu-info" => cmd_gpu_info(rest),
+        "package" => cmd_package(rest),
         "cpu" => cmd_cpu(rest),
         "mem" => cmd_mem(rest),
         "uncore" => cmd_uncore(rest),
@@ -1651,6 +1677,55 @@ selectors:");
 // run <profile>
 // ---------------------------------------------------------------------------
 
+/// `package` — build (and optionally open) the index page for a machine.
+///
+/// Separate from a run because the moment you want it is usually *after* the
+/// fact: a folder of captures from a bench session, or a directory a technician
+/// sent in. It reads what is on disk and nothing else.
+fn cmd_package(rest: &[String]) -> Result<u8, String> {
+    let p = Parsed::parse(rest, COMMON_BOOLS)?;
+    p.reject_unknown(&["out", "device", "open", "help"])?;
+
+    let dir = match p.get("out") {
+        Some(d) => PathBuf::from(d),
+        None => default_out_dir(),
+    };
+    let found = package::scan(&dir).map_err(|e| format!("could not read {}: {e}", dir.display()))?;
+    if found.is_empty() {
+        return Err(format!(
+            "no cec-crucible runs found in {} — point --out at the folder holding the reports",
+            dir.display()
+        ));
+    }
+
+    // With no --device, build a page for every machine in the folder; a bench
+    // directory routinely holds several.
+    let wanted: Vec<String> = match p.get("device") {
+        Some(d) => vec![d.to_string()],
+        None => found.keys().cloned().collect(),
+    };
+
+    let mut opened = false;
+    for device in wanted {
+        let Some(runs) = found.get(&device) else {
+            eprintln!("warning: no runs for device {device} in {}", dir.display());
+            continue;
+        };
+        let page = package::render(&dir, &device, runs)
+            .map_err(|e| format!("could not write the package page: {e}"))?;
+        println!("{}  ({} run(s))", page.display(), runs.len());
+        // Only the first page is opened: a folder with a dozen machines in it
+        // should not fill the operator's browser with tabs.
+        if p.has("open") && !opened {
+            if let Err(e) = package::open_in_browser(&page) {
+                eprintln!("warning: could not open a browser: {e}");
+            }
+            opened = true;
+        }
+    }
+    Ok(0)
+}
+
 fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let p = Parsed::parse(rest, COMMON_BOOLS)?;
     let mut allowed: Vec<&str> = vec![
@@ -2282,6 +2357,8 @@ struct Runner {
     graph: bool,
     /// What this run is, for the chart page title and the crash breadcrumb.
     label: String,
+    /// Open the machine's package page in a browser when the run finishes.
+    open_report: bool,
     /// Live ETW (WPR) capture and the profiles it was asked for.
     #[cfg(windows)]
     etw: Option<etw::Capture>,
@@ -2321,8 +2398,20 @@ impl Runner {
         // and, worse, late load edges. --priority high goes further; the default
         // deliberately stops at ABOVE_NORMAL so we do not starve the desktop or
         // the drivers we are measuring.
+        // Stored settings are DEFAULTS. An explicit flag on this command line
+        // always wins, so a value the operator armed in the menu last week can
+        // never override what they just typed.
+        let stored = settings::Settings::load();
+
         if !p.has("no-priority") {
-            crucible_core::sysinfo::raise_process_priority(p.get("priority") == Some("high"));
+            let high = match p.get("priority") {
+                Some(v) => v == "high",
+                None => stored.priority == 1,
+            };
+            let off = p.get("priority").is_none() && stored.priority == 2;
+            if !off {
+                crucible_core::sysinfo::raise_process_priority(high);
+            }
         }
 
         install_ctrlc();
@@ -2343,12 +2432,12 @@ impl Runner {
             ui: p.has("ui"),
             ui_stop: None,
             ui_handle: None,
-            csv: p.has("csv"),
-            telemetry: p.has("telemetry-csv"),
+            csv: p.has("csv") || stored.results_csv,
+            telemetry: p.has("telemetry-csv") || stored.telemetry_csv,
             telemetry_stop: None,
             telemetry_handle: None,
             eventlog: !p.has("no-eventlog"),
-            graph: !p.has("no-graph"),
+            graph: !p.has("no-graph") && stored.graph,
             #[cfg(windows)]
             etw: None,
             // `--etw` alone means first-level triage; `--etw CPU,GPU,Power`
@@ -2359,8 +2448,11 @@ impl Runner {
             etw_profiles: if p.has("etw") || p.get("etw-profiles").is_some() {
                 etw::parse_profiles(p.get("etw-profiles"))
             } else {
-                Vec::new()
+                // The menu's ETW ring, remembered across restarts. Index 0 is
+                // off, which is why an untouched install captures nothing.
+                settings::etw_profiles(stored.etw)
             },
+            open_report: stored.open_report,
             label: p.positional.first().cloned().unwrap_or_else(|| "run".to_string()),
             gpu_summary: Arc::new(Mutex::new(Default::default())),
             gpu_latest: Arc::new(Mutex::new(None)),
@@ -2369,7 +2461,7 @@ impl Runner {
             #[cfg(all(windows, feature = "gpu"))]
             pm: None,
             pm_seconds: p.get_u64("seconds").ok().flatten().unwrap_or(60),
-            pm_enabled: p.has("presentmon"),
+            pm_enabled: p.has("presentmon") || stored.presentmon,
             pm_path: p.get("presentmon-path").map(|s| s.to_string()),
             run_started: Instant::now(),
         })
@@ -3015,6 +3107,8 @@ impl Runner {
         let mut csv_path: Option<PathBuf> = None;
         let mut telemetry_path: Option<PathBuf> = None;
         let mut graph_path: Option<PathBuf> = None;
+        let mut eventlog_path: Option<PathBuf> = None;
+        let mut package_path: Option<PathBuf> = None;
         if let Some(dir) = self.out_dir.clone() {
             match std::fs::create_dir_all(&dir) {
                 Ok(()) => {
@@ -3041,6 +3135,36 @@ impl Runner {
                             }
                         }
                     }
+                    // The complete event-log archive for the run window: every
+                    // channel the machine will let us read, not just the
+                    // providers we happen to have written a classifier for. The
+                    // curated scan above decides the verdict; this is what makes
+                    // the failure nobody predicted still investigable tomorrow.
+                    if self.eventlog {
+                        let window = self.run_started.elapsed().as_millis() as u64
+                            + EVENT_ARCHIVE_MARGIN_MS;
+                        let full = crucible_core::eventlog::capture_all_channels(
+                            window,
+                            MAX_ARCHIVED_EVENTS,
+                        );
+                        if !full.records.is_empty() {
+                            let ep =
+                                dir.join(format!("crucible-{}.eventlog.jsonl", self.stamp));
+                            match std::fs::write(&ep, full.to_jsonl()) {
+                                Ok(()) => {
+                                    println!("events:  {}  ({})", ep.display(), full.summary());
+                                    eventlog_path = Some(ep);
+                                }
+                                Err(e) => eprintln!("warning: could not write event archive: {e}"),
+                            }
+                        }
+                        if full.truncated {
+                            self.report.note(format!(
+                                "event archive TRUNCATED at {MAX_ARCHIVED_EVENTS} records"
+                            ));
+                        }
+                    }
+
                     // The telemetry file was streamed by its logger thread; just
                     // surface its path in the summary.
                     if self.telemetry {
@@ -3059,11 +3183,43 @@ impl Runner {
                                 Ok(()) => graph_path = Some(gp),
                                 Err(e) => eprintln!("warning: could not chart telemetry: {e}"),
                             }
+                            // PNGs beside the page: the page is for looking at,
+                            // a PNG is what goes into a ticket or an email.
+                            match graph::render_pngs(&tp, &dir, &format!("crucible-{}", self.stamp)) {
+                                Ok(v) if !v.is_empty() => {
+                                    println!("images:  {} PNG chart(s) in {}", v.len(), dir.display());
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("warning: could not render chart PNGs: {e}"),
+                            }
                         }
                         telemetry_path = Some(tp);
                     }
                 }
                 Err(e) => eprintln!("warning: could not create out dir {}: {e}", dir.display()),
+            }
+
+            // The machine's index page, rebuilt from whatever is on disk rather
+            // than from what this process wrote — the runs worth finding are the
+            // ones that crashed, and a crashed run recorded nothing.
+            match package::scan(&dir) {
+                Ok(by_device) => {
+                    let device = self.device.short_id.clone();
+                    if let Some(runs) = by_device.get(&device) {
+                        match package::render(&dir, &device, runs) {
+                            Ok(p) => {
+                                if self.open_report {
+                                    if let Err(e) = package::open_in_browser(&p) {
+                                        eprintln!("warning: could not open {}: {e}", p.display());
+                                    }
+                                }
+                                package_path = Some(p);
+                            }
+                            Err(e) => eprintln!("warning: could not build package page: {e}"),
+                        }
+                    }
+                }
+                Err(e) => eprintln!("warning: could not scan {} for a package page: {e}", dir.display()),
             }
         }
 
@@ -3136,6 +3292,10 @@ impl Runner {
             }
             if let Some(gp) = &graph_path {
                 println!("charts:  {}", gp.display());
+            }
+            let _ = &eventlog_path;
+            if let Some(pp) = &package_path {
+                println!("package: {}", pp.display());
             }
         }
 
