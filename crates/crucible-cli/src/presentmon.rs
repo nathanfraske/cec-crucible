@@ -81,13 +81,14 @@ pub fn locate(explicit: Option<&str>) -> Option<PathBuf> {
 pub struct Capture {
     child: Child,
     csv: PathBuf,
+    /// Where PresentMon's own stderr went, so a failure can be explained rather
+    /// than merely reported.
+    err_log: PathBuf,
     /// True when PresentMon is genuinely our child (we were already elevated),
     /// which is what makes stopping it immediate rather than a wait.
     owns_child: bool,
     /// PresentMon's own path, so the capture can be stopped by session name.
     exe: PathBuf,
-    /// The ETW session name we gave it.
-    session: String,
     /// When the capture was spawned, and the `--timed` backstop we gave it — so
     /// `finish` never declares the CSV complete before PresentMon has stopped
     /// writing it.
@@ -129,9 +130,18 @@ impl Capture {
             backstop.to_string(),
             "--terminate_after_timed".to_string(),
             "--stop_existing_session".to_string(),
-            // A session we can name is a session we can find and clean up.
+            // A FIXED name, deliberately not per-run.
+            //
+            // An ETW session outlives the process that created it: kill
+            // PresentMon and its session keeps running in the kernel. With a
+            // per-pid name every run left a `crucible-<pid>` session behind and
+            // `--stop_existing_session` — which only matches its own name —
+            // never reclaimed any of them. Two were found running on this bench,
+            // against a system-wide limit of 64. One fixed name makes the next
+            // run's `--stop_existing_session` clean up the last run's leak, so
+            // the failure mode is self-healing rather than cumulative.
             "--session_name".to_string(),
-            format!("crucible-{pid}"),
+            SESSION_NAME.to_string(),
             // Never outlive us: if this run crashes, the session goes with it
             // rather than blocking the next one.
             "--terminate_on_proc_exit".to_string(),
@@ -144,21 +154,38 @@ impl Capture {
             args.push("--restart_as_admin".to_string());
         }
 
+        // Keep stderr instead of discarding it.
+        //
+        // PresentMon explains itself when it fails — "access denied", "N ETW
+        // events were lost" — and all of that was going to the null device, so
+        // every failure looked identical from the outside: a long wait and no
+        // data. On this bench it turned out to be losing ~180,000 events per six
+        // seconds and capturing nothing, which the tool had no way to say.
+        let err_log = csv.with_extension("log");
+        let stderr = std::fs::File::create(&err_log)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
         let child = Command::new(exe)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()?;
         Ok(Capture {
             child,
             csv,
             started: Instant::now(),
             window: Duration::from_secs(backstop),
+            err_log,
             owns_child: elevated,
             exe: exe.to_path_buf(),
-            session: format!("crucible-{pid}"),
         })
+    }
+
+    /// Where the capture is writing. Needed by the caller before `finish`
+    /// consumes the handle, so a failure can still be explained afterwards.
+    pub fn csv_path(&self) -> PathBuf {
+        self.csv.clone()
     }
 
     /// Wait for the capture to land. PresentMon stops itself after its `--timed`
@@ -173,30 +200,33 @@ impl Capture {
         // On a run that finished on schedule that was a couple of wasted seconds;
         // on a soak the operator stopped early it was minutes of a progress-less
         // wait, which is what made this feel interminable.
+        // Stop the SESSION, not merely the process.
+        //
+        // Killing PresentMon does not stop its ETW session — the session lives in
+        // the kernel and keeps running, holding buffers, until something stops it
+        // by name. `--terminate_existing_session` is that something, and it is
+        // done FIRST so the session is gone whether or not the process is ours.
+        let _ = Command::new(&self.exe)
+            .args([
+                "--terminate_existing_session",
+                "--session_name",
+                SESSION_NAME,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|mut c| {
+                let _ = c.wait();
+            });
+
         if self.owns_child {
-            // Elevated: it is our child, so ending it is immediate. PresentMon
-            // writes the CSV incrementally, so the rows already on disk survive.
+            // Elevated: it is our child, so it can also be ended directly, as a
+            // backstop for the case where the session stop did not reach it.
+            // PresentMon writes the CSV incrementally, so rows already on disk
+            // survive either way.
             let _ = self.child.kill();
             let _ = self.child.wait();
-        } else {
-            // Unelevated: the writer is a detached elevated process. Ask
-            // PresentMon to stop the session by name — the running instance sees
-            // its session end and exits. This needs elevation too, so it may be
-            // refused; the poll below then falls back to waiting, which is why
-            // the backstop timer still exists.
-            let _ = Command::new(&self.exe)
-                .args([
-                    "--terminate_existing_session",
-                    "--session_name",
-                    &self.session,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map(|mut c| {
-                    let _ = c.wait();
-                });
         }
 
         // Nothing to wait for if nothing was ever captured.
@@ -271,6 +301,37 @@ impl Capture {
         } else {
             Duration::from_secs(12)
         }
+    }
+}
+
+/// The ETW session name. Fixed, so a leak is cleaned up by the next run rather
+/// than accumulating against the system's 64-session limit.
+pub const SESSION_NAME: &str = "cec-crucible";
+
+/// Whatever PresentMon last said on stderr, trimmed to something printable.
+///
+/// This is the difference between "PresentMon captured nothing" and "PresentMon
+/// captured nothing because 183,445 ETW events were lost" — the second is a
+/// diagnosis, and it was being thrown away.
+///
+/// Often empty in practice, and that is expected rather than broken: PresentMon
+/// prints its summary warnings as it exits, and the normal path now ends its
+/// session before it gets there. What this reliably catches is the failure that
+/// happens at *startup* — "access denied" when the session cannot be created —
+/// which is the one an operator most needs to be told about.
+pub fn last_error(csv: &Path) -> Option<String> {
+    let log = csv.with_extension("log");
+    let text = std::fs::read_to_string(log).ok()?;
+    let msg: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(3)
+        .collect();
+    if msg.is_empty() {
+        None
+    } else {
+        Some(msg.join("; "))
     }
 }
 

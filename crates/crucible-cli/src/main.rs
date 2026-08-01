@@ -3030,6 +3030,7 @@ impl Runner {
             // Time the stop and say so. This step has been the single worst
             // stall in the tool, and an operator watching a blank console needs
             // the number in the output rather than a stopwatch.
+            let pm_csv = c.csv_path();
             let pm_t0 = Instant::now();
             let outcome = c.finish();
             let pm_secs = pm_t0.elapsed().as_secs_f64();
@@ -3054,13 +3055,20 @@ impl Runner {
                     }
                     eprintln!("presentmon: {}", csv.display());
                 }
-                None => eprintln!(
-                    "note: PresentMon captured no frames in {pm_secs:.1}s. Either the ETW session 
-                     needed elevation (run from an admin shell), or this test never presents — 
-                     PresentMon records DISPLAYED frames, so it only has anything to say on 
-                     render / rt / pathtrace with --preview. Compute, memory, storage and PCIe 
-                     loads put nothing on screen."
-                ),
+                None => {
+                    eprintln!(
+                        "note: PresentMon captured no frames in {pm_secs:.1}s. Causes, in order 
+                         of likelihood: this test never presents (PresentMon records DISPLAYED 
+                         frames, so only render / rt / pathtrace with --preview can produce any); 
+                         the ETW session needed elevation; or the machine's ETW plane is 
+                         saturated. PresentMon's own words follow when it left any."
+                    );
+                    // Its own diagnosis, which used to go to the null device.
+                    if let Some(why) = presentmon::last_error(&pm_csv) {
+                        eprintln!("      presentmon said: {why}");
+                        self.report.note(format!("presentmon: {why}"));
+                    }
+                }
             }
         }
 
