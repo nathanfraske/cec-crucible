@@ -191,3 +191,76 @@ extern "system" {
     fn GetCurrentThread() -> isize;
     fn SetThreadPriority(handle: isize, priority: i32) -> i32;
 }
+
+/// Is this process running elevated (an Administrator token)?
+///
+/// Matters because it decides whether a child ETW capture is *ours*. PresentMon
+/// needs elevation for its trace session; when we are not elevated it relaunches
+/// itself with `--restart_as_admin`, and the process that ends up writing the CSV
+/// is no longer our child — so we cannot stop it, and have to wait out its own
+/// timer. Running elevated turns a wait of up to the whole run duration into an
+/// immediate stop.
+pub fn is_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        win_elevation::is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+mod win_elevation {
+    use core::ffi::c_void;
+
+    /// `TokenElevation` from the TOKEN_INFORMATION_CLASS enum.
+    const TOKEN_ELEVATION: u32 = 20;
+    const TOKEN_QUERY: u32 = 0x0008;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        // Handles are `isize` here to match the declaration this crate already
+        // carries for GetCurrentProcess. Two extern blocks in one crate declaring
+        // the same symbol with different signatures is a real hazard, not a
+        // style point: the linker keeps one and the other becomes a silent
+        // type-confusion at the call site.
+        fn OpenProcessToken(process: isize, access: u32, token: *mut *mut c_void) -> i32;
+        fn GetTokenInformation(
+            token: *mut c_void,
+            class: u32,
+            info: *mut c_void,
+            len: u32,
+            out_len: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn CloseHandle(h: *mut c_void) -> i32;
+    }
+
+    pub(super) fn is_elevated() -> bool {
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no close;
+        // the token handle is closed on every path out.
+        unsafe {
+            let mut token: *mut c_void = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let mut elevated: u32 = 0;
+            let mut len: u32 = 0;
+            let ok = GetTokenInformation(
+                token,
+                TOKEN_ELEVATION,
+                &mut elevated as *mut u32 as *mut c_void,
+                std::mem::size_of::<u32>() as u32,
+                &mut len,
+            );
+            CloseHandle(token);
+            ok != 0 && elevated != 0
+        }
+    }
+}

@@ -131,7 +131,26 @@ impl AdapterRecord {
 /// Ordering is wgpu's, so a class ordinal (`Integrated(1)` = "the second
 /// integrated adapter") means here exactly what it means when the kernel asks
 /// wgpu for its device.
+///
+/// **Cached for the life of the process.** Identity is consulted from nine
+/// places — buffer sizing, the UMA checks in `vram` and `link`, each kernel's
+/// detail string, adapter selection — for an answer that cannot change: adapters
+/// do not appear or vanish partway through a run.
+///
+/// Measured honestly: this is *not* the speed-up it looks like. A/B against the
+/// uncached build on a `run worst-case --seconds 15` came out 35.3s vs 35.6s,
+/// inside the noise. The first enumeration in a process pays to load the DX12,
+/// Vulkan and GL drivers (~3.3s here, visible in `gpu-info`), but the drivers
+/// stay loaded, so later walks were already cheap. Kept because doing the same
+/// work nine times for an invariant answer is still wrong, not because it made
+/// the suite faster.
 pub fn enumerate() -> Vec<AdapterRecord> {
+    static CACHE: std::sync::OnceLock<Vec<AdapterRecord>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(enumerate_uncached).clone()
+}
+
+/// The real walk, behind the cache. Separate so a test can measure it.
+fn enumerate_uncached() -> Vec<AdapterRecord> {
     let instance = wgpu::Instance::default();
     let dxgi = dxgi_adapters();
 
@@ -366,6 +385,28 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_second_enumeration_is_served_from_cache() {
+        // Nine call sites consult identity, and the uncached walk initialises
+        // every graphics backend. Without the cache a cross-load spent tens of
+        // seconds re-deriving an answer that cannot change mid-run.
+        let first = std::time::Instant::now();
+        let a = enumerate();
+        let cold = first.elapsed();
+
+        let second = std::time::Instant::now();
+        let b = enumerate();
+        let warm = second.elapsed();
+
+        assert_eq!(a, b, "the cached answer must be the same answer");
+        // Not a timing assertion on the cold path (that depends on the machine)
+        // — only that the warm path is not doing the work again.
+        assert!(
+            warm * 10 < cold.max(std::time::Duration::from_millis(10)),
+            "second enumeration took {warm:?} against a cold {cold:?}: cache not working"
+        );
+    }
 
     #[test]
     fn enumeration_is_self_consistent() {

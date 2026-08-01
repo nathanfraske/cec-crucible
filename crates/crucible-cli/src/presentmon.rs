@@ -80,7 +80,14 @@ pub fn locate(explicit: Option<&str>) -> Option<PathBuf> {
 pub struct Capture {
     child: Child,
     csv: PathBuf,
-    /// When the capture was spawned, and the `--timed` window we gave it — so
+    /// True when PresentMon is genuinely our child (we were already elevated),
+    /// which is what makes stopping it immediate rather than a wait.
+    owns_child: bool,
+    /// PresentMon's own path, so the capture can be stopped by session name.
+    exe: PathBuf,
+    /// The ETW session name we gave it.
+    session: String,
+    /// When the capture was spawned, and the `--timed` backstop we gave it — so
     /// `finish` never declares the CSV complete before PresentMon has stopped
     /// writing it.
     started: Instant,
@@ -93,26 +100,51 @@ impl Capture {
     /// Targets our pid so only the windows we present are recorded.
     pub fn start(exe: &Path, csv: PathBuf, seconds: u64) -> std::io::Result<Capture> {
         let pid = std::process::id();
+        // Elevation decides whether the capture is OURS.
+        //
+        // PresentMon's trace session needs an Administrator token. Unelevated, it
+        // relaunches itself with `--restart_as_admin`, and the process that ends
+        // up writing the CSV is no longer our child — we cannot stop it, so the
+        // capture only ends when its own `--timed` timer fires. Elevated, it is a
+        // normal child we can end the instant the run does.
+        let elevated = crucible_core::sysinfo::is_elevated();
+
+        // `--timed` is a BACKSTOP, not the plan.
+        //
+        // It used to be `seconds + 2`, taken from the *requested* duration, which
+        // was wrong in both directions: a run that overran (a cross-load asked for
+        // 20s routinely takes 35) had its capture cut off early, and a run stopped
+        // early left `finish` sleeping out the whole remaining window for nothing.
+        // Now it is set well past any plausible run so it never truncates, and the
+        // capture is ended actively instead.
+        let backstop = backstop_seconds(seconds);
+
+        let mut args = vec![
+            "--process_id".to_string(),
+            pid.to_string(),
+            "--output_file".to_string(),
+            csv.to_string_lossy().into_owned(),
+            "--timed".to_string(),
+            backstop.to_string(),
+            "--terminate_after_timed".to_string(),
+            "--stop_existing_session".to_string(),
+            // A session we can name is a session we can find and clean up.
+            "--session_name".to_string(),
+            format!("crucible-{pid}"),
+            // Never outlive us: if this run crashes, the session goes with it
+            // rather than blocking the next one.
+            "--terminate_on_proc_exit".to_string(),
+            "--no_console_stats".to_string(),
+            // Pin the schema: v2 metrics carry the present-pipeline breakdown
+            // (GPUBusy / CPUBusy / CPUWait / DisplayLatency) this suite reports.
+            "--v2_metrics".to_string(),
+        ];
+        if !elevated {
+            args.push("--restart_as_admin".to_string());
+        }
+
         let child = Command::new(exe)
-            .args([
-                "--process_id".to_string(),
-                pid.to_string(),
-                "--output_file".to_string(),
-                csv.to_string_lossy().into_owned(),
-                "--timed".to_string(),
-                (seconds + 2).to_string(),
-                "--terminate_after_timed".to_string(),
-                "--stop_existing_session".to_string(),
-                "--no_console_stats".to_string(),
-                // Pin the schema: v2 metrics carry the present-pipeline breakdown
-                // (GPUBusy / CPUBusy / CPUWait / DisplayLatency) this suite reports.
-                "--v2_metrics".to_string(),
-                // An ETW real-time session needs elevation. When we are not already
-                // elevated PresentMon relaunches ITSELF elevated (one UAC prompt) —
-                // which is why `finish` waits on the CSV, not on our child handle:
-                // the relaunched process is not ours.
-                "--restart_as_admin".to_string(),
-            ])
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -121,7 +153,10 @@ impl Capture {
             child,
             csv,
             started: Instant::now(),
-            window: Duration::from_secs(seconds + 2),
+            window: Duration::from_secs(backstop),
+            owns_child: elevated,
+            exe: exe.to_path_buf(),
+            session: format!("crucible-{pid}"),
         })
     }
 
@@ -131,18 +166,55 @@ impl Capture {
     /// its size stops growing. Returns `None` on timeout — practically always a
     /// declined UAC prompt (no elevation, no ETW session, no data).
     pub fn finish(mut self) -> Option<PathBuf> {
-        // Our own child is only meaningful when it wasn't relaunched; don't block
-        // on it for long either way.
-        let _ = self.child.try_wait();
+        // End the capture NOW rather than waiting for its timer.
+        //
+        // The old code slept out the remaining `--timed` window unconditionally.
+        // On a run that finished on schedule that was a couple of wasted seconds;
+        // on a soak the operator stopped early it was minutes of a progress-less
+        // wait, which is what made this feel interminable.
+        if self.owns_child {
+            // Elevated: it is our child, so ending it is immediate. PresentMon
+            // writes the CSV incrementally, so the rows already on disk survive.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        } else {
+            // Unelevated: the writer is a detached elevated process. Ask
+            // PresentMon to stop the session by name — the running instance sees
+            // its session end and exits. This needs elevation too, so it may be
+            // refused; the poll below then falls back to waiting, which is why
+            // the backstop timer still exists.
+            let _ = Command::new(&self.exe)
+                .args([
+                    "--terminate_existing_session",
+                    "--session_name",
+                    &self.session,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|mut c| {
+                    let _ = c.wait();
+                });
+        }
+
+        // Nothing to wait for if nothing was ever captured.
+        //
+        // Unelevated, PresentMon needs a UAC prompt to relaunch itself; declined
+        // or dismissed, no session starts and no CSV is ever created. The old
+        // code still sat out the entire `--timed` window for a file that would
+        // never appear — a 3-second test spent two and a half minutes waiting on
+        // a capture that did not exist.
+        if !self.csv.exists() {
+            return None;
+        }
 
         // PresentMon writes in buffered bursts, so "size didn't change since last
-        // poll" is NOT proof it finished — early on, the file is briefly stable
-        // holding only its header. Wait out the `--timed` window first, then
-        // require a stable size over several polls AND at least one data row.
-        let remaining = self.window.saturating_sub(self.started.elapsed());
-        std::thread::sleep(remaining);
-
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // poll" is NOT proof it finished — early on the file is briefly stable
+        // holding only its header. So completion still needs a stable size over
+        // several polls AND at least one data row. What changed is that we start
+        // checking immediately instead of after a fixed sleep.
+        let deadline = Instant::now() + self.wait_budget();
         let mut last_len: u64 = u64::MAX;
         let mut stable_for = 0u32;
         while Instant::now() < deadline {
@@ -168,6 +240,36 @@ impl Capture {
         }
         None
     }
+
+    /// How long to keep polling for the CSV to settle, once the capture has been
+    /// asked to stop.
+    ///
+    /// **Seconds either way, never the length of the run.** PresentMon writes the
+    /// CSV incrementally, so we never needed it to *exit* — only to stop writing
+    /// long enough that we are not reading a half-flushed line. Waiting out its
+    /// `--timed` window bought nothing and cost the whole window.
+    ///
+    /// A little longer when the writer is not our child, because the stop request
+    /// has to travel through a second process; still bounded, and whatever rows
+    /// are on disk when the budget expires are returned rather than discarded.
+    fn wait_budget(&self) -> Duration {
+        if self.owns_child {
+            Duration::from_secs(6)
+        } else {
+            Duration::from_secs(12)
+        }
+    }
+}
+
+/// The `--timed` backstop for a run of `seconds`.
+///
+/// Generous on purpose. It exists only so a crashed run cannot leave a trace
+/// session recording forever; it must never be the thing that ends a capture,
+/// because a run routinely takes longer than it was asked for — a cross-load
+/// requested at 20s measures 35s once every stage's setup and teardown is
+/// counted. The old value of `seconds + 2` truncated exactly those runs.
+fn backstop_seconds(seconds: u64) -> u64 {
+    seconds.saturating_mul(2).saturating_add(120)
 }
 
 /// True once the CSV holds at least one row beyond its header — i.e. real frames
@@ -373,6 +475,22 @@ mod tests {
         assert_eq!(s.dropped, 1, "undisplayed frame counts as dropped");
         assert!(s.line().contains("gpu_busy 6.00ms"), "{}", s.line());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_backstop_never_ends_a_run_that_overran() {
+        // Measured on the bench: `run worst-case --seconds 20` takes ~35s wall,
+        // and `--seconds 15` GPU runs take ~17s. The old `seconds + 2` cut the
+        // first of those off 13 seconds early.
+        for (asked, actual) in [(20u64, 35u64), (15, 17), (60, 95), (300, 380)] {
+            assert!(
+                backstop_seconds(asked) > actual,
+                "a {asked}s run that actually took {actual}s would be truncated at {}",
+                backstop_seconds(asked)
+            );
+        }
+        // And it stays finite on an absurd request rather than overflowing.
+        assert!(backstop_seconds(u64::MAX) >= u64::MAX - 1);
     }
 
     #[test]

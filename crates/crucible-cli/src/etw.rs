@@ -66,6 +66,10 @@ pub struct EtwTrace {
     pub profiles: Vec<String>,
     pub path: String,
     pub bytes: u64,
+    /// How long `wpr -stop` took. Reported because the flush is the slowest part
+    /// of an ETW capture by a wide margin, and it scales with trace size — which
+    /// is the lever an operator actually has (fewer profiles, shorter run).
+    pub flush_seconds: f64,
 }
 
 impl EtwTrace {
@@ -76,6 +80,7 @@ impl EtwTrace {
             profiles: profiles.to_vec(),
             path: String::new(),
             bytes: 0,
+            flush_seconds: 0.0,
         }
     }
 
@@ -83,10 +88,11 @@ impl EtwTrace {
     pub fn line(&self) -> String {
         if self.available {
             format!(
-                "etw:     {}  ({}, {:.1} MB)",
+                "etw:     {}  ({}, {:.1} MB, flushed in {:.1}s)",
                 self.path,
                 self.profiles.join("+"),
-                self.bytes as f64 / (1024.0 * 1024.0)
+                self.bytes as f64 / (1024.0 * 1024.0),
+                self.flush_seconds
             )
         } else {
             format!("etw: UNAVAILABLE ({})", self.unavailable_reason)
@@ -113,7 +119,8 @@ impl EtwTrace {
                 Json::Array(self.profiles.iter().map(|p| Json::str(p)).collect()),
             )
             .push("path", Json::str(&self.path))
-            .push("bytes", Json::U64(self.bytes));
+            .push("bytes", Json::U64(self.bytes))
+            .push("flush_seconds", Json::F64((self.flush_seconds * 10.0).round() / 10.0));
         o
     }
 }
@@ -198,14 +205,26 @@ impl Capture {
 
     /// Stop the capture and flush the `.etl`.
     ///
-    /// WPR writes the whole buffered trace here, which on a long run can take
-    /// tens of seconds — that wait is the price of the artifact, so it is not
-    /// short-circuited.
+    /// `wpr -stop` does not merely close a file: it *merges* the trace, and by
+    /// default that includes generating NGEN and embedded PDBs so a profiler can
+    /// resolve managed symbols later. On a machine with .NET assemblies loaded
+    /// that symbol generation is routinely the majority of the stop time — tens
+    /// of seconds, sometimes minutes, on a trace that took seconds to record.
+    ///
+    /// We are capturing hardware behaviour, not profiling managed code, so
+    /// `-skipPdbGen` removes work whose output nothing here would ever read. The
+    /// remaining merge — image-ID and machine-info injection, which is what makes
+    /// the `.etl` openable in WPA on another machine — is kept.
+    ///
+    /// The flush is timed and reported: an operator watching a progress-less wait
+    /// should at least be told afterwards what it cost.
     pub fn finish(self, description: &str) -> EtwTrace {
+        let began = std::time::Instant::now();
         let r = Command::new(&self.wpr)
             .arg("-stop")
             .arg(&self.out)
             .arg(description)
+            .arg("-skipPdbGen")
             .output();
         match r {
             Ok(o) if o.status.success() => {
@@ -225,6 +244,7 @@ impl Capture {
                     profiles: self.profiles,
                     path: self.out.display().to_string(),
                     bytes,
+                    flush_seconds: began.elapsed().as_secs_f64(),
                 }
             }
             Ok(o) => EtwTrace::unavailable(explain(&o), &self.profiles),
