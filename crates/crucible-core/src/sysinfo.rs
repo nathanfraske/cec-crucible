@@ -12,6 +12,39 @@ pub struct MemInfo {
     pub avail_bytes: u64,
 }
 
+/// System memory a test must leave alone, in bytes, given the machine's total.
+///
+/// A flat "90% of available" is what pushes a box into paging. Available memory
+/// is not spare memory: Windows is holding a file cache it will give back under
+/// pressure, the GPU driver has pinned allocations, and the operator's session
+/// needs a working set. Commit past that and the machine starts swapping — at
+/// which point a memory test has become a disk test, it reports throughput that
+/// says nothing about the DIMMs, and the technician's desktop stops responding.
+///
+/// So the reserve scales with the machine and has a floor: **2 GiB or an eighth
+/// of total RAM, whichever is larger.** On an 8 GiB box that is 2 GiB; on 32 GiB
+/// it is 4 GiB; on 128 GiB it is 16 GiB. Sizing off *total* rather than
+/// *available* is deliberate — the reserve should not shrink just because
+/// something else is already using memory.
+pub fn working_set_reserve_bytes(total_bytes: u64) -> u64 {
+    const FLOOR: u64 = 2 * 1024 * 1024 * 1024;
+    (total_bytes / 8).max(FLOOR)
+}
+
+/// The largest buffer a test may take right now without pushing the machine
+/// into paging: available memory minus [`working_set_reserve_bytes`].
+///
+/// Returns `None` when memory cannot be read at all, and `Some(0)` when the
+/// machine is already inside its reserve — the caller must treat that as "do
+/// not allocate", not as "allocate nothing and call it a pass".
+pub fn safe_test_budget_bytes() -> Option<u64> {
+    let m = memory()?;
+    Some(
+        m.avail_bytes
+            .saturating_sub(working_set_reserve_bytes(m.total_bytes)),
+    )
+}
+
 /// Number of logical processors the runtime will schedule threads across.
 pub fn logical_cpus() -> usize {
     std::thread::available_parallelism()

@@ -36,6 +36,7 @@ pub(crate) mod geom;
 // Pure frame-time math (no GPU/preview deps): used by the normal render run for
 // its pacing summary and by the windows+preview benchmark for its score.
 pub(crate) mod frame_timer;
+pub mod adapter;
 pub mod link;
 #[cfg(feature = "optix")]
 pub mod optix;
@@ -280,12 +281,64 @@ impl LoadKernel for GpuKernel {
         let cube_dim = CubeDim::new_1d(workgroup);
 
         let handle = client.empty(threads * std::mem::size_of::<f32>());
-        let data_elems = (self.data_mb * 1024 * 1024) / std::mem::size_of::<f32>();
-        let data_handle = if self.mix {
-            Some(client.empty(data_elems * std::mem::size_of::<f32>()))
-        } else {
-            None
-        };
+        // The mix buffer's default is 1 GiB, which a discrete card swallows and
+        // an integrated one refuses outright — the allocation used to `unwrap()`
+        // and take the whole run down with a panic. Probe downwards instead of
+        // predicting a limit: halve until the driver accepts, which needs no
+        // per-vendor knowledge and works the same on a 24 GiB card and a UHD 630.
+        let mut data_mb = self.data_mb.max(1);
+        if let Some(a) = crate::adapter::resolve(self.device) {
+            // The binding limit is the real ceiling, and it is *not* the same on
+            // every adapter: on this bench the 3070 reports 2047 MiB while the
+            // UHD 630 reports 1023 — so the default 1024 MiB buffer fit the card
+            // exactly and overshot the iGPU by one megabyte. wgpu's refusal
+            // surfaces asynchronously, well after the allocation call returns, so
+            // no amount of catching around `empty()` helps. It has to be asked
+            // for correctly in the first place.
+            if a.max_storage_binding_bytes > 0 {
+                let cap_mb = (a.max_storage_binding_bytes / (1024 * 1024)) as usize;
+                // A megabyte under the stated limit: some drivers count their own
+                // header against it.
+                data_mb = data_mb.min(cap_mb.saturating_sub(1).max(16));
+            }
+            // On UMA the buffer comes out of system RAM, so it is also bounded by
+            // what the machine can hold resident — nothing to do with the "GPU".
+            if a.uma {
+                if let Some(budget) = crucible_core::sysinfo::safe_test_budget_bytes() {
+                    let cap_mb = (budget / 4 / (1024 * 1024)) as usize;
+                    data_mb = data_mb.min(cap_mb.max(16));
+                }
+            }
+        }
+        let mut data_handle = None;
+        let mut data_note = String::new();
+        if self.mix {
+            loop {
+                let bytes = data_mb * 1024 * 1024;
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    client.empty(bytes)
+                })) {
+                    Ok(h) => {
+                        data_handle = Some(h);
+                        break;
+                    }
+                    Err(_) if data_mb > 16 => data_mb /= 2,
+                    // Even 16 MiB refused: run ALU-only rather than dying. The
+                    // load is weaker and the detail says so.
+                    Err(_) => {
+                        data_note = "; mix buffer unavailable (alu-only)".to_string();
+                        break;
+                    }
+                }
+            }
+            if data_handle.is_some() && data_mb != self.data_mb {
+                data_note = format!(
+                    "; mix buffer sized down to {data_mb} MiB (adapter refused {} MiB)",
+                    self.data_mb
+                );
+            }
+        }
+        let data_elems = (data_mb * 1024 * 1024) / std::mem::size_of::<f32>();
         // Adjacent threads read adjacent elements (coalesced) while the loop
         // sweeps the buffer; sustained bandwidth is what drives memory power.
         let stride = threads;
@@ -416,11 +469,37 @@ impl LoadKernel for GpuKernel {
             0.0
         };
 
-        let detail = format!(
-            "{}, {dispatches} dispatch(es), {verifications} verify, ~{tflops:.2} TFLOP/s{}",
-            self.mode_detail(),
-            detail_extra
-        );
+        // A run that verified nothing has no result to report — and a throughput
+        // figure from one is worse than useless, it is misleading. On the bench
+        // this printed "~2.61 TFLOP/s" for a UHD 630 whose theoretical peak is
+        // about 0.46, computed from four dispatches and zero verifications, on a
+        // run that had already crashed. `rt` and `render` have carried this guard
+        // since they were written; this kernel never did.
+        let detail = if verifications == 0 {
+            errors = errors.max(1);
+            format!(
+                "{}, {dispatches} dispatch(es), 0 verify — NOT VERIFIED, no throughput can be \
+                 claimed{}{}",
+                self.mode_detail(),
+                data_note,
+                detail_extra
+            )
+        } else {
+            format!(
+                "{}, {dispatches} dispatch(es), {verifications} verify, ~{tflops:.2} TFLOP/s{}{}",
+                self.mode_detail(),
+                data_note,
+                detail_extra
+            )
+        };
+
+        // Release the pooled device memory rather than leaving it reserved for
+        // the life of the process — a later stage on the same device is the one
+        // that pays for it, with an OOM on a card that looks empty.
+        drop(handle);
+        drop(data_handle);
+        client.memory_cleanup();
+        let _ = client.sync();
 
         LoadResult::new(true, dispatches, last_checksum, errors, detail)
     }

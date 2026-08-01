@@ -749,19 +749,14 @@ fn vram_kernel_from(p: &Parsed) -> Result<crucible_gpu::vram::VramKernel, String
     // machinery find the ceiling. This is also the only mode that exercises the
     // near-full-VRAM behaviour a game hits in its worst moments.
     if matches!(p.get("vram-mb"), Some(v) if v.eq_ignore_ascii_case("max")) {
-        let idx = match device {
-            GpuDevice::Discrete(i) | GpuDevice::Integrated(i) => i as u32,
-            GpuDevice::Default => 0,
-        };
-        match crucible_gpu::vramsize::max_testable_vram_mb(idx) {
-            Some(mb) => k.vram_mb = mb,
-            None => {
-                return Err(
-                    "--vram-mb max needs the adapter's dedicated VRAM size, which could not                      be read (no DXGI, or a shared-memory adapter). Give an explicit size,                      e.g. --vram-mb 6144."
-                        .to_string(),
-                )
-            }
-        }
+        // Sized from the adapter this run actually resolves to — not from a
+        // class ordinal reused as a DXGI index, which is what previously sized
+        // an integrated run to the discrete card and called system RAM "VRAM".
+        let span = crucible_gpu::vramsize::max_testable_span(device)?;
+        // Print the derivation: a number this consequential should never appear
+        // without saying where it came from.
+        eprintln!("vram max: {} MiB — {}", span.mb, span.basis);
+        k.vram_mb = span.mb;
     } else if let Some(v) = p.get_u64("vram-mb")? {
         k.vram_mb = v.clamp(16, 65536) as usize;
     }
@@ -1620,14 +1615,32 @@ fn cmd_gpu_info(rest: &[String]) -> Result<u8, String> {
     {
         let p = Parsed::parse(rest, COMMON_BOOLS)?;
         p.reject_unknown(&["help"])?;
-        println!("GPU devices:");
+        // Identity first: what each selector actually resolves to. This is the
+        // question that used to be answered wrong — a class ordinal handed to
+        // DXGI as an adapter index — so it is now the first thing printed.
+        println!("adapters (as this machine presents them):");
+        for a in crucible_gpu::adapter::enumerate() {
+            let luid = a
+                .pdh_luid_key()
+                .unwrap_or_else(|| "no LUID".to_string());
+            println!("  {}  [{}]", a.line(), luid);
+        }
+
+        println!("
+selectors:");
         for d in [
             GpuDevice::Discrete(0),
             GpuDevice::Integrated(0),
             GpuDevice::Default,
         ] {
-            match crucible_gpu::probe(d) {
-                Ok(s) | Err(s) => println!("  {s}"),
+            let probe = match crucible_gpu::probe(d) {
+                Ok(s) | Err(s) => s,
+            };
+            match crucible_gpu::adapter::resolve(d) {
+                Some(a) => println!("  {probe}
+      -> {}", a.line()),
+                None => println!("  {probe}
+      -> no adapter of that class"),
             }
         }
         Ok(0)
@@ -3295,18 +3308,15 @@ fn cores_label(sel: CoreSel) -> String {
     }
 }
 
-/// Fraction of AVAILABLE RAM used by `--mb max`. Deliberately not 1.0: the OS,
-/// the GPU driver's pinned allocations and this process all need headroom, and a
-/// run that triggers the OOM killer tests nothing. 90% is the most we can take
-/// and still reliably finish.
-const MEM_MAX_FRACTION: f64 = 0.90;
-
 fn mem_size_from(p: &Parsed, default_mb: Option<u64>) -> Result<MemSize, String> {
     // `--mb max` fills memory rather than taking the default half — the case
     // that actually exercises the far end of the address space and forces the
     // allocator into regions a smaller buffer never touches.
     if matches!(p.get("mb"), Some(v) if v.eq_ignore_ascii_case("max")) {
-        return Ok(MemSize::Fraction(MEM_MAX_FRACTION));
+        // The kernel resolves this against available RAM minus a machine-scaled
+        // working-set reserve — see crucible_mem::FRACTION_MAX. A flat fraction
+        // here is what used to commit past what the box could hold resident.
+        return Ok(MemSize::Fraction(crucible_mem::FRACTION_MAX));
     }
     match p.get_u64("mb")? {
         // saturating_mul so an absurd --mb can't overflow/panic (the kernel

@@ -63,6 +63,28 @@ pub mod throttle {
 /// Human-readable throttle reasons present in `mask`, most serious first.
 /// Deliberately omits `GPU_IDLE` and the benign clock-setting bits: reporting
 /// "throttled: idle" during a burst test's off-phase would be noise.
+/// Negotiated PCIe link (generation, width) for NVIDIA adapter `index`.
+///
+/// Free-standing rather than a method on the telemetry handle, because the PCIe
+/// test needs it before it has one — and it is the ceiling that makes an
+/// impossible transfer rate detectable rather than printable. `None` on
+/// anything not NVIDIA; the caller then judges against an absolute ceiling.
+pub fn pcie_link(index: u32) -> Option<(u32, u32)> {
+    #[cfg(windows)]
+    {
+        let n = win::Nvml::open(index)?;
+        match (n.pcie_gen, n.pcie_width) {
+            (0, _) | (_, 0) => None,
+            (g, w) => Some((g, w)),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = index;
+        None
+    }
+}
+
 pub fn throttle_names(mask: u64) -> Vec<&'static str> {
     let mut v = Vec::new();
     if mask & throttle::HW_POWER_BRAKE != 0 {
@@ -285,6 +307,11 @@ mod win {
         f_clock: Option<unsafe extern "C" fn(Handle, u32, *mut u32) -> i32>,
         f_throttle: Option<unsafe extern "C" fn(Handle, *mut u64) -> i32>,
         f_fields: Option<unsafe extern "C" fn(Handle, i32, *mut FieldValue) -> i32>,
+        /// Negotiated PCIe link generation and width. Read once at open: these
+        /// only change on a link retrain, and they are what makes an impossible
+        /// transfer rate detectable.
+        pub(super) pcie_gen: u32,
+        pub(super) pcie_width: u32,
     }
 
     // SAFETY: NVML device handles are process-wide and the library is documented
@@ -345,10 +372,37 @@ mod win {
                 }
             }
 
+            // Negotiated link state. `Curr` rather than `Max`: a card sitting in
+            // a x4 slot must be measured against x4, not against what the board
+            // could do somewhere else.
+            let read_u32 = |sym_name: &str| -> u32 {
+                let mut name_z = sym_name.as_bytes().to_vec();
+                name_z.push(0);
+                // SAFETY: NUL-terminated name; signature matches NVML's.
+                let p = unsafe { GetProcAddress(lib, name_z.as_ptr()) };
+                if p.is_null() {
+                    return 0;
+                }
+                let f: unsafe extern "C" fn(Handle, *mut u32) -> i32 =
+                    // SAFETY: transmute target matches the documented signature.
+                    unsafe { std::mem::transmute(p) };
+                let mut v = 0u32;
+                // SAFETY: valid out-param.
+                if unsafe { f(dev, &mut v) } == NVML_SUCCESS {
+                    v
+                } else {
+                    0
+                }
+            };
+            let pcie_gen = read_u32("nvmlDeviceGetCurrPcieLinkGeneration");
+            let pcie_width = read_u32("nvmlDeviceGetCurrPcieLinkWidth");
+
             Some(Nvml {
                 dev,
                 name,
                 power_limit_w,
+                pcie_gen,
+                pcie_width,
                 f_power: sym!(
                     lib,
                     "nvmlDeviceGetPowerUsage",

@@ -35,8 +35,13 @@ use crucible_core::sysinfo;
 
 /// Fraction of *available* physical memory to test when no explicit size given.
 pub const DEFAULT_FRACTION: f64 = 0.5;
-/// Headroom left free so the test never drives the machine into paging/OOM.
-const SAFETY_BYTES: u64 = 1024 * 1024 * 1024;
+/// Sentinel fraction meaning "as much as this machine can hold resident".
+///
+/// Distinct from any ordinary fraction because it is not a fraction at all: the
+/// budget comes from [`sysinfo::safe_test_budget_bytes`], which subtracts a
+/// reserve that scales with the machine. A flat 90%-of-available is what pushes
+/// a box into paging, and a memory test that pages is measuring the disk.
+pub const FRACTION_MAX: f64 = -1.0;
 /// Fallback buffer size when available memory can't be queried.
 const FALLBACK_BYTES: u64 = 256 * 1024 * 1024;
 /// Stop responsiveness: check the stop flag / deadline every this many words.
@@ -79,6 +84,14 @@ impl MemKernel {
         let avail = sysinfo::memory().map(|m| m.avail_bytes);
         let bytes = match self.size {
             MemSize::Bytes(b) => b,
+            // `max`: everything the machine can hold resident, and not one page
+            // more. Sized from available memory minus a reserve that scales with
+            // total RAM, because "available" is not "spare" — Windows is holding
+            // a file cache, the GPU driver has pinned pages, and the operator's
+            // session needs a working set.
+            MemSize::Fraction(f) if f == FRACTION_MAX => {
+                sysinfo::safe_test_budget_bytes().unwrap_or(FALLBACK_BYTES)
+            }
             MemSize::Fraction(f) => {
                 let f = f.clamp(0.01, 0.95);
                 match avail {
@@ -87,12 +100,15 @@ impl MemKernel {
                 }
             }
         };
-        // Never take the machine below the safety headroom.
-        let capped = match avail {
-            Some(a) => bytes.min(a.saturating_sub(SAFETY_BYTES)).max(1),
-            None => bytes.max(1),
+        // Whatever was asked for, never commit past what the machine can hold
+        // resident. This applies to an explicit `--mb 60000` too: the operator
+        // asking for more than exists should get the largest honest test, not a
+        // frozen desktop.
+        let capped = match sysinfo::safe_test_budget_bytes() {
+            Some(budget) => bytes.min(budget),
+            None => bytes,
         };
-        capped / 8 // bytes -> u64 words
+        capped.max(1) / 8 // bytes -> u64 words
     }
 }
 

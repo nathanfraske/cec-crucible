@@ -157,16 +157,61 @@ impl LinkGpu {
     /// Initialise the adapter/device and allocate the reusable pool. Returns the
     /// pool and the actual buffer size (possibly clamped to the adapter limit).
     fn init(link: &LinkKernel, want_bytes: u64, pattern: &[u8]) -> Result<LinkGpu, String> {
-        // Default instance enables all available backends (DX12/Vulkan on
-        // Windows); the adapter request picks the high-performance one.
-        let instance = wgpu::Instance::default();
+        // **Backend choice is load-bearing here, not a preference.**
+        //
+        // The staging buffer is created MAP_WRITE | COPY_SRC, and the whole test
+        // rests on that buffer living in *system* memory so the copy to the
+        // device buffer actually crosses PCIe. On D3D12 that is guaranteed:
+        // MAP_WRITE maps to D3D12_HEAP_TYPE_UPLOAD, which is system memory by
+        // definition, and the device-local host-visible heap that Resizable BAR
+        // exposes is a separate opt-in type (D3D12_HEAP_TYPE_GPU_UPLOAD) that
+        // wgpu does not use for this. On Vulkan there is no such guarantee: the
+        // allocator is free to satisfy HOST_VISIBLE from a memory type that is
+        // also DEVICE_LOCAL, which under ReBAR is VRAM — and then the "upload"
+        // is a VRAM->VRAM copy running at memory-bus speed. That is how a field
+        // capture came back reporting H2D ~370 GB/s across a link whose ceiling
+        // is ~16 GB/s.
+        //
+        // So on Windows this test forces DX12. Elsewhere it takes what it can
+        // get and leans on the plausibility gate below.
+        #[cfg(windows)]
+        let backends = wgpu::Backends::DX12;
+        #[cfg(not(windows))]
+        let backends = wgpu::Backends::all();
 
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: link.power_preference(),
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .map_err(|e| format!("no usable GPU adapter: {e}"))?;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: Default::default(),
+            display: Default::default(),
+        });
+
+        // Pick the adapter this run actually selected, by identity, rather than
+        // asking for "high performance" and hoping — a run labelled integrated0
+        // used to be able to execute on the discrete card.
+        let want = crate::adapter::resolve(link.device);
+        let adapter = match &want {
+            Some(w) => block_on(instance.enumerate_adapters(backends))
+                .into_iter()
+                .find(|a| {
+                    let i = a.get_info();
+                    i.vendor == w.vendor_id && i.device == w.device_id
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "{} resolves to {}, which the {backends:?} backend does not expose",
+                        link.device.label(),
+                        w.name
+                    )
+                })?,
+            None => block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: link.power_preference(),
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            }))
+            .map_err(|e| format!("no usable GPU adapter: {e}"))?,
+        };
 
         let limits = adapter.limits();
         // Clamp to what the adapter can bind in one buffer.
@@ -438,10 +483,45 @@ impl LoadKernel for LinkKernel {
         let total_gib = (bytes_up + bytes_down) as f64 / (1024.0 * 1024.0 * 1024.0);
         let _ = start;
 
-        let mut detail = format!(
-            "{mode}, {transfers} transfer(s), {verifies} verified, {total_gib:.1} GiB moved, \
-             H2D ~{up:.1} GB/s, D2H ~{down:.1} GB/s, host-RAM ~{host_gbps:.1} GB/s"
-        );
+        // What kind of link, if any, is actually under test? An integrated GPU
+        // shares the CPU's memory controller and has no PCIe link at all, so a
+        // figure labelled H2D there is a memcpy wearing a PCIe badge.
+        let uma = crate::adapter::resolve(self.device)
+            .map(|a| a.uma)
+            .unwrap_or(false);
+
+        let mut detail = if uma {
+            format!(
+                "{mode}, {transfers} transfer(s), {verifies} verified, {total_gib:.1} GiB moved, \
+                 up ~{up:.1} GB/s, down ~{down:.1} GB/s, host-RAM ~{host_gbps:.1} GB/s \
+                 (UMA adapter: NO PCIe LINK EXISTS — this is memory-controller bandwidth)"
+            )
+        } else {
+            format!(
+                "{mode}, {transfers} transfer(s), {verifies} verified, {total_gib:.1} GiB moved, \
+                 H2D ~{up:.1} GB/s, D2H ~{down:.1} GB/s, host-RAM ~{host_gbps:.1} GB/s"
+            )
+        };
+
+        // The second ReBAR defence. Forcing DX12 above should keep the staging
+        // buffer in system memory, but a rate above what the negotiated link can
+        // physically carry proves the bytes never crossed it whatever the cause
+        // — and a wrong number that looks plausible is worse than a failure, so
+        // this FAILS the stage rather than annotating it.
+        if !uma {
+            let ceiling = crucible_core::pcielink::Ceiling::detect(0);
+            for (what, measured) in [("H2D", up), ("D2H", down)] {
+                if measured > 0.0 && !ceiling.plausible(measured) {
+                    detail.push_str("; ");
+                    detail.push_str(&ceiling.rejection(what, measured));
+                    errors += 1;
+                }
+            }
+            match &ceiling.link {
+                Some(l) => detail.push_str(&format!("; link {}", l.describe())),
+                None => detail.push_str("; link speed unknown (judged against the absolute ceiling)"),
+            }
+        }
         if device_lost {
             detail.push_str("; DEVICE LOST / transfer error");
             errors += 1;

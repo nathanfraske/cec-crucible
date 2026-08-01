@@ -322,11 +322,36 @@ impl LoadKernel for VramKernel {
         let chunk_elems = chunk_bytes / std::mem::size_of::<u32>();
         let target_bytes = self.vram_mb.max(self.chunk_mb) * 1024 * 1024;
 
+        // On a UMA adapter every "VRAM" chunk is really system RAM, so filling
+        // the requested span can starve the machine rather than merely the card.
+        // There is no device to lose — Windows just starts paging, and a memory
+        // test that has become a disk test tells you nothing while making the
+        // operator's session unusable. So on UMA we watch real available memory
+        // as we go and stop while there is still headroom.
+        let uma = crate::adapter::resolve(self.device)
+            .map(|a| a.uma)
+            .unwrap_or(false);
+        let host_reserve = crucible_core::sysinfo::memory()
+            .map(|m| crucible_core::sysinfo::working_set_reserve_bytes(m.total_bytes))
+            .unwrap_or(0);
+
         // Allocate every chunk up front so the whole requested span is resident
         // and genuinely under test — testing one buffer repeatedly would only
         // ever exercise the same physical memory.
         let mut chunks = Vec::new();
+        let mut stopped_for_headroom = false;
         while chunks.len() * chunk_bytes + chunk_bytes <= target_bytes {
+            if uma && host_reserve > 0 {
+                // Re-read rather than predict: the only number that matters is
+                // what the machine has left *now*, with this run's allocations
+                // already counted against it.
+                if let Some(m) = crucible_core::sysinfo::memory() {
+                    if m.avail_bytes < host_reserve + chunk_bytes as u64 {
+                        stopped_for_headroom = true;
+                        break;
+                    }
+                }
+            }
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 client.empty(chunk_bytes)
             })) {
@@ -497,6 +522,32 @@ impl LoadKernel for VramKernel {
             l.set_phase(PHASE_DONE);
         }
 
+        // ---- Reclaim -------------------------------------------------------
+        //
+        // Dropping the handles is not enough. CubeCL pools device allocations
+        // and keeps them reserved against the (process-wide, cached) client, so
+        // without an explicit cleanup the memory stays committed for the life of
+        // the process — which is why a later stage in the same run, or a second
+        // GPU test, could hit OOM on a card that looked empty.
+        //
+        // And because reclaim is the kind of thing that silently stops working,
+        // it is *measured*: reserved bytes before and after, reported in the
+        // detail. An assertion in a comment is not evidence.
+        let chunk_count = chunks.len();
+        let reserved_before = client
+            .memory_usage()
+            .map(|u| u.bytes_reserved)
+            .unwrap_or(0);
+        drop(chunks);
+        client.memory_cleanup();
+        // Cleanup is submitted, not blocking: sync so the pool has actually run
+        // it before we look at the numbers.
+        let _ = client.sync();
+        let reserved_after = client
+            .memory_usage()
+            .map(|u| u.bytes_reserved)
+            .unwrap_or(0);
+
         let seconds = start.elapsed().as_secs_f64();
         let gib_checked = (words_checked as f64 * 4.0) / (1024.0 * 1024.0 * 1024.0);
         let rate = if seconds > 0.0 {
@@ -505,14 +556,47 @@ impl LoadKernel for VramKernel {
             0.0
         };
 
+        // On a UMA adapter there is no dedicated video memory: every chunk came
+        // out of system RAM through the shared aperture. Calling that "VRAM"
+        // would claim a test of hardware the machine does not have — the same
+        // failure that let an integrated run report "6784 MiB VRAM" while
+        // exercising system memory. What it *does* test is real and worth
+        // saying: the path the iGPU reaches memory through.
+        let memory_kind = if crate::adapter::resolve(self.device)
+            .map(|a| a.uma)
+            .unwrap_or(false)
+        {
+            "shared (UMA, system RAM)"
+        } else {
+            "VRAM"
+        };
         let mut detail = format!(
-            "{} MiB VRAM ({} x {} MiB chunks), {passes} full pass(es), {:.1} GiB verified, ~{:.1} GiB/s",
+            "{} MiB {memory_kind} ({} x {} MiB chunks), {passes} full pass(es), {:.1} GiB verified, ~{:.1} GiB/s",
             tested_mb,
-            chunks.len(),
+            chunk_count,
             self.chunk_mb,
             gib_checked,
             rate
         );
+        if stopped_for_headroom {
+            detail.push_str(&format!(
+                "; stopped short of the requested {} MiB to keep {} MiB of system RAM free \
+                 (UMA: filling it would page the machine, not fail the card)",
+                self.vram_mb,
+                host_reserve / (1024 * 1024)
+            ));
+        }
+        // Reclaim, stated as a measurement. A pool that did not shrink is a real
+        // finding — the next stage is the one that will hit OOM because of it.
+        let freed = reserved_before.saturating_sub(reserved_after);
+        detail.push_str(&format!(
+            "; reclaimed {} MiB ({} MiB still reserved)",
+            freed / (1024 * 1024),
+            reserved_after / (1024 * 1024)
+        ));
+        if reserved_after > reserved_before / 2 && reserved_before > 64 * 1024 * 1024 {
+            detail.push_str("; WARNING: the device memory pool did not release — a later stage may hit OOM");
+        }
         if let Some(e) = &io_error {
             detail.push_str(&format!("; {e}"));
             errors += 1;

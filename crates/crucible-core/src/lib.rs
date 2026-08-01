@@ -29,6 +29,7 @@ pub mod gputel;
 pub mod json;
 pub mod kernel;
 pub mod markers;
+pub mod pcielink;
 pub mod report;
 pub mod rng;
 pub mod sysinfo;
