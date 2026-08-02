@@ -274,9 +274,18 @@ mod win {
             events: Vec::new(),
         };
 
-        // `timediff` is evaluated by the query engine against "now", which is
-        // exactly the run window we want and avoids any timezone handling.
-        let query = format!("*[System[TimeCreated[timediff(@SystemTime) <= {window_ms}]]]");
+        // ABSOLUTE time filter, not `timediff`.
+        //
+        // `timediff(@SystemTime) <= ms` is accepted by EvtQuery and then
+        // silently ignored on many channels. A field capture proved it: seven
+        // channels returned their entire contents, and 99% of every archive was
+        // events from twelve hours outside the run. `@SystemTime >= '<ISO>'` is
+        // honoured everywhere.
+        //
+        // Getting this wrong on THIS path is worse than on the archive: a stale
+        // WHEA entry from hours ago would fail a run that was clean.
+        let since = crate::clock::iso8601_utc_ago(window_ms);
+        let query = format!("*[System[TimeCreated[@SystemTime>='{since}']]]");
         let path = wide("System");
         let q = wide(&query);
 
@@ -359,6 +368,12 @@ mod win {
                 };
 
                 let time = attr(&xml, "SystemTime").unwrap_or("").to_string();
+                // Belt and braces: even with an absolute filter, never let an
+                // event from outside the window count toward a verdict. ISO-8601
+                // UTC sorts lexicographically, so this is a string compare.
+                if !time.is_empty() && time.as_str() < since.as_str() {
+                    continue;
+                }
                 let level: u32 = between(&xml, "<Level>", "</Level>")
                     .and_then(|s| s.trim().parse().ok())
                     .unwrap_or(0);
@@ -453,7 +468,10 @@ mod win {
         let channels = channel_paths();
         out.channels_total = channels.len();
 
-        let query = format!("*[System[TimeCreated[timediff(@SystemTime) <= {window_ms}]]]");
+        // Absolute, for the reason spelled out in `scan` above. The archive is
+        // where the failure was visible: 3 MB per run of which 99% predated it.
+        let since = crate::clock::iso8601_utc_ago(window_ms);
+        let query = format!("*[System[TimeCreated[@SystemTime>='{since}']]]");
         let q = wide(&query);
         let mut buf: Vec<u16> = vec![0; 16 * 1024];
 
@@ -528,6 +546,14 @@ mod win {
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(0);
                     let time = attr(&xml, "SystemTime").unwrap_or("").to_string();
+                    // Drop anything outside the window whatever the query did.
+                    // This is the guard that would have caught the shipped bug:
+                    // a channel ignoring the filter can no longer fill the
+                    // archive with history.
+                    if time.is_empty() || time.as_str() < since.as_str() {
+                        out.filtered_stale += 1;
+                        continue;
+                    }
                     let level: u32 = between(&xml, "<Level>", "</Level>")
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(0);
@@ -693,6 +719,10 @@ pub struct FullLog {
     /// The cap was hit and events were dropped. A capture that silently
     /// truncates reads as a quiet log.
     pub truncated: bool,
+    /// Records the channel returned that fell outside the run window and were
+    /// rejected here. Non-zero means a channel ignored the time filter — worth
+    /// surfacing, because that is exactly the failure that shipped once.
+    pub filtered_stale: usize,
 }
 
 impl FullLog {
@@ -708,7 +738,11 @@ impl FullLog {
                 String::new()
             },
             if self.truncated { " (TRUNCATED)" } else { "" }
-        )
+        ) + &if self.filtered_stale > 0 {
+            format!(", {} outside the window rejected", self.filtered_stale)
+        } else {
+            String::new()
+        }
     }
 
     /// Render the archive as JSONL.

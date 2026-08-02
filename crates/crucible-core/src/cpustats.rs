@@ -111,6 +111,13 @@ mod win {
 
     // --- PDH status / format constants ------------------------------------
     const ERROR_SUCCESS: u32 = 0;
+    /// Ceiling on a believable effective clock, MHz.
+    ///
+    /// No shipping x86 core runs here — the fastest stock boost is around 6.2
+    /// GHz and the all-time LN2 overclocking record is near 9.1 GHz, which is not
+    /// a QC bench. Anything above this is a counter artefact, not a CPU.
+    const MAX_PLAUSIBLE_MHZ: u32 = 8000;
+
     /// `PdhGetFormattedCounterArrayW`'s "buffer too small" sizing return.
     const PDH_MORE_DATA: u32 = 0x8000_07D2;
     const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
@@ -187,6 +194,9 @@ mod win {
 
     /// The live query plus the cached base MHz.
     pub(super) struct Query {
+        /// Whether the rate counters have had a real interval to accumulate
+        /// over. False until the first `sample`, which is discarded.
+        primed: bool,
         query: isize,
         h_perf: isize,
         h_time: isize,
@@ -243,10 +253,29 @@ mod win {
                 h_perf,
                 h_time,
                 base_mhz,
+                primed: false,
             })
         }
 
         pub(super) fn sample(&mut self) -> Vec<CoreStat> {
+            // The FIRST sample after `open` is thrown away.
+            //
+            // `% Processor Performance` is a rate counter: its value is the
+            // change since the previous collect, divided by the interval. `open`
+            // performs a priming collect, and the first `sample` follows it by
+            // microseconds — so the divisor is nearly zero and the ratio is
+            // nonsense. A field capture caught it: seven cores reported clocks
+            // between 6.7 GHz and 47.6 GHz, every one of them at t=0.001s, the
+            // very first row of the telemetry log.
+            //
+            // Discarding it costs one 250 ms sample and removes the whole class.
+            if !self.primed {
+                self.primed = true;
+                // SAFETY: valid open handle; the result is deliberately unused —
+                // this collect only establishes the interval for the next one.
+                unsafe { PdhCollectQueryData(self.query) };
+                return Vec::new();
+            }
             // Second/subsequent collect: yields the rate values accumulated since
             // the previous collect.
             // SAFETY: `self.query` is a valid open handle for this borrow.
@@ -284,12 +313,23 @@ mod win {
             let base = self.base_mhz as f64;
             rows.into_iter()
                 .enumerate()
-                .map(|(idx, (_key, (perf_pct, time_pct)))| CoreStat {
-                    core: idx as u32,
+                .filter_map(|(idx, (_key, (perf_pct, time_pct)))| {
                     // f64->u32 casts saturate, so a stray negative or huge value
                     // can't wrap; `max(0.0)` documents the intent.
-                    effective_mhz: (base * perf_pct / 100.0).round().max(0.0) as u32,
-                    util_pct: time_pct.clamp(0.0, 100.0) as f32,
+                    let mhz = (base * perf_pct / 100.0).round().max(0.0) as u32;
+                    // Defence in depth behind the priming fix above: a clock no
+                    // silicon runs at is not a measurement, and one bad sample
+                    // does more damage than a missing one — it rescales every
+                    // chart it appears on until the real data is a flat line at
+                    // the bottom.
+                    if mhz > MAX_PLAUSIBLE_MHZ {
+                        return None;
+                    }
+                    Some(CoreStat {
+                        core: idx as u32,
+                        effective_mhz: mhz,
+                        util_pct: time_pct.clamp(0.0, 100.0) as f32,
+                    })
                 })
                 .collect()
         }
@@ -510,8 +550,15 @@ mod tests {
             }));
         }
 
-        // Rate counters are computed between collects; wait between new()'s prime
-        // collect and this read so the values cover a real interval.
+        // The first `sample` is deliberately empty: it re-primes the rate
+        // counters so the NEXT one covers a real interval. Sampling once and
+        // trusting the result is exactly what produced 47 GHz readings in a field
+        // capture, so the contract is asserted here rather than assumed.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            cpu.sample().is_empty(),
+            "the first sample must be discarded, not reported"
+        );
         std::thread::sleep(Duration::from_millis(700));
         let stats = cpu.sample();
 
