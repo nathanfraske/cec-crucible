@@ -1707,10 +1707,10 @@ fn cmd_sensors(rest: &[String]) -> Result<u8, String> {
 
     // --- CPU package power / die temperature ------------------------------
     print!("CPU package power + die temp   ");
-    match crucible_core::hwinfo::HwInfo::open() {
+    match crucible_core::hwinfo::CpuFeed::open() {
         Some(h) => {
             let s = h.sample();
-            println!("AVAILABLE (HWiNFO shared memory)");
+            println!("AVAILABLE ({})", h.source().as_str());
             if let Some(l) = s.line() {
                 println!("    {l}");
             }
@@ -3092,7 +3092,7 @@ impl Runner {
     /// to do four times a second and changes far too slowly to need it.
     fn start_env_sampler(&mut self) {
         let platform = crucible_core::platform::Platform::open();
-        let hw = crucible_core::hwinfo::HwInfo::open();
+        let hw = crucible_core::hwinfo::CpuFeed::open();
         let drives = crucible_core::nvme::scan(MAX_DRIVES_PROBED);
 
         if platform.is_none() && hw.is_none() && drives.is_empty() {
@@ -3118,6 +3118,10 @@ impl Runner {
             // HWiNFO's own poll timestamp, to notice the feed freezing — the
             // free version stops publishing after ~12 minutes and a frozen
             // reading is indistinguishable from a steady one.
+            if let Some(h) = hw.as_ref() {
+                summary.lock().unwrap_or_else(|e| e.into_inner()).cpu.source =
+                    h.source().as_str().to_string();
+            }
             let mut last_poll = 0u64;
             let mut frozen_for = 0u32;
             let mut tick = 0u64;
@@ -3144,7 +3148,7 @@ impl Runner {
                         g.cpu.accumulate(&c);
                     }
                     if let Some(h) = hw.as_ref() {
-                        let now = h.poll_time();
+                        let now = h.heartbeat();
                         if now == last_poll {
                             frozen_for += 1;
                             // ~10s of an unchanging timestamp is a stopped feed,

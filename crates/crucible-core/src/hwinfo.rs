@@ -50,9 +50,10 @@ use crate::json::Json;
 const SIGNATURE: u32 = 0x4857_6953;
 
 /// Reading kinds, from the SDK's `SENSOR_READING_TYPE`.
-const TYPE_TEMPERATURE: u32 = 1;
-const TYPE_FAN: u32 = 3;
-const TYPE_POWER: u32 = 5;
+/// Shared with [`crate::lhm`], the other backend for this vocabulary.
+pub const TYPE_TEMPERATURE: u32 = 1;
+pub const TYPE_FAN: u32 = 3;
+pub const TYPE_POWER: u32 = 5;
 
 /// One sensor reading as HWiNFO publishes it.
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +132,8 @@ pub struct CpuSummary {
     /// timeout, or the daemon being closed. Reported, because a sensor plane
     /// that silently stops looks exactly like hardware that silently cooled.
     pub went_stale: bool,
+    /// Which daemon produced these numbers.
+    pub source: String,
 }
 
 impl CpuSummary {
@@ -182,7 +185,10 @@ impl CpuSummary {
             s.push_str(&format!(", VRM peak {:.0} °C", self.vrm_peak_c));
         }
         if self.went_stale {
-            s.push_str("  [SENSOR FEED STOPPED MID-RUN — HWiNFO free-version shared memory times out after ~12 min]");
+            s.push_str(
+                "  [SENSOR FEED STOPPED MID-RUN — the daemon stopped publishing; HWiNFO's free \
+                 version times out after ~12 min]",
+            );
         }
         if s.len() <= 9 {
             return None;
@@ -193,7 +199,14 @@ impl CpuSummary {
     pub fn to_json(&self) -> Json {
         let f = |v: f64| if v > 0.0 { Json::F64((v * 10.0).round() / 10.0) } else { Json::Null };
         let mut o = Json::object();
-        o.push("source", Json::str("HWiNFO shared memory"))
+        o.push(
+            "source",
+            Json::str(if self.source.is_empty() {
+                "unknown"
+            } else {
+                &self.source
+            }),
+        )
             .push("samples", Json::U64(self.samples))
             .push(
                 "package_power_avg_w",
@@ -225,7 +238,13 @@ pub fn select(readings: &[Reading]) -> CpuSensors {
     // Power, best match first. `Package Power` beats `PPT` beats anything else
     // containing both "CPU" and "Power", so a board that publishes several does
     // not hand us the wrong one.
-    for want in ["cpu package power", "cpu ppt", "package power"] {
+    // Most specific first. The two daemons name the same sensor differently:
+    // HWiNFO says "CPU Package Power", LibreHardwareMonitor says just "CPU
+    // Package" and relies on the metric being a power metric. Matching the bare
+    // "cpu package" is only safe because the kind filter above has already
+    // excluded every temperature — which is exactly what the
+    // `a_temperature_is_never_mistaken_for_a_power_reading` test pins.
+    for want in ["cpu package power", "cpu ppt", "cpu package", "package power"] {
         if out.package_power_w.is_some() {
             break;
         }
@@ -342,9 +361,99 @@ impl HwInfo {
 
 /// What to tell an operator who wants CPU power and has no daemon running.
 pub const SETUP_HINT: &str = "CPU package power and die temperature need a sensor daemon: they live \
-in model-specific registers that only a kernel driver can read, and this tool deliberately ships \
-none. Install HWiNFO (free), run it in Sensors-only mode, and enable Settings -> Shared Memory \
-Support. Note the free version stops publishing shared memory after ~12 minutes per session.";
+in model-specific registers only a kernel driver can read, and this tool deliberately ships none. \
+Install both of these once per machine, then re-run:\n      \
+winget install -e --id namazso.PawnIO\n      \
+winget install -e --id LibreHardwareMonitor.LibreHardwareMonitor\n    \
+cec-crucible configures and starts LibreHardwareMonitor itself from there. (HWiNFO also works if \
+you already run it with Shared Memory Support ticked, but that checkbox cannot be automated and \
+its free version stops publishing after ~12 minutes.)";
+
+/// Where a CPU sensor reading came from, so a report can say which daemon
+/// produced its numbers rather than presenting them as if from nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Lhm,
+    HwInfo,
+}
+
+impl Source {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Source::Lhm => "LibreHardwareMonitor (PawnIO)",
+            Source::HwInfo => "HWiNFO shared memory",
+        }
+    }
+}
+
+/// A live CPU sensor feed, whichever daemon is providing it.
+///
+/// LibreHardwareMonitor is preferred and tried first: it can be configured and
+/// started without a human, which HWiNFO's GUI-only shared-memory checkbox
+/// cannot. HWiNFO remains supported for machines that already run it.
+pub enum CpuFeed {
+    Lhm(u16),
+    HwInfo(Box<HwInfo>),
+}
+
+impl CpuFeed {
+    /// Find a feed, starting one if the machinery is installed but idle.
+    pub fn open() -> Option<CpuFeed> {
+        // Already answering? Use it and change nothing about the machine.
+        if crate::lhm::available(crate::lhm::DEFAULT_PORT) {
+            return Some(CpuFeed::Lhm(crate::lhm::DEFAULT_PORT));
+        }
+        // Installed but not serving: configure and start it. This is the step
+        // that makes the feature work from a downloaded package rather than
+        // from a technician's memory.
+        if let Some(exe) = crate::lhm::locate() {
+            let _ = crate::lhm::configure(&exe, crate::lhm::DEFAULT_PORT);
+            if crate::lhm::launch(&exe) {
+                // It enumerates every sensor on the machine before serving, so
+                // give it a moment rather than declaring failure immediately.
+                for _ in 0..30 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if crate::lhm::available(crate::lhm::DEFAULT_PORT) {
+                        return Some(CpuFeed::Lhm(crate::lhm::DEFAULT_PORT));
+                    }
+                }
+            }
+        }
+        HwInfo::open().map(|h| CpuFeed::HwInfo(Box::new(h)))
+    }
+
+    pub fn source(&self) -> Source {
+        match self {
+            CpuFeed::Lhm(_) => Source::Lhm,
+            CpuFeed::HwInfo(_) => Source::HwInfo,
+        }
+    }
+
+    pub fn readings(&self) -> Vec<Reading> {
+        match self {
+            CpuFeed::Lhm(port) => crate::lhm::read(*port).unwrap_or_default(),
+            CpuFeed::HwInfo(h) => h.readings(),
+        }
+    }
+
+    pub fn sample(&self) -> CpuSensors {
+        select(&self.readings())
+    }
+
+    /// A monotonically-changing value used to notice the feed freezing. HWiNFO
+    /// publishes its own poll timestamp; for LHM the readings themselves are the
+    /// evidence, so their sum stands in.
+    pub fn heartbeat(&self) -> u64 {
+        match self {
+            CpuFeed::Lhm(_) => self
+                .readings()
+                .iter()
+                .map(|r| r.value.to_bits())
+                .fold(0u64, |a, b| a.rotate_left(7) ^ b),
+            CpuFeed::HwInfo(h) => h.poll_time(),
+        }
+    }
+}
 
 #[cfg(windows)]
 mod win {
@@ -593,6 +702,7 @@ mod tests {
             ..Default::default()
         });
         sum.went_stale = true;
+        sum.source = "test".into();
         let l = sum.line().unwrap();
         assert!(l.contains("SENSOR FEED STOPPED"), "{l}");
         assert!(sum.to_json().to_compact().contains("\"feed_stopped_mid_run\":true"));

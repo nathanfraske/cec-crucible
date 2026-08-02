@@ -30,6 +30,7 @@ pub mod json;
 pub mod kernel;
 pub mod markers;
 pub mod hwinfo;
+pub mod lhm;
 pub mod nvme;
 pub mod pcielink;
 pub mod platform;

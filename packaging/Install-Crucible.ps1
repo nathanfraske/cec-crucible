@@ -31,6 +31,8 @@
 param(
     [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\cec-crucible'),
     [switch] $NoShortcuts,
+    # Skip the optional CPU-sensor daemon install (PawnIO + LibreHardwareMonitor).
+    [switch] $NoCpuSensors,
     [switch] $Uninstall
 )
 
@@ -157,6 +159,51 @@ Write-Host ""
 Write-Host "  Detected GPUs:" -ForegroundColor Cyan
 $gpu | ForEach-Object { Write-Host "    $_" }
 
+
+# --- Optional: CPU package power + die temperature ------------------------
+#
+# These live in model-specific registers that only ring 0 can read, so a sensor
+# daemon has to do it. cec-crucible ships no driver of its own deliberately: the
+# common one, WinRing0, is on Microsoft's vulnerable-driver blocklist and is now
+# flagged by Defender. LibreHardwareMonitor 0.9.5+ uses PawnIO instead - signed,
+# open source, and sandboxed - and keeps its settings in a plain config file, so
+# cec-crucible can configure and start it without anyone clicking anything.
+#
+# Offered, never forced: this puts a kernel module on the machine, and that
+# should be a decision somebody makes rather than a side effect of an install.
+if (-not $NoCpuSensors) {
+    Write-Host ""
+    Write-Host "  Optional: CPU package power + die temperature" -ForegroundColor White
+    Write-Host "    Needs a sensor daemon (they live in ring-0 registers)." -ForegroundColor Gray
+    Write-Host "    Installs PawnIO (signed, sandboxed kernel module) and" -ForegroundColor Gray
+    Write-Host "    LibreHardwareMonitor. cec-crucible starts and reads them itself." -ForegroundColor Gray
+    Write-Host "    Everything else - SSD temps, board zones, GPU power - already" -ForegroundColor Gray
+    Write-Host "    works without this." -ForegroundColor Gray
+    Write-Host ""
+
+    $haveWinget = $null -ne (Get-Command winget -ErrorAction SilentlyContinue)
+    if (-not $haveWinget) {
+        Write-Warn2 "winget not found - skipping. Install manually from pawnio.eu and"
+        Write-Warn2 "  github.com/LibreHardwareMonitor/LibreHardwareMonitor if you want CPU power."
+    } else {
+        $ans = Read-Host "    Install them now? [y/N]"
+        if ($ans -match '^(y|yes)$') {
+            foreach ($pkg in @('namazso.PawnIO','LibreHardwareMonitor.LibreHardwareMonitor')) {
+                Write-Step "installing $pkg ..."
+                # Elevation is requested by the package installers themselves.
+                & winget install -e --id $pkg --accept-package-agreements --accept-source-agreements | Out-Null
+                if ($LASTEXITCODE -eq 0) { Write-Ok "$pkg installed" }
+                else { Write-Warn2 "$pkg did not install cleanly (exit $LASTEXITCODE)" }
+            }
+            Write-Host ""
+            Write-Ok "Run cec-crucible AS ADMINISTRATOR for CPU sensors - PawnIO needs it."
+            Write-Host "    Check with:  cec-crucible sensors" -ForegroundColor Gray
+        } else {
+            Write-Host "    Skipped. 'cec-crucible sensors' will tell you how to add it later." -ForegroundColor DarkGray
+        }
+    }
+}
+
 Write-Host ""
 Write-Ok "Installed."
 Write-Host ""
@@ -168,6 +215,7 @@ Write-Host "  A few things to try:" -ForegroundColor White
 Write-Host "    cec-crucible info                 system + device identity" -ForegroundColor Gray
 Write-Host "    cec-crucible run quick            ~15s CPU/RAM/storage QC" -ForegroundColor Gray
 Write-Host "    cec-crucible benchmark            graphics composite score" -ForegroundColor Gray
+Write-Host "    cec-crucible sensors              what this machine can measure" -ForegroundColor Gray
 Write-Host "    cec-crucible run worst-case --ui  everything at once, live dashboard" -ForegroundColor Gray
 Write-Host ""
 Write-Host "  Uninstall:  powershell -ExecutionPolicy Bypass -File Install-Crucible.ps1 -Uninstall" -ForegroundColor DarkGray

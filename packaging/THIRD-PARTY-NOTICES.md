@@ -46,3 +46,36 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ---
 
 cec-crucible itself is MIT licensed — see `LICENSE`.
+
+
+## Optional CPU sensor daemons (NOT bundled)
+
+cec-crucible reads CPU package power and die temperature from a sensor daemon
+rather than shipping a kernel driver of its own. Neither of these is included in
+this package; the installer offers to fetch them via `winget`, and both are
+removable independently.
+
+**LibreHardwareMonitor** — Mozilla Public License 2.0.
+<https://github.com/LibreHardwareMonitor/LibreHardwareMonitor>
+Preferred backend. cec-crucible writes two keys into its config file
+(`runWebServerMenuItem`, `listenerIp=127.0.0.1`) and reads its local `/metrics`
+endpoint. The listener is bound to loopback deliberately.
+
+**PawnIO** — <https://pawnio.eu/> · <https://github.com/namazso/PawnIO>
+The signed, sandboxed kernel module LibreHardwareMonitor 0.9.5+ uses in place of
+WinRing0. Required for CPU power/temperature; without it LHM runs but reports no
+CPU sensors.
+
+**HWiNFO** — <https://www.hwinfo.com/> (freeware, not redistributed).
+Supported as an alternative backend via its documented shared-memory interface,
+for machines that already run it with Shared Memory Support enabled.
+
+### Why no driver is bundled
+
+CPU package power and die temperature live in model-specific registers readable
+only from ring 0. The driver most monitoring tools have historically used,
+WinRing0, carries a privilege-escalation CVE, sits on Microsoft's
+vulnerable-driver blocklist, and is now flagged by Defender as
+`VulnerableDriver:WinNT/Winring0`. Shipping it would leave an exploitable driver
+on every machine this tool touches. PawnIO is a deliberate, removable choice the
+operator makes.
