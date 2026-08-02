@@ -226,9 +226,9 @@ mod win_elevation {
         // the same symbol with different signatures is a real hazard, not a
         // style point: the linker keeps one and the other becomes a silent
         // type-confusion at the call site.
-        fn OpenProcessToken(process: isize, access: u32, token: *mut *mut c_void) -> i32;
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
         fn GetTokenInformation(
-            token: *mut c_void,
+            token: isize,
             class: u32,
             info: *mut c_void,
             len: u32,
@@ -239,14 +239,14 @@ mod win_elevation {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetCurrentProcess() -> isize;
-        fn CloseHandle(h: *mut c_void) -> i32;
+        fn CloseHandle(h: isize) -> i32;
     }
 
     pub(super) fn is_elevated() -> bool {
         // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no close;
         // the token handle is closed on every path out.
         unsafe {
-            let mut token: *mut c_void = std::ptr::null_mut();
+            let mut token: isize = 0;
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
                 return false;
             }

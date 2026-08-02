@@ -93,7 +93,33 @@ pub struct LaneSnap {
 /// `core N` rows (and standalone `cpu N` rows), blank on other lanes.
 pub fn telemetry_csv_header() -> &'static str {
     "elapsed_s,lane,work,phase,errors,hash_hex,eff_mhz,util_pct,\
-gpu_power_w,gpu_temp_c,gpu_mem_temp_c,gpu_fan_pct,gpu_sm_mhz,gpu_throttle\n"
+gpu_power_w,gpu_temp_c,gpu_mem_temp_c,gpu_fan_pct,gpu_sm_mhz,gpu_throttle,\
+board_zone_c,system_power_w,disk_temp_c\n"
+}
+
+/// The platform sensors that are readable without a kernel driver: an ACPI
+/// board zone, a system power meter where the firmware has one, and the warmest
+/// NVMe drive. Deliberately NOT a CPU die temperature or a DIMM temperature —
+/// see `crucible_core::platform` for why those cannot be had honestly.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EnvSample {
+    pub board_zone_c: Option<f64>,
+    pub system_power_w: Option<f64>,
+    pub disk_temp_c: Option<i32>,
+}
+
+/// Same rule as the GPU columns: absent means blank, never zero. A 0 °C drive
+/// or a 0 W system would both plot as real measurements.
+fn env_cols(e: Option<&EnvSample>) -> String {
+    match e {
+        Some(v) => format!(
+            "{},{},{}",
+            v.board_zone_c.map(|c| format!("{c:.1}")).unwrap_or_default(),
+            v.system_power_w.map(|w| format!("{w:.1}")).unwrap_or_default(),
+            v.disk_temp_c.map(|c| c.to_string()).unwrap_or_default(),
+        ),
+        None => ",,".to_string(),
+    }
 }
 
 /// GPU sensor columns for one sample, or empty cells when no GPU telemetry is
@@ -147,6 +173,7 @@ pub fn telemetry_csv_rows(
     lanes: &[LaneSnap],
     cpu: &[CoreStat],
     gpu: Option<&GpuSample>,
+    env: Option<&EnvSample>,
 ) -> String {
     use std::collections::{BTreeMap, BTreeSet};
     let by_core: BTreeMap<u32, &CoreStat> = cpu.iter().map(|c| (c.core, c)).collect();
@@ -170,11 +197,12 @@ pub fn telemetry_csv_rows(
             None => (String::new(), String::new()),
         };
         s.push_str(&format!(
-            "{elapsed_s:.3},{label},{},{phase},{},{:#018x},{mhz},{util},{g}\n",
+            "{elapsed_s:.3},{label},{},{phase},{},{:#018x},{mhz},{util},{g},{e}\n",
             l.work,
             l.errors,
             l.hash,
-            g = gpu_cols(gpu)
+            g = gpu_cols(gpu),
+            e = env_cols(env)
         ));
     }
 
@@ -183,11 +211,12 @@ pub fn telemetry_csv_rows(
     for (core, cs) in &by_core {
         if !charted.contains(core) {
             s.push_str(&format!(
-                "{elapsed_s:.3},cpu {core},0,idle,0,{:#018x},{},{:.1},{g}\n",
+                "{elapsed_s:.3},cpu {core},0,idle,0,{:#018x},{},{:.1},{g},{e}\n",
                 0u64,
                 cs.effective_mhz,
                 cs.util_pct,
-                g = gpu_cols(gpu)
+                g = gpu_cols(gpu),
+                e = env_cols(env)
             ));
         }
     }
@@ -430,7 +459,7 @@ mod tests {
             CoreStat { core: 0, effective_mhz: 4800, util_pct: 99.5 },
             CoreStat { core: 1, effective_mhz: 1200, util_pct: 3.0 },
         ];
-        let out = telemetry_csv_rows(1.5, &lanes, &cpu, None);
+        let out = telemetry_csv_rows(1.5, &lanes, &cpu, None, None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3, "core 0 + mem + backfilled cpu 1");
 
@@ -479,7 +508,7 @@ mod tests {
             throttle: 0x4,
             ..Default::default()
         };
-        let out = telemetry_csv_rows(2.0, &[snap("gpu", 9, PHASE_WORK)], &[], Some(&g));
+        let out = telemetry_csv_rows(2.0, &[snap("gpu", 9, PHASE_WORK)], &[], Some(&g), None);
         let line = out.lines().next().unwrap();
         let field = |name: &str| -> String {
             let hdr: Vec<&str> = telemetry_csv_header().trim().split(',').collect();
@@ -506,7 +535,7 @@ mod tests {
         // The flip side: when the board DOES have the sensor, the value must
         // survive — the blank-if-zero rule must not swallow real readings.
         let g = GpuSample { mem_temp_c: 94, ..Default::default() };
-        let out = telemetry_csv_rows(1.0, &[snap("gpu", 1, PHASE_WORK)], &[], Some(&g));
+        let out = telemetry_csv_rows(1.0, &[snap("gpu", 1, PHASE_WORK)], &[], Some(&g), None);
         let line = out.lines().next().unwrap();
         let hdr: Vec<&str> = telemetry_csv_header().trim().split(',').collect();
         let i = hdr.iter().position(|h| *h == "gpu_mem_temp_c").unwrap();
@@ -515,7 +544,7 @@ mod tests {
 
     #[test]
     fn telemetry_csv_blank_cpu_columns_without_pdh() {
-        let out = telemetry_csv_rows(0.0, &[snap("core 0", 1, PHASE_WORK)], &[], None);
+        let out = telemetry_csv_rows(0.0, &[snap("core 0", 1, PHASE_WORK)], &[], None, None);
         assert_eq!(out.lines().count(), 1, "no PDH -> no backfill rows");
         let want = telemetry_csv_header().trim().split(',').count();
         assert_eq!(out.lines().next().unwrap().split(',').count(), want);

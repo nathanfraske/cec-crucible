@@ -91,6 +91,18 @@ const EVENT_ARCHIVE_MARGIN_MS: u64 = 60 * 1000;
 /// silent.
 const MAX_ARCHIVED_EVENTS: usize = 20_000;
 
+/// How many `\\.\PhysicalDriveN` slots to probe for NVMe health. Non-NVMe and
+/// absent drives decline immediately, so this only bounds the walk.
+const MAX_DRIVES_PROBED: u32 = 8;
+
+/// The non-GPU sensor planes, accumulated together because they share a thread.
+#[derive(Default)]
+struct EnvSummaries {
+    platform: crucible_core::platform::PlatformSummary,
+    cpu: crucible_core::hwinfo::CpuSummary,
+    drives: Vec<crucible_core::nvme::NvmeHealth>,
+}
+
 const COMMON_BOOLS: &[&str] = &[
     "json",
     "no-report",
@@ -114,6 +126,7 @@ const COMMON_BOOLS: &[&str] = &[
     "no-graph",
     "etw",
     "open",
+    "all",
 ];
 
 /// Options recognized for the GPU kernel (accepted even in non-GPU builds so
@@ -155,6 +168,8 @@ COMMANDS:
     info                 Print device id, CPU, memory and QPC info, then exit.
     drives               List fixed physical drives (NVMe/SATA), then exit.
     gpu-info             List usable GPUs, then exit.            [--features gpu]
+    sensors [--all]      What each sensor plane can and cannot report on this
+                         machine, and what to install for the ones it cannot.
     package [--open]     Build the per-machine index page for --out (every run
                          for one box: verdicts, charts, and every artifact
                          linked), and open it in a browser with --open.
@@ -402,6 +417,7 @@ fn run(argv: &[String]) -> Result<u8, String> {
         "drives" => cmd_drives(rest),
         "gpu-info" => cmd_gpu_info(rest),
         "package" => cmd_package(rest),
+        "sensors" => cmd_sensors(rest),
         "cpu" => cmd_cpu(rest),
         "mem" => cmd_mem(rest),
         "uncore" => cmd_uncore(rest),
@@ -1677,6 +1693,90 @@ selectors:");
 // run <profile>
 // ---------------------------------------------------------------------------
 
+/// `sensors` — what this machine will and will not tell us, plane by plane.
+///
+/// Exists because "why is there no CPU power in my report" is otherwise a
+/// research project. Every plane reports its state explicitly, including the
+/// ones that are structurally impossible, so an operator can tell "not
+/// installed" from "not supported" from "needs elevation" at a glance.
+fn cmd_sensors(rest: &[String]) -> Result<u8, String> {
+    let p = Parsed::parse(rest, COMMON_BOOLS)?;
+    p.reject_unknown(&["help", "all"])?;
+
+    println!("sensor planes on this machine\n");
+
+    // --- CPU package power / die temperature ------------------------------
+    print!("CPU package power + die temp   ");
+    match crucible_core::hwinfo::HwInfo::open() {
+        Some(h) => {
+            let s = h.sample();
+            println!("AVAILABLE (HWiNFO shared memory)");
+            if let Some(l) = s.line() {
+                println!("    {l}");
+            }
+            if p.has("all") {
+                for r in h.readings().iter().filter(|r| r.value != 0.0) {
+                    println!("    [{}] {} = {} {}", r.sensor, r.label, r.value, r.unit);
+                }
+            }
+        }
+        None => {
+            println!("NOT AVAILABLE");
+            println!("    {}", crucible_core::hwinfo::SETUP_HINT);
+        }
+    }
+
+    // --- ACPI zones / system power ----------------------------------------
+    print!("\nboard thermal zones            ");
+    match crucible_core::platform::Platform::open() {
+        Some(pl) => {
+            let s = pl.sample();
+            match s.zone_c {
+                Some(c) => println!(
+                    "AVAILABLE — {c:.1} °C across {} zone(s)\n    a chassis/board sensor, NOT the CPU die",
+                    s.zones
+                ),
+                None => println!("counters present but no zone reported a temperature"),
+            }
+            match s.power_w {
+                Some(w) => println!("system power meter             AVAILABLE — {w:.1} W (ACPI EMI)"),
+                None => println!(
+                    "system power meter             NOT AVAILABLE\n    \
+                     no ACPI Energy Metering Interface; normal on desktops, common on laptops"
+                ),
+            }
+        }
+        None => println!("NOT AVAILABLE (no PDH thermal-zone counters)"),
+    }
+
+    // --- Drives ------------------------------------------------------------
+    println!("\nNVMe drive health              ");
+    let drives = crucible_core::nvme::scan(MAX_DRIVES_PROBED);
+    if drives.is_empty() {
+        println!("    none readable (no NVMe drive, or the driver declined the health log)");
+    } else {
+        for d in &drives {
+            println!("    {}", d.line());
+            if p.has("all") && !d.sensors_c.is_empty() {
+                println!("        sensors: {:?} °C", d.sensors_c);
+            }
+        }
+    }
+    println!(
+        "    NVMe reports power STATES, not watts — there is no drive wattage to read."
+    );
+
+    // --- The ones that cannot be had --------------------------------------
+    println!("\nnot obtainable without a kernel driver, and deliberately not shipped:");
+    println!("    RAM temperature   DDR4 TS / DDR5 PMIC sit behind the SMBus.");
+    println!("    RAM power         same bus, same problem.");
+    println!("        Both DO appear above if HWiNFO is running and the board exposes them.");
+    println!("    CPU die temp / package power via MSRs directly — WinRing0-class drivers are");
+    println!("        on Microsoft's vulnerable-driver blocklist and blocked by HVCI. This tool");
+    println!("        reads a daemon the operator installed instead of leaving one behind.");
+    Ok(0)
+}
+
 /// `package` — build (and optionally open) the index page for a machine.
 ///
 /// Separate from a run because the moment you want it is usually *after* the
@@ -2338,6 +2438,13 @@ struct Runner {
     gpu_latest: Arc<Mutex<Option<crucible_core::gputel::GpuSample>>>,
     gpu_stop: Option<Arc<AtomicBool>>,
     gpu_handle: Option<JoinHandle<()>>,
+    /// Platform sensors (ACPI zones, EMI power), the HWiNFO bridge (CPU package
+    /// power / die temp / DIMMs) and NVMe drive health. Sampled on the same
+    /// thread as the GPU so there is one cadence and one place to stop.
+    env_summary: Arc<Mutex<EnvSummaries>>,
+    env_latest: Arc<Mutex<Option<crucible_core::markers::EnvSample>>>,
+    env_stop: Option<Arc<AtomicBool>>,
+    env_handle: Option<JoinHandle<()>>,
     /// Live ETW capture, owned by the Runner so its stats land in the report
     /// BEFORE the report is written (a capture finished by the caller
     /// afterwards would always be too late).
@@ -2458,6 +2565,10 @@ impl Runner {
             gpu_latest: Arc::new(Mutex::new(None)),
             gpu_stop: None,
             gpu_handle: None,
+            env_summary: Arc::new(Mutex::new(EnvSummaries::default())),
+            env_latest: Arc::new(Mutex::new(None)),
+            env_stop: None,
+            env_handle: None,
             #[cfg(all(windows, feature = "gpu"))]
             pm: None,
             pm_seconds: p.get_u64("seconds").ok().flatten().unwrap_or(60),
@@ -2848,6 +2959,8 @@ impl Runner {
             }));
         }
 
+        self.start_env_sampler();
+
         // Arm the OS-level ETW capture. This goes last in begin() so the trace
         // brackets the load as tightly as possible rather than the setup.
         #[cfg(windows)]
@@ -2957,8 +3070,9 @@ impl Runner {
                         let markers = Arc::clone(&self.markers);
                         let start = Instant::now();
                         let gpu_latest = Arc::clone(&self.gpu_latest);
+                        let env_latest = Arc::clone(&self.env_latest);
                         self.telemetry_handle = Some(std::thread::spawn(move || {
-                            telemetry_loop(&path, markers, stop_c, start, gpu_latest)
+                            telemetry_loop(&path, markers, stop_c, start, gpu_latest, env_latest)
                         }));
                         self.telemetry_stop = Some(stop);
                     }
@@ -2968,6 +3082,92 @@ impl Runner {
                 ),
             }
         }
+    }
+
+    /// Sample the non-GPU sensor planes for the length of the run.
+    ///
+    /// Three sources with very different costs, so three cadences: the ACPI/EMI
+    /// counters are cheap PDH reads, HWiNFO's table is a shared-memory walk, and
+    /// NVMe health opens a device handle per drive — which is far too expensive
+    /// to do four times a second and changes far too slowly to need it.
+    fn start_env_sampler(&mut self) {
+        let platform = crucible_core::platform::Platform::open();
+        let hw = crucible_core::hwinfo::HwInfo::open();
+        let drives = crucible_core::nvme::scan(MAX_DRIVES_PROBED);
+
+        if platform.is_none() && hw.is_none() && drives.is_empty() {
+            return; // nothing to sample; say nothing rather than sample nothing
+        }
+        if hw.is_none() {
+            // The one plane an operator can do something about, so tell them.
+            eprintln!("note: no CPU package power/temperature — {}",
+                      crucible_core::hwinfo::SETUP_HINT);
+        }
+
+        {
+            let mut g = self.env_summary.lock().unwrap_or_else(|e| e.into_inner());
+            g.drives = drives;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        let summary = Arc::clone(&self.env_summary);
+        let latest = Arc::clone(&self.env_latest);
+        self.env_stop = Some(stop);
+        self.env_handle = Some(std::thread::spawn(move || {
+            // HWiNFO's own poll timestamp, to notice the feed freezing — the
+            // free version stops publishing after ~12 minutes and a frozen
+            // reading is indistinguishable from a steady one.
+            let mut last_poll = 0u64;
+            let mut frozen_for = 0u32;
+            let mut tick = 0u64;
+            let mut drive_temp: Option<i32> = None;
+            while !s2.load(Ordering::SeqCst) {
+                let p = platform.as_ref().map(|p| p.sample()).unwrap_or_default();
+                let c = hw.as_ref().map(|h| h.sample()).unwrap_or_default();
+
+                // Drive health every ~8s: it opens handles, and an SSD's
+                // temperature does not move meaningfully faster than that.
+                if tick % 32 == 0 {
+                    let ds = crucible_core::nvme::scan(MAX_DRIVES_PROBED);
+                    drive_temp = ds.iter().map(|d| d.temp_c).max();
+                    if !ds.is_empty() {
+                        summary.lock().unwrap_or_else(|e| e.into_inner()).drives = ds;
+                    }
+                }
+                tick += 1;
+
+                {
+                    let mut g = summary.lock().unwrap_or_else(|e| e.into_inner());
+                    g.platform.accumulate(&p);
+                    if c.any() {
+                        g.cpu.accumulate(&c);
+                    }
+                    if let Some(h) = hw.as_ref() {
+                        let now = h.poll_time();
+                        if now == last_poll {
+                            frozen_for += 1;
+                            // ~10s of an unchanging timestamp is a stopped feed,
+                            // not a slow one.
+                            if frozen_for > 40 {
+                                g.cpu.went_stale = true;
+                            }
+                        } else {
+                            frozen_for = 0;
+                            last_poll = now;
+                        }
+                    }
+                }
+
+                *latest.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crucible_core::markers::EnvSample {
+                        board_zone_c: p.zone_c,
+                        system_power_w: c.package_power_w.or(p.power_w),
+                        disk_temp_c: drive_temp,
+                    });
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }));
     }
 
     fn run_one(&mut self, kernel: &dyn LoadKernel, budget: &Budget, mode: &str) {
@@ -3100,9 +3300,27 @@ impl Runner {
             }
         }
 
-        // Stop the GPU sampler and fold its summary into the report.
+        // Stop the samplers and fold their summaries into the report.
         if let Some(stop) = self.gpu_stop.take() {
             stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(stop) = self.env_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(h) = self.env_handle.take() {
+            let _ = h.join();
+        }
+        {
+            let e = self.env_summary.lock().unwrap_or_else(|x| x.into_inner());
+            if e.platform.samples > 0 {
+                self.report.platform = Some(e.platform.clone());
+            }
+            if e.cpu.samples > 0 {
+                self.report.cpu_sensors = Some(e.cpu.clone());
+            }
+            if !e.drives.is_empty() {
+                self.report.drives = e.drives.clone();
+            }
         }
         if let Some(h) = self.gpu_handle.take() {
             let _ = h.join();
@@ -3257,6 +3475,19 @@ impl Runner {
             // that came in low without a single error.
             if let Some(g) = &self.report.gpu {
                 println!("{}", g.line());
+            }
+            if let Some(c) = &self.report.cpu_sensors {
+                if let Some(l) = c.line() {
+                    println!("{l}");
+                }
+            }
+            if let Some(pl) = &self.report.platform {
+                if let Some(l) = pl.line() {
+                    println!("{l}");
+                }
+            }
+            for d in &self.report.drives {
+                println!("{}", d.line());
             }
             if let Some(t) = &self.report.etw {
                 println!("{}", t.line);
@@ -3593,6 +3824,7 @@ fn telemetry_loop(
     stop: Arc<AtomicBool>,
     start: Instant,
     gpu: Arc<Mutex<Option<crucible_core::gputel::GpuSample>>>,
+    env: Arc<Mutex<Option<crucible_core::markers::EnvSample>>>,
 ) {
     use std::io::Write;
     // Sampling on a fixed cadence only means something if we actually get
@@ -3626,10 +3858,17 @@ fn telemetry_loop(
         // The GPU sensor thread publishes its latest sample here; we copy it out
         // under the lock rather than holding it across the write.
         let gpu_now = gpu.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let env_now = *env.lock().unwrap_or_else(|e| e.into_inner());
         if w
             .write_all(
-                telemetry_csv_rows(el, &markers.live_snapshot(), &cpu_stats, gpu_now.as_ref())
-                    .as_bytes(),
+                telemetry_csv_rows(
+                    el,
+                    &markers.live_snapshot(),
+                    &cpu_stats,
+                    gpu_now.as_ref(),
+                    env_now.as_ref(),
+                )
+                .as_bytes(),
             )
             .is_err()
         {

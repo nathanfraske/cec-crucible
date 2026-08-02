@@ -143,6 +143,14 @@ pub struct Report {
     pub present: Option<PresentSummary>,
     /// GPU sensor summary (NVML): peak power, peak temps, throttle reasons.
     pub gpu: Option<crate::gputel::GpuSummary>,
+    /// CPU package power / die temperature / DIMM temperatures, via the HWiNFO
+    /// bridge. `None` when no sensor daemon is running — which is the common
+    /// case and is reported as absent, never as zero.
+    pub cpu_sensors: Option<crate::hwinfo::CpuSummary>,
+    /// ACPI board zones and, where the firmware has one, a system power meter.
+    pub platform: Option<crate::platform::PlatformSummary>,
+    /// NVMe drive health: temperature, endurance, media errors.
+    pub drives: Vec<crate::nvme::NvmeHealth>,
     /// OS-level ETW trace (`--etw`, via Windows Performance Recorder). Carried
     /// as an opaque record — the `.etl` is the artifact; this says whether one
     /// exists, where, and why not when it does not.
@@ -169,6 +177,9 @@ impl Report {
             events: None,
             present: None,
             gpu: None,
+            cpu_sensors: None,
+            platform: None,
+            drives: Vec::new(),
             etw: None,
         }
     }
@@ -250,6 +261,18 @@ impl Report {
         }
         if let Some(g) = &self.gpu {
             root.push("gpu", g.to_json());
+        }
+        if let Some(c) = &self.cpu_sensors {
+            root.push("cpu_sensors", c.to_json());
+        }
+        if let Some(pl) = &self.platform {
+            root.push("platform", pl.to_json());
+        }
+        if !self.drives.is_empty() {
+            root.push(
+                "drives",
+                Json::Array(self.drives.iter().map(|d| d.to_json()).collect()),
+            );
         }
         if let Some(t) = &self.etw {
             root.push("etw", t.json.clone());
