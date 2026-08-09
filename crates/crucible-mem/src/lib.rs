@@ -44,6 +44,10 @@ pub const DEFAULT_FRACTION: f64 = 0.5;
 pub const FRACTION_MAX: f64 = -1.0;
 /// Fallback buffer size when available memory can't be queried.
 const FALLBACK_BYTES: u64 = 256 * 1024 * 1024;
+/// Smallest span the headroom cap may reduce a request to. Small enough to fit
+/// on a machine under real pressure, large enough that a pass still means
+/// something.
+const MIN_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 /// Stop responsiveness: check the stop flag / deadline every this many words.
 const CHECK_STRIDE: usize = 1 << 18;
 
@@ -104,8 +108,15 @@ impl MemKernel {
         // resident. This applies to an explicit `--mb 60000` too: the operator
         // asking for more than exists should get the largest honest test, not a
         // frozen desktop.
+        //
+        // But the cap has a FLOOR. A machine already inside its working-set
+        // reserve reports a budget of zero, and capping to zero turned a modest
+        // explicit request into "resolved buffer size is zero" — refusing to
+        // test at all on exactly the machine most worth testing. The reserve
+        // exists to stop us committing *everything*, not to forbid allocating
+        // anything.
         let capped = match sysinfo::safe_test_budget_bytes() {
-            Some(budget) => bytes.min(budget),
+            Some(budget) => bytes.min(budget.max(MIN_BUFFER_BYTES)),
             None => bytes,
         };
         capped.max(1) / 8 // bytes -> u64 words

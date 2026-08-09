@@ -360,14 +360,14 @@ impl HwInfo {
 }
 
 /// What to tell an operator who wants CPU power and has no daemon running.
-pub const SETUP_HINT: &str = "CPU package power and die temperature need a sensor daemon: they live \
-in model-specific registers only a kernel driver can read, and this tool deliberately ships none. \
-Install both of these once per machine, then re-run:\n      \
-winget install -e --id namazso.PawnIO\n      \
-winget install -e --id LibreHardwareMonitor.LibreHardwareMonitor\n    \
-cec-crucible configures and starts LibreHardwareMonitor itself from there. (HWiNFO also works if \
-you already run it with Shared Memory Support ticked, but that checkbox cannot be automated and \
-its free version stops publishing after ~12 minutes.)";
+pub const SETUP_HINT: &str = "CPU package power and die temperature live in model-specific \
+registers that only a kernel module can read. LibreHardwareMonitor ships with this package and is \
+started automatically; the missing piece is PawnIO, the signed sandboxed module it reads them \
+through. Install it once per machine:\n      \
+winget install -e --id namazso.PawnIO\n    \
+or re-run the installer and answer yes when it offers. Then run cec-crucible as Administrator — \
+PawnIO needs it. (HWiNFO also works if you already run it with Shared Memory Support ticked, but \
+that checkbox cannot be automated and its free version stops publishing after ~12 minutes.)";
 
 /// Where a CPU sensor reading came from, so a report can say which daemon
 /// produced its numbers rather than presenting them as if from nowhere.

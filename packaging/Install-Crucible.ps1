@@ -31,8 +31,11 @@
 param(
     [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\cec-crucible'),
     [switch] $NoShortcuts,
-    # Skip the optional CPU-sensor daemon install (PawnIO + LibreHardwareMonitor).
+    # Skip the optional CPU-sensor driver (PawnIO). LibreHardwareMonitor is
+    # bundled and always installed; only the kernel module is optional.
     [switch] $NoCpuSensors,
+    # Uninstall without prompting about PawnIO - leave it on the machine.
+    [switch] $KeepPawnIO,
     [switch] $Uninstall
 )
 
@@ -70,9 +73,65 @@ if ($Uninstall) {
         }
     }
 
+    # Stop the sensor daemon we may have started, before deleting it out from
+    # under itself. It is ours only when it lives inside our install directory;
+    # a copy the operator installed separately is left alone.
+    $ourLhm = Join-Path $InstallDir 'LibreHardwareMonitor'
+    Get-Process LibreHardwareMonitor -ErrorAction SilentlyContinue | ForEach-Object {
+        $path = try { $_.MainModule.FileName } catch { '' }
+        if ($path -and $path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase)) {
+            $_.CloseMainWindow() | Out-Null
+            Start-Sleep -Milliseconds 800
+            if (-not $_.HasExited) { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+            Write-Ok "stopped bundled LibreHardwareMonitor"
+        } else {
+            Write-Warn2 "left a LibreHardwareMonitor running from $path (not ours)"
+        }
+    }
+
     if (Test-Path $InstallDir) {
         Remove-Item $InstallDir -Recurse -Force
         Write-Ok "removed $InstallDir"
+    }
+
+    # Settings live outside the install directory on purpose (they follow the
+    # technician between machines), so removing the directory does not remove
+    # them. Leaving them behind would be a lie about "fully uninstalled".
+    $cfgDir = Join-Path $env:APPDATA 'cec-crucible'
+    if (Test-Path $cfgDir) {
+        Remove-Item $cfgDir -Recurse -Force
+        Write-Ok "removed settings at $cfgDir"
+    }
+
+    # An ETW session outlives the process that created it. A run killed
+    # mid-flight can leave ours recording in the kernel, and uninstalling the
+    # tool that owns it would strand it there permanently.
+    $sessions = (& logman query -ets 2>&1 | Out-String) -split "`r?`n" |
+        Where-Object { $_ -match '^(cec-crucible|crucible-)\S*' } |
+        ForEach-Object { ($_ -split '\s+')[0] }
+    foreach ($sn in $sessions) {
+        & logman stop $sn -ets 2>&1 | Out-Null
+        Write-Ok "stopped leftover ETW session $sn"
+    }
+
+    # PawnIO is a kernel driver we may have installed. Offer to take it with us:
+    # other tools (FanControl, LibreHardwareMonitor installed separately) use it
+    # too, so removing it unasked could break something the operator relies on.
+    if (-not $KeepPawnIO) {
+        $pawnUninst = Join-Path ${env:ProgramFiles} 'PawnIO\uninstall.exe'
+        if (Test-Path $pawnUninst) {
+            Write-Host ""
+            Write-Host "  PawnIO (the CPU-sensor kernel module) is still installed." -ForegroundColor White
+            Write-Host "  Other tools may use it - FanControl and LibreHardwareMonitor do." -ForegroundColor Gray
+            $ans = Read-Host "    Remove PawnIO as well? [y/N]"
+            if ($ans -match '^(y|yes)$') {
+                Start-Process -FilePath $pawnUninst -ArgumentList '/S' -Wait -Verb RunAs -ErrorAction SilentlyContinue
+                if (Test-Path $pawnUninst) { Write-Warn2 "PawnIO uninstaller ran but files remain; remove manually if you want it gone" }
+                else { Write-Ok "removed PawnIO" }
+            } else {
+                Write-Host "    Left installed." -ForegroundColor DarkGray
+            }
+        }
     }
 
     Write-Host ""
@@ -111,6 +170,19 @@ $pm = Join-Path $PSScriptRoot 'PresentMon.exe'
 if (Test-Path $pm) {
     Copy-Item $pm (Join-Path $InstallDir 'PresentMon.exe') -Force
     Write-Ok "copied PresentMon.exe (enables --presentmon)"
+}
+
+# Directories, which the file loop above cannot carry. Missing this is why an
+# install once produced a working binary with no bundled sensor daemon beside
+# it: LibreHardwareMonitor sat in the extracted archive and never arrived.
+foreach ($sub in @('LibreHardwareMonitor', 'licenses')) {
+    $src = Join-Path $PSScriptRoot $sub
+    if (Test-Path $src) {
+        $dst = Join-Path $InstallDir $sub
+        if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+        Copy-Item $src $dst -Recurse -Force
+        Write-Ok "copied $sub\"
+    }
 }
 
 $destExe = Join-Path $InstallDir $ExeName
@@ -160,48 +232,70 @@ Write-Host "  Detected GPUs:" -ForegroundColor Cyan
 $gpu | ForEach-Object { Write-Host "    $_" }
 
 
-# --- Optional: CPU package power + die temperature ------------------------
+# --- CPU package power + die temperature ----------------------------------
 #
-# These live in model-specific registers that only ring 0 can read, so a sensor
-# daemon has to do it. cec-crucible ships no driver of its own deliberately: the
-# common one, WinRing0, is on Microsoft's vulnerable-driver blocklist and is now
-# flagged by Defender. LibreHardwareMonitor 0.9.5+ uses PawnIO instead - signed,
-# open source, and sandboxed - and keeps its settings in a plain config file, so
-# cec-crucible can configure and start it without anyone clicking anything.
+# LibreHardwareMonitor ships in this package (MPL-2.0) and was copied in with
+# everything else above; cec-crucible configures and starts it itself. What it
+# still needs is PawnIO, a signed kernel module, because package power and die
+# temperature live in model-specific registers no user-mode code can read.
 #
-# Offered, never forced: this puts a kernel module on the machine, and that
-# should be a decision somebody makes rather than a side effect of an install.
-if (-not $NoCpuSensors) {
+# PawnIO is NOT redistributed here - its signed setup has no stated licence, so
+# the installer downloads it from the official URL and verifies a pinned hash.
+# See licenses/THIRD-PARTY-BOUNDARY.md.
+#
+# Offered, never forced: this puts a kernel module on the machine, and that is a
+# decision somebody should make rather than absorb as a side effect.
+$PawnIoUrl    = 'https://github.com/namazso/PawnIO.Setup/releases/download/2.2.0/PawnIO_setup.exe'
+$PawnIoSha256 = '1f519a22e47187f70a1379a48ca604981c4fcf694f4e65b734aaa74a9fba3032'
+
+$pawnPresent = Test-Path (Join-Path ${env:ProgramFiles} 'PawnIO\PawnIOLib.dll')
+if ($pawnPresent) {
+    Write-Ok "PawnIO already installed - CPU package power will be available"
+} elseif (-not $NoCpuSensors) {
     Write-Host ""
     Write-Host "  Optional: CPU package power + die temperature" -ForegroundColor White
-    Write-Host "    Needs a sensor daemon (they live in ring-0 registers)." -ForegroundColor Gray
-    Write-Host "    Installs PawnIO (signed, sandboxed kernel module) and" -ForegroundColor Gray
-    Write-Host "    LibreHardwareMonitor. cec-crucible starts and reads them itself." -ForegroundColor Gray
-    Write-Host "    Everything else - SSD temps, board zones, GPU power - already" -ForegroundColor Gray
-    Write-Host "    works without this." -ForegroundColor Gray
+    Write-Host "    Needs PawnIO, a signed, sandboxed kernel module - those values" -ForegroundColor Gray
+    Write-Host "    live in registers no user-mode code can read. It replaces the old" -ForegroundColor Gray
+    Write-Host "    WinRing0 driver that Defender now flags." -ForegroundColor Gray
+    Write-Host "    Downloaded from the official release and hash-verified; it is not" -ForegroundColor Gray
+    Write-Host "    redistributed in this package." -ForegroundColor Gray
+    Write-Host "    Everything else - GPU power, SSD health, board zones, per-core" -ForegroundColor Gray
+    Write-Host "    clocks - already works without it." -ForegroundColor Gray
     Write-Host ""
-
-    $haveWinget = $null -ne (Get-Command winget -ErrorAction SilentlyContinue)
-    if (-not $haveWinget) {
-        Write-Warn2 "winget not found - skipping. Install manually from pawnio.eu and"
-        Write-Warn2 "  github.com/LibreHardwareMonitor/LibreHardwareMonitor if you want CPU power."
-    } else {
-        $ans = Read-Host "    Install them now? [y/N]"
-        if ($ans -match '^(y|yes)$') {
-            foreach ($pkg in @('namazso.PawnIO','LibreHardwareMonitor.LibreHardwareMonitor')) {
-                Write-Step "installing $pkg ..."
-                # Elevation is requested by the package installers themselves.
-                & winget install -e --id $pkg --accept-package-agreements --accept-source-agreements | Out-Null
-                if ($LASTEXITCODE -eq 0) { Write-Ok "$pkg installed" }
-                else { Write-Warn2 "$pkg did not install cleanly (exit $LASTEXITCODE)" }
+    $ans = Read-Host "    Download and install PawnIO now? [y/N]"
+    if ($ans -match '^(y|yes)$') {
+        $tmp = Join-Path $env:TEMP 'PawnIO_setup.exe'
+        try {
+            Write-Step "downloading PawnIO ..."
+            Invoke-WebRequest -Uri $PawnIoUrl -OutFile $tmp -UseBasicParsing
+            $got = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $PawnIoSha256) {
+                # Refuse rather than warn: this one runs in ring 0.
+                Write-Warn2 "PawnIO hash mismatch - NOT installing."
+                Write-Warn2 "  expected $PawnIoSha256"
+                Write-Warn2 "  got      $got"
+                Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Ok "hash verified"
+                Write-Step "installing PawnIO (expect an elevation prompt) ..."
+                Start-Process -FilePath $tmp -ArgumentList '/S' -Wait -Verb RunAs
+                Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                if (Test-Path (Join-Path ${env:ProgramFiles} 'PawnIO\PawnIOLib.dll')) {
+                    Write-Ok "PawnIO installed"
+                } else {
+                    Write-Warn2 "PawnIO does not appear to have installed; run 'cec-crucible sensors' to check"
+                }
             }
-            Write-Host ""
-            Write-Ok "Run cec-crucible AS ADMINISTRATOR for CPU sensors - PawnIO needs it."
-            Write-Host "    Check with:  cec-crucible sensors" -ForegroundColor Gray
-        } else {
-            Write-Host "    Skipped. 'cec-crucible sensors' will tell you how to add it later." -ForegroundColor DarkGray
+        } catch {
+            Write-Warn2 "could not fetch PawnIO: $($_.Exception.Message)"
+            Write-Warn2 "  install it later with:  winget install -e --id namazso.PawnIO"
         }
+    } else {
+        Write-Host "    Skipped. 'cec-crucible sensors' will tell you how to add it later." -ForegroundColor DarkGray
     }
+}
+if (Test-Path (Join-Path $InstallDir 'LibreHardwareMonitor\LibreHardwareMonitor.exe')) {
+    Write-Ok "LibreHardwareMonitor bundled (MPL-2.0) - started automatically when needed"
 }
 
 Write-Host ""
@@ -218,5 +312,7 @@ Write-Host "    cec-crucible benchmark            graphics composite score" -For
 Write-Host "    cec-crucible sensors              what this machine can measure" -ForegroundColor Gray
 Write-Host "    cec-crucible run worst-case --ui  everything at once, live dashboard" -ForegroundColor Gray
 Write-Host ""
-Write-Host "  Uninstall:  powershell -ExecutionPolicy Bypass -File Install-Crucible.ps1 -Uninstall" -ForegroundColor DarkGray
+Write-Host "  Uninstall (removes files, PATH, shortcuts, settings, and offers to" -ForegroundColor DarkGray
+Write-Host "  remove PawnIO):" -ForegroundColor DarkGray
+Write-Host "    powershell -ExecutionPolicy Bypass -File Install-Crucible.ps1 -Uninstall" -ForegroundColor DarkGray
 Write-Host ""

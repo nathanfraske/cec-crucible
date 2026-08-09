@@ -18,3 +18,5 @@ spikes/*/*.spv
 # Release packaging build artifacts (the zip is attached to the GitHub release)
 packaging/stage/
 packaging/*.zip
+packaging/vendor/
+packaging/stage-portable/
