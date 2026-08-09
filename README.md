@@ -40,8 +40,11 @@ Grab the installer from the [latest release](https://github.com/nathanfraske/cec
 and run it, or do the whole thing from a terminal:
 
 ```powershell
-$u='https://github.com/nathanfraske/cec-crucible/releases/latest/download/cec-crucible-setup.exe';$f="$env:TEMP\crucible-setup.exe";irm $u -OutFile $f;& $f /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+$u='https://github.com/nathanfraske/cec-crucible/releases/latest/download/cec-crucible-setup.exe';$f="$env:TEMP\crucible-setup.exe";irm $u -OutFile $f;Start-Process $f '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -Wait
 ```
+
+`Start-Process -Wait` rather than plain `&`: Setup is a GUI-subsystem process,
+so `&` returns the moment it launches and anything you run next would race it.
 
 Per-user, no admin needed. It puts `cec-crucible` on your PATH, appears in
 Add/Remove Programs, and bundles everything it needs —

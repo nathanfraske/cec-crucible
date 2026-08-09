@@ -30,7 +30,7 @@ so it cannot half-install itself by accident.
 One line, no browser — download and install:
 
 ```powershell
-$u='https://github.com/nathanfraske/cec-crucible/releases/latest/download/cec-crucible-setup.exe';$f="$env:TEMP\crucible-setup.exe";irm $u -OutFile $f;& $f /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+$u='https://github.com/nathanfraske/cec-crucible/releases/latest/download/cec-crucible-setup.exe';$f="$env:TEMP\crucible-setup.exe";irm $u -OutFile $f;Start-Process $f '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -Wait
 ```
 
 Add `/MERGETASKS="cpusensors"` to fetch the CPU-sensor driver in the same pass,
