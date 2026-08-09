@@ -15,8 +15,12 @@ crucible-*.markers.jsonl
 crucible-scratch-*.tmp
 spikes/*/*.spv
 
-# Release packaging build artifacts (the zip is attached to the GitHub release)
+# Release packaging build artifacts (both are attached to the GitHub release).
+# The winget manifests under packaging/winget/ ARE committed: they are generated,
+# but they are also what gets submitted to microsoft/winget-pkgs, so the exact
+# text that was published needs to be in history.
 packaging/stage/
 packaging/*.zip
+packaging/*-setup.exe
 packaging/vendor/
 packaging/stage-portable/

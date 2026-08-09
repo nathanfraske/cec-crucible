@@ -1,0 +1,33 @@
+﻿# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: CriticalErrorComputing.Crucible
+PackageVersion: 0.0.6
+PackageLocale: en-US
+Publisher: Critical Error Computing
+PublisherUrl: https://github.com/nathanfraske
+PublisherSupportUrl: https://github.com/nathanfraske/cec-crucible/issues
+PackageName: CEC Crucible
+PackageUrl: https://github.com/nathanfraske/cec-crucible
+License: MIT
+LicenseUrl: https://github.com/nathanfraske/cec-crucible/blob/master/LICENSE
+Copyright: Copyright (c) Critical Error Computing
+ShortDescription: PC-build stress, validation and benchmark suite for the workshop bench.
+Description: |-
+  A stress, validation and benchmark suite for people who build and repair PCs.
+  Mission: if something is ever going to fail, make it fail in the shop.
+
+  Loads CPU, memory, storage, GPU compute, VRAM, PCIe and the graphics pipeline,
+  alone or simultaneously, and records power, temperature, clocks and drive
+  health throughout. Ships with LibreHardwareMonitor and PresentMon; CPU package
+  power additionally needs PawnIO, which the installer offers to fetch.
+Moniker: crucible
+Tags:
+  - benchmark
+  - burn-in
+  - diagnostics
+  - gpu
+  - hardware
+  - memory-test
+  - stress-test
+ReleaseNotesUrl: https://github.com/nathanfraske/cec-crucible/releases/tag/v0.0.6
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

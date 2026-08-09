@@ -526,8 +526,6 @@ row:    {row}"
         assert!(r.to_pretty_json().contains("unavailable_reason"));
     }
 
-    use super::*;
-
     fn dev() -> DeviceId {
         DeviceId::from_override("TEST-UUID")
     }

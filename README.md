@@ -2,9 +2,10 @@
 
 # cec-crucible
 
-**Status: Phase 1 built** (CPU / RAM / storage + orchestrator CLI). Licensed
-[MIT](LICENSE). The GPU power-virus (Phase 3) is the remaining long pole. See the
-[roadmap](docs/roadmap.md). ("cec-crucible" is a working name; rename freely.)
+**Status: alpha, v0.0.6** — CPU, RAM, storage, GPU compute, VRAM, PCIe, ray
+tracing and the graphics pipeline all run, alone or simultaneously, with power,
+temperature, clock and drive-health telemetry throughout. Windows x64. Licensed
+[MIT](LICENSE). See the [roadmap](docs/roadmap.md) for what is still missing.
 
 A crucible is the vessel you heat metal in past its limits to see what it's
 really made of. This is that, for finished PC builds: CEC's in-house
@@ -32,6 +33,37 @@ for the 1kHz rig, and license-clean commercial use on customer builds.
 | GPU | custom CubeCL compute thrasher: steady + bursty + VRAM thrash + wattage targeting |
 | Cross-load | orchestrate multiple domains concurrently (CPU pinned while GPU bursts, etc.) — the worst-case transients that kill marginal builds |
 | Wattage | closed-loop power targeting (hold/step/ramp/sweep) + self-optimizing per-GPU calibration |
+
+## Install
+
+Grab the installer from the [latest release](https://github.com/nathanfraske/cec-crucible/releases/latest)
+and run it, or do the whole thing from a terminal:
+
+```powershell
+$u='https://github.com/nathanfraske/cec-crucible/releases/latest/download/cec-crucible-setup.exe';$f="$env:TEMP\crucible-setup.exe";irm $u -OutFile $f;& $f /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+Per-user, no admin needed. It puts `cec-crucible` on your PATH, appears in
+Add/Remove Programs, and bundles everything it needs —
+[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
+and [PresentMon](https://github.com/GameTechDev/PresentMon), with their licence
+texts. Add `/MERGETASKS="cpusensors"` to also fetch
+[PawnIO](https://github.com/namazso/PawnIO), which is what makes CPU package
+power and die temperature readable; everything else works without it. See
+[`third_party/README.md`](third_party/README.md) for where our code ends and
+theirs begins.
+
+There is also a **portable** zip on the same release page: extract, run, delete.
+It touches nothing outside its own folder and contains no installer.
+
+Uninstalling removes the install directory, the PATH entry, the shortcuts, the
+settings in `%APPDATA%`, and any ETW session a killed run left behind:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\cec-crucible\unins000.exe" /VERYSILENT
+```
+
+Not code-signed yet, so SmartScreen will warn on first run.
 
 ## Build & run
 

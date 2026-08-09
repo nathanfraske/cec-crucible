@@ -5,21 +5,28 @@
 .DESCRIPTION
     Produces:
 
-      cec-crucible-<ver>-win-x64.zip           installer release
-      cec-crucible-<ver>-win-x64-portable.zip  portable release
+      cec-crucible-<ver>-win-x64-setup.exe      installer
+      cec-crucible-<ver>-win-x64-portable.zip   portable
 
     Both carry the same payload. The difference is intent, and it is worth
     keeping separate:
 
-      * The installer copies into %LOCALAPPDATA%, puts itself on PATH, makes
-        shortcuts, offers the CPU-sensor driver, and can uninstall all of it.
+      * The installer is a real setup executable - nothing to unpack, an entry
+        in Add/Remove Programs, and an uninstaller that removes everything it
+        created. Silent install for imaging a bench:
+            cec-crucible-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
       * The portable archive runs from wherever it is extracted and touches
         nothing outside its own folder except the settings file. It is what goes
         on a USB stick to a customer site, or onto a machine that must be left
         exactly as it was found.
 
-    The portable archive deliberately omits Install-Crucible.ps1 so there is no
-    way to half-install from it by accident.
+    The portable archive deliberately contains no installer of any kind, so
+    there is no way to half-install from it by accident.
+
+    Also emits winget manifests under packaging/winget/, with the real installer
+    hash filled in. Generated rather than hand-maintained because a manifest
+    whose hash does not match the artifact is worse than no manifest: winget
+    refuses the install and blames the network.
 
 .PARAMETER SkipBuild
     Use the existing target/release binary instead of rebuilding.
@@ -102,8 +109,9 @@ function Build-Payload([string]$dir, [bool]$withInstaller) {
     }
 
     if ($withInstaller) {
-        Copy-Item (Join-Path $PSScriptRoot 'Install-Crucible.ps1') $dir
-        Copy-Item (Join-Path $PSScriptRoot 'INSTALL.cmd') $dir
+        # Nothing extra: the payload IS the installer's input. Inno Setup
+        # compiles it into a single executable, so there is no loose installer
+        # script for an operator to run by mistake.
     } else {
         # A portable archive that can half-install itself is not portable.
         @"
@@ -136,19 +144,116 @@ Build-Payload $stage $true
 Step "staging portable payload ..."
 Build-Payload $portage $false
 
-# --- Archives -------------------------------------------------------------
-$zipInstall  = Join-Path $PSScriptRoot "cec-crucible-$ver-win-x64.zip"
-$zipPortable = Join-Path $PSScriptRoot "cec-crucible-$ver-win-x64-portable.zip"
-foreach ($z in @($zipInstall, $zipPortable)) {
-    if (Test-Path $z) { Remove-Item $z -Force }
+# --- Installer ------------------------------------------------------------
+$iscc = @(
+    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+    "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) {
+    throw "Inno Setup not found. Install it with:  winget install -e --id JRSoftware.InnoSetup"
 }
-Step "compressing ..."
-Compress-Archive -Path "$stage\*"   -DestinationPath $zipInstall  -CompressionLevel Optimal
+Step "compiling installer ..."
+$setupExe = Join-Path $PSScriptRoot "cec-crucible-$ver-win-x64-setup.exe"
+if (Test-Path $setupExe) { Remove-Item $setupExe -Force }
+& $iscc /Qp "/DAppVersion=$ver" "/DPayload=stage" (Join-Path $PSScriptRoot 'cec-crucible.iss')
+if ($LASTEXITCODE -ne 0) { throw "Inno Setup compile failed" }
+
+# A second copy under a version-free name, uploaded alongside. It is what makes
+#   .../releases/latest/download/cec-crucible-setup.exe
+# a URL that keeps working, so the install one-liner in the README does not go
+# stale the moment the next version ships. Same bytes, different name.
+$setupStable = Join-Path $PSScriptRoot 'cec-crucible-setup.exe'
+Copy-Item $setupExe $setupStable -Force
+
+# --- Portable archive -----------------------------------------------------
+$zipPortable = Join-Path $PSScriptRoot "cec-crucible-$ver-win-x64-portable.zip"
+if (Test-Path $zipPortable) { Remove-Item $zipPortable -Force }
+Step "compressing portable ..."
 Compress-Archive -Path "$portage\*" -DestinationPath $zipPortable -CompressionLevel Optimal
 
+# --- winget manifests -----------------------------------------------------
+# So `winget install CriticalErrorComputing.Crucible` works once these are
+# merged into microsoft/winget-pkgs. Generated here because the hash has to be
+# the hash of the artifact we just built - see the note in the header.
+Step "writing winget manifests ..."
+$pkgId    = 'CriticalErrorComputing.Crucible'
+$setupSha = (Get-FileHash $setupExe -Algorithm SHA256).Hash.ToUpper()
+$relUrl   = "https://github.com/nathanfraske/cec-crucible/releases/download/v$ver/$(Split-Path $setupExe -Leaf)"
+$wgDir    = Join-Path $PSScriptRoot "winget\$pkgId\$ver"
+New-Item -ItemType Directory -Force $wgDir | Out-Null
+
+@"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+PackageIdentifier: $pkgId
+PackageVersion: $ver
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0
+"@ | Set-Content (Join-Path $wgDir "$pkgId.yaml") -Encoding UTF8
+
+@"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: $pkgId
+PackageVersion: $ver
+InstallerType: inno
+Scope: user
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+UpgradeBehavior: install
+ReleaseDate: $(Get-Date -Format 'yyyy-MM-dd')
+Installers:
+  - Architecture: x64
+    InstallerUrl: $relUrl
+    InstallerSha256: $setupSha
+ManifestType: installer
+ManifestVersion: 1.6.0
+"@ | Set-Content (Join-Path $wgDir "$pkgId.installer.yaml") -Encoding UTF8
+
+@"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: $pkgId
+PackageVersion: $ver
+PackageLocale: en-US
+Publisher: Critical Error Computing
+PublisherUrl: https://github.com/nathanfraske
+PublisherSupportUrl: https://github.com/nathanfraske/cec-crucible/issues
+PackageName: CEC Crucible
+PackageUrl: https://github.com/nathanfraske/cec-crucible
+License: MIT
+LicenseUrl: https://github.com/nathanfraske/cec-crucible/blob/master/LICENSE
+Copyright: Copyright (c) Critical Error Computing
+ShortDescription: PC-build stress, validation and benchmark suite for the workshop bench.
+Description: |-
+  A stress, validation and benchmark suite for people who build and repair PCs.
+  Mission: if something is ever going to fail, make it fail in the shop.
+
+  Loads CPU, memory, storage, GPU compute, VRAM, PCIe and the graphics pipeline,
+  alone or simultaneously, and records power, temperature, clocks and drive
+  health throughout. Ships with LibreHardwareMonitor and PresentMon; CPU package
+  power additionally needs PawnIO, which the installer offers to fetch.
+Moniker: crucible
+Tags:
+  - benchmark
+  - burn-in
+  - diagnostics
+  - gpu
+  - hardware
+  - memory-test
+  - stress-test
+ReleaseNotesUrl: https://github.com/nathanfraske/cec-crucible/releases/tag/v$ver
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
+"@ | Set-Content (Join-Path $wgDir "$pkgId.locale.en-US.yaml") -Encoding UTF8
+
 Write-Host ""
-foreach ($z in @($zipInstall, $zipPortable)) {
-    $i = Get-Item $z
-    Ok ("{0,-46} {1,7:N1} MB  sha256 {2}" -f $i.Name, ($i.Length/1MB), (Get-FileHash $z -Algorithm SHA256).Hash.Substring(0,16).ToLower())
+foreach ($a in @($setupExe, $zipPortable)) {
+    if (-not (Test-Path $a)) { continue }
+    $i = Get-Item $a
+    Ok ("{0,-46} {1,7:N1} MB" -f $i.Name, ($i.Length/1MB))
+    Write-Host ("      sha256 {0}" -f (Get-FileHash $a -Algorithm SHA256).Hash.ToLower()) -ForegroundColor DarkGray
 }
+Ok ("{0,-46} {1,7} " -f "winget/$pkgId/$ver", "3 files")
 Write-Host ""

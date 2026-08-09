@@ -19,11 +19,37 @@ capture we have shows that happening, but the door was open. Details below.
 
 | | |
 |---|---|
-| `cec-crucible-0.0.6-win-x64.zip` | **Installer.** Double-click `INSTALL.cmd`. Per-user, no admin. Puts itself on PATH, makes shortcuts, offers the CPU-sensor driver, and uninstalls all of it cleanly. |
+| `cec-crucible-0.0.6-win-x64-setup.exe` | **Installer.** A real one now — run it. Per-user, no admin. Puts itself on PATH, makes shortcuts, offers the CPU-sensor driver, appears in Add/Remove Programs, and uninstalls all of it cleanly. |
 | `cec-crucible-0.0.6-win-x64-portable.zip` | **Portable.** Extract and run. Adds nothing to PATH, creates no shortcuts, installs no driver. For a customer site, or a machine that must be left exactly as it was found. |
 
 Same payload either way. The portable archive deliberately contains no installer,
 so it cannot half-install itself by accident.
+
+### From the command line
+
+One line, no browser — download and install:
+
+```powershell
+$u='https://github.com/nathanfraske/cec-crucible/releases/latest/download/cec-crucible-setup.exe';$f="$env:TEMP\crucible-setup.exe";irm $u -OutFile $f;& $f /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+Add `/MERGETASKS="cpusensors"` to fetch the CPU-sensor driver in the same pass,
+or `/TASKS=""` for a bare install with no PATH entry and no shortcuts. Open a new
+terminal afterwards to pick up the PATH change.
+
+Uninstall is symmetrical:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\cec-crucible\unins000.exe" /VERYSILENT
+```
+
+A winget manifest ships in `packaging/winget/`. Once it is merged upstream this
+becomes `winget install CriticalErrorComputing.Crucible`; until then, use the
+line above.
+
+> Not code-signed yet, so SmartScreen will show "Windows protected your PC" on
+> first run — **More info → Run anyway**. Verify the download against the SHA-256
+> published with this release if you want to be sure of it.
 
 ---
 
@@ -51,16 +77,17 @@ derived works.
 
 ### Uninstall actually uninstalls
 
-```
-powershell -ExecutionPolicy Bypass -File Install-Crucible.ps1 -Uninstall
-```
+Add/Remove Programs, or `unins000.exe` in the install directory.
 
-Removes the install directory, the PATH entry, both shortcuts, the settings in
+It removes the install directory, the PATH entry, both shortcuts, the settings in
 `%APPDATA%`, and any ETW session a killed run left recording in the kernel. It
 stops the bundled sensor daemon first — and leaves alone a copy you installed
-yourself. It then *asks* about PawnIO rather than assuming, because FanControl
-and a separately-installed LibreHardwareMonitor use it too. `-KeepPawnIO` skips
-the question.
+yourself.
+
+PawnIO it deliberately leaves in place. FanControl and a separately-installed
+LibreHardwareMonitor read hardware through it too, and pulling it out from under
+them would break tools we did not install. It has its own Add/Remove Programs
+entry if you want it gone.
 
 Verified by round trip on the bench: install → confirm every artifact present →
 uninstall → confirm nothing remains.
@@ -132,6 +159,10 @@ Everything from the Alpha 5 line that has not shipped before:
   available to validate the CPU sensor path.
 * **The elevated ETW path is still unverified** — the non-elevated refusal is
   tested; an actual `.etl` has not been produced here.
+* **The installer's PawnIO step is half-verified.** The download and the pinned
+  SHA-256 are confirmed against the live upstream release, but the driver
+  install itself was not run on the build machine — so the install/uninstall
+  round trip below covers everything *except* that one optional task.
 * **The ReBAR PCIe fix is unproven end-to-end** — the ceiling check is tested
   against the exact 370 GB/s figure from the field, but no ReBAR machine
   exhibiting the fault has been available.
